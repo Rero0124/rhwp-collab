@@ -1,0 +1,13 @@
+{
+  "name": "@cc-rhwp/collab-client",
+  "private": true,
+  "version": "0.2.0",
+  "description": "cc-rhwp 공동편집 클라이언트: studio 플러그인과 collab 엔진",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=23.6"
+  }
+}

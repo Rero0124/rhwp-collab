@@ -1,0 +1,6 @@
+# 업스트림 rhwp 고정 버전. scripts/bootstrap.sh 가 읽는다.
+repo=https://github.com/edwardkim/rhwp.git
+rev=981ce66b4183b13c1a3b5907e04a8969c8c42034
+# 희소 체크아웃 경로(cone). 업스트림 전체는 4GB+ 라 필요한 디렉터리만 받는다.
+# tests/* 는 lib 단위 테스트가 include!/include_bytes! 로 읽는다. rev 를 올리면 다시 확인한다.
+sparse=src crates tools bindings rhwp-studio rhwp-shared npm scripts typescript ttfs data vendor saved assets mydocs/manual mydocs/tech/agent_roadmap mydocs/tech/agent_runtime samples/hml samples/hwpx/ref tests/fixtures tests/common tests/support samples/chart/가로막대형 samples/hwpjson samples/issue5725 samples/issue6179 samples/issue7235 samples/basic samples/issue5721 samples/issue6173

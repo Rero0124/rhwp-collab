@@ -1,0 +1,7 @@
+# 업스트림 체크아웃 (scripts/bootstrap.sh 로 재생성)
+/upstream/
+# 빌드 산출물·로컬 도구
+/target/
+/.tools/
+node_modules/
+.DS_Store

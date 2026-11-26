@@ -1,0 +1,117 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 3ba518dd..b0a7e446 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -54,6 +54,10 @@ pub mod subsecond_dev;
+ pub mod wasm_api;
+ pub mod wmf;
+ 
++// cc-rhwp: 공동편집 코어 (다운스트림 패치, collab-core/ 참고)
++#[path = "../../../collab-core/src/lib.rs"]
++pub mod collab;
++
+ pub use document_core::DocumentCore;
+ #[cfg(feature = "pdf-import")]
+ pub use document_core::PdfImportSession;
+diff --git a/src/wasm_api.rs b/src/wasm_api.rs
+index 80882ecd..32b75208 100644
+--- a/src/wasm_api.rs
++++ b/src/wasm_api.rs
+@@ -434,7 +434,7 @@ fn collect_external_image_references(document: &Document) -> Vec<ExternalImageRe
+ /// `Deref`/`DerefMut`를 통해 투명하게 접근한다.
+ #[wasm_bindgen]
+ pub struct HwpDocument {
+-    core: DocumentCore,
++    core: crate::collab::CollabCore,
+ }
+ 
+ /// 한 번의 문서 내보내기 결과.
+@@ -482,21 +482,21 @@ impl DocumentExport {
+ }
+ 
+ impl std::ops::Deref for HwpDocument {
+-    type Target = DocumentCore;
+-    fn deref(&self) -> &DocumentCore {
++    type Target = crate::collab::CollabCore;
++    fn deref(&self) -> &crate::collab::CollabCore {
+         &self.core
+     }
+ }
+ 
+ impl std::ops::DerefMut for HwpDocument {
+-    fn deref_mut(&mut self) -> &mut DocumentCore {
++    fn deref_mut(&mut self) -> &mut crate::collab::CollabCore {
+         &mut self.core
+     }
+ }
+ 
+ impl From<DocumentCore> for HwpDocument {
+     fn from(core: DocumentCore) -> Self {
+-        Self { core }
++        Self { core: core.into() }
+     }
+ }
+ 
+@@ -505,11 +505,11 @@ impl From<DocumentCore> for HwpDocument {
+ /// 테스트 및 CLI 환경에서 `HwpDocument::from_bytes()` 등을 직접 호출할 수 있도록 한다.
+ impl HwpDocument {
+     pub fn from_bytes(data: &[u8]) -> Result<HwpDocument, HwpError> {
+-        DocumentCore::from_bytes(data).map(|core| HwpDocument { core })
++        DocumentCore::from_bytes(data).map(|core| HwpDocument { core: core.into() })
+     }
+ 
+     pub fn from_bytes_with_password(data: &[u8], password: &[u8]) -> Result<HwpDocument, HwpError> {
+-        DocumentCore::from_bytes_with_password(data, password).map(|core| HwpDocument { core })
++        DocumentCore::from_bytes_with_password(data, password).map(|core| HwpDocument { core: core.into() })
+     }
+ 
+     /// 인증 성공 뒤에만 문서를 교체하는 Native/Rust command. 기존 constructor는
+@@ -662,7 +662,7 @@ impl HwpDocument {
+     #[wasm_bindgen(constructor)]
+     pub fn new(data: &[u8]) -> Result<HwpDocument, JsValue> {
+         DocumentCore::from_bytes(data)
+-            .map(|core| HwpDocument { core })
++            .map(|core| HwpDocument { core: core.into() })
+             .map_err(|e| e.into())
+     }
+ 
+@@ -744,7 +744,7 @@ impl HwpDocument {
+             let data = pdf_import::copy_input(data, &policy, &mut session)?;
+             session
+                 .open(&data, &options)
+-                .map(|core| HwpDocument { core })
++                .map(|core| HwpDocument { core: core.into() })
+                 .map_err(JsValue::from)
+         }
+         #[cfg(not(all(feature = "pdf-import", target_arch = "wasm32")))]
+@@ -807,7 +807,7 @@ impl HwpDocument {
+         let mut document = Document::default();
+         document.sections.push(section);
+         core.set_document(document);
+-        HwpDocument { core }
++        HwpDocument { core: core.into() }
+     }
+ 
+     /// 내장 템플릿에서 빈 문서를 생성한다.
+diff --git a/src/wasm_api/pdf_request.rs b/src/wasm_api/pdf_request.rs
+index a95b3d8a..22a047f2 100644
+--- a/src/wasm_api/pdf_request.rs
++++ b/src/wasm_api/pdf_request.rs
+@@ -107,7 +107,7 @@ impl PdfImportRequest {
+                 }
+                 Ok(())
+             })?;
+-        self.document = Some(HwpDocument { core });
++        self.document = Some(HwpDocument { core: core.into() });
+         Ok(())
+     }
+ 
+@@ -281,7 +281,7 @@ impl PdfEditorReopen {
+         let result = (|| -> Result<HwpDocument, JsValue> {
+             let bytes = pdf_import::copy_input_limited(data, maximum as usize, &mut session)?;
+             let core = session.reopen_hwpx_export(&bytes, maximum as usize)?;
+-            Ok(HwpDocument { core })
++            Ok(HwpDocument { core: core.into() })
+         })();
+         if now
+             .call0(&performance)?

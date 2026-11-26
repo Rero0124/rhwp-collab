@@ -1,0 +1,1204 @@
+diff --git a/rhwp-studio/src/engine/caret-renderer.ts b/rhwp-studio/src/engine/caret-renderer.ts
+index 1e2a6986..4caa8146 100644
+--- a/rhwp-studio/src/engine/caret-renderer.ts
++++ b/rhwp-studio/src/engine/caret-renderer.ts
+@@ -57,6 +57,19 @@ export class CaretRenderer {
+     this.currentRect = null;
+   }
+ 
++  /**
++   * cc-rhwp: 커서 사각형(쪽 좌표)을 스크롤 내용 요소 기준 위치로 — 캐럿을 놓는 계산과 같다(쪽 위치·쪽 왼쪽·줌·자르기).
++   * 플러그인이 다른 사람 캐럿을 같은 자리에 그릴 때 쓴다.
++   */
++  toContentRect(rect: CursorRect, zoom: number): { left: number; top: number; height: number } {
++    const { x, y, height } = this.clampCaretRect(rect, zoom);
++    return {
++      left: this.calcPageLeft(rect.pageIndex) + x * zoom,
++      top: this.virtualScroll.getPageOffset(rect.pageIndex) + y * zoom,
++      height: height * zoom,
++    };
++  }
++
+   /** 줌/스크롤 변경 시 위치를 갱신한다 */
+   updatePosition(zoom: number): void {
+     if (!this.currentRect) return;
+diff --git a/rhwp-studio/src/engine/history.ts b/rhwp-studio/src/engine/history.ts
+index 8610bc16..dabe590e 100644
+--- a/rhwp-studio/src/engine/history.ts
++++ b/rhwp-studio/src/engine/history.ts
+@@ -43,6 +43,19 @@ function snapshotIdBudget(wasm: WasmBridge): number {
+ /** Undo/Redo 히스토리 관리 */
+ export class CommandHistory {
+   lastFailureRecovery: RollbackOutcome = 'unknown';
++  /**
++   * cc-rhwp: 기록 중지(공동편집). 중지 동안 실행한 명령은 스택에 넣지 않고 바로 자원을 해제한다 —
++   * 크기 초과 축출과 같은 경로라 스냅샷·조각이 쌓이지 않는다.
++   */
++  private suspended = false;
++
++  /** cc-rhwp: 기록을 멈추거나 재개한다. 멈출 때 기존 스택을 비운다(wasm 이 있으면 자원도 해제). */
++  setSuspended(on: boolean, wasm?: WasmBridge): void {
++    if (on && !this.suspended) this.clear(wasm);
++    this.suspended = on;
++  }
++
++  isSuspended(): boolean { return this.suspended; }
+ 
+   /** 동일 엔트리·순서의 양 스택을 확인한다. counts만으로 redo 파괴를 숨기지 않는다. */
+   recoveryCheckpoint(): () => boolean {
+@@ -136,6 +149,12 @@ export class CommandHistory {
+       return cursorAfter;
+     }
+ 
++    // cc-rhwp: 기록 중지 — 쌓지 않고 자원을 해제한다.
++    if (this.suspended) {
++      command.discard?.(wasm);
++      return cursorAfter;
++    }
++
+     // 직전 명령과 병합 시도
+     if (this.undoStack.length > 0) {
+       const last = this.undoStack[this.undoStack.length - 1];
+@@ -255,6 +274,11 @@ export class CommandHistory {
+   /** execute() 없이 히스토리에만 기록 (IME compositionend용 — 텍스트가 이미 문서에 있는 경우) */
+   recordWithoutExecute(command: EditCommand, wasm?: WasmBridge): void {
+     this.lastExecutionEffects = NO_TEXT_MUTATION_EFFECTS;
++    // cc-rhwp: 기록 중지 — 쌓지 않고 자원을 해제한다.
++    if (this.suspended) {
++      if (wasm) command.discard?.(wasm);
++      return;
++    }
+     // 직전 명령과 병합 시도
+     if (this.undoStack.length > 0) {
+       const last = this.undoStack[this.undoStack.length - 1];
+diff --git a/rhwp-studio/src/engine/input-handler.ts b/rhwp-studio/src/engine/input-handler.ts
+index 7d251116..e3b68288 100644
+--- a/rhwp-studio/src/engine/input-handler.ts
++++ b/rhwp-studio/src/engine/input-handler.ts
+@@ -549,6 +549,8 @@ export class InputHandler {
+ 
+   // IME 조합 상태
+   private isComposing = false;
++  /** cc-rhwp: 되돌리기 기록 중지 안내. null 이면 중지 아님. */
++  private historySuspendedMessage: string | null = null;
+   private compositionAnchor: DocumentPosition | null = null;
+   private compositionLength = 0; // 문서에 삽입된 조합 텍스트 길이
+   private compositionBodyLogical = false;
+@@ -3036,6 +3038,10 @@ export class InputHandler {
+ 
+   /** Undo 처리 */
+   private handleUndo(): void {
++    if (this.historySuspendedMessage !== null) {
++      showToast({ message: this.historySuspendedMessage });
++      return;
++    }
+     this.withCommandErrorBoundary('undo', () => {
+       this.flushDeferredPaginationIfNeeded('before-undo', false);
+       let newPos: DocumentPosition | null;
+@@ -3058,6 +3064,10 @@ export class InputHandler {
+ 
+   /** Redo 처리 */
+   private handleRedo(): void {
++    if (this.historySuspendedMessage !== null) {
++      showToast({ message: this.historySuspendedMessage });
++      return;
++    }
+     this.withCommandErrorBoundary('redo', () => {
+       this.flushDeferredPaginationIfNeeded('before-redo', false);
+       let newPos: DocumentPosition | null;
+@@ -3511,6 +3521,8 @@ export class InputHandler {
+   /** IME 조합 완료 — 조합 텍스트를 Command로 기록 */
+   private onCompositionEnd(): void {
+     _text.onCompositionEnd.call(this);
++    // cc-rhwp: 조합이 실제로 끝났을 때만 알린다(셀 단축키 IME 가드가 삼킨 경우 제외).
++    if (!this.isComposing) this.eventBus.emit('composition-end');
+   }
+ 
+   /** 위치에서 텍스트를 읽는다 (본문/셀 자동 분기) */
+@@ -4991,6 +5003,76 @@ export class InputHandler {
+     this.afterEdit();
+   }
+ 
++  /** cc-rhwp: IME 조합 중인가 (PluginHost.isComposing). */
++  isImeComposing(): boolean {
++    return this.isComposing;
++  }
++
++  /**
++   * cc-rhwp: 캐럿을 옮기고 선택을 접는다 (PluginHost.setCaret). 문서는 바꾸지 않는다.
++   * 조합 중이면 옮기지 않는다 — 조합 앵커가 어긋나면 확정 글자가 엉뚱한 곳에 들어간다.
++   */
++  /**
++   * cc-rhwp: 문서 위치의 캐럿 사각형(스크롤 내용 요소 기준). 커서가 쓰는 것과 같은 커서 사각형 조회(본문·셀·중첩
++   * 셀 경로)와 캐럿 배치 계산을 쓴다. 문서·캐럿 상태는 바꾸지 않는다. 계산할 수 없으면 `null`.
++   */
++  caretRectFor(pos: DocumentPosition): { left: number; top: number; height: number } | null {
++    try {
++      const sec = pos.sectionIndex;
++      let rect: CursorRect | null;
++      if (pos.cellPath && pos.cellPath.length > 1 && pos.parentParaIndex !== undefined) {
++        rect = this.wasm.getCursorRectByPath(sec, pos.parentParaIndex, JSON.stringify(pos.cellPath), pos.charOffset);
++      } else if (pos.parentParaIndex !== undefined && pos.controlIndex !== undefined && pos.cellIndex !== undefined && pos.cellParaIndex !== undefined) {
++        rect = this.wasm.getCursorRectInCell(sec, pos.parentParaIndex, pos.controlIndex, pos.cellIndex, pos.cellParaIndex, pos.charOffset);
++      } else {
++        rect = this.wasm.getCursorRect(sec, pos.paragraphIndex, pos.charOffset);
++      }
++      return rect ? this.caret.toContentRect(rect, this.viewportManager.getZoom()) : null;
++    } catch {
++      return null;
++    }
++  }
++
++  /**
++   * cc-rhwp: 플러그인 겹침 층 — 스크롤 내용 안(문서와 함께 스크롤), 포인터를 받지 않고 캐럿(z 10)보다 위, 대화상자보다
++   * 아래. 내용 요소가 바뀌면(문서 다시 열기) 새로 만든다.
++   */
++  pluginOverlayLayer(): HTMLElement | null {
++    const content = this.container.querySelector<HTMLElement>('#scroll-content');
++    if (!content) return null;
++    let layer = content.querySelector<HTMLElement>(':scope > [data-plugin-overlay]');
++    if (!layer) {
++      layer = document.createElement('div');
++      layer.dataset.pluginOverlay = '';
++      layer.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;overflow:visible;pointer-events:none;z-index:11;';
++      content.appendChild(layer);
++    }
++    return layer;
++  }
++
++  placeCaret(pos: DocumentPosition): boolean {
++    if (this.isComposing) return false;
++    try {
++      this.cursor.clearSelection();
++      this.cursor.moveTo(pos);
++      this.cursor.resetPreferredX();
++      this.updateCaret();
++      return true;
++    } catch (error) {
++      console.warn('[InputHandler] placeCaret 실패:', error);
++      return false;
++    }
++  }
++
++  /**
++   * cc-rhwp: 되돌리기 기록을 멈추거나 재개한다 (PluginHost.suspendHistory). `message` 가 있으면 멈춤 —
++   * 히스토리를 비우고, 멈춘 동안 undo/redo 는 그 안내만 띄운다.
++   */
++  setHistorySuspended(message: string | null): void {
++    this.historySuspendedMessage = message;
++    this.history.setSuspended(message !== null, this.wasm);
++  }
++
+   exitPictureObjectSelectionAndAfterEdit(): void {
+     this.exitPictureObjectSelectionIfNeeded();
+     this.afterEdit();
+@@ -5658,10 +5740,11 @@ export class InputHandler {
+   }
+ 
+   /** Undo 가능한가? */
+-  canUndo(): boolean { return this.history.canUndo(); }
++  // cc-rhwp: 기록을 멈춘 동안에도 참 — 누르면 안내를 띄운다(handleUndo).
++  canUndo(): boolean { return this.historySuspendedMessage !== null || this.history.canUndo(); }
+ 
+   /** Redo 가능한가? */
+-  canRedo(): boolean { return this.history.canRedo(); }
++  canRedo(): boolean { return this.historySuspendedMessage !== null || this.history.canRedo(); }
+ 
+   /** Undo 실행 (커맨드 시스템용) */
+   performUndo(): void { this.handleUndo(); }
+diff --git a/rhwp-studio/src/main.ts b/rhwp-studio/src/main.ts
+index 50b4215d..729fa5d7 100644
+--- a/rhwp-studio/src/main.ts
++++ b/rhwp-studio/src/main.ts
+@@ -32,6 +32,10 @@ import { AutomationHost } from '@/automation/host';
+ import { getChromeVisibility, setChromeVisibility } from '@/automation/chrome';
+ import type { ChromeVisibility } from '@/automation/types';
+ import { PluginHostRegistry } from '@/plugin/host';
++// cc-rhwp: 공동편집 기록 훅 — 문서 클래스와 변경 메서드 목록
++import { HwpDocument as HwpDocumentClass } from '@wasm/rhwp.js';
++import { MUTATING_METHODS } from '@/core/mutation-method-registry';
++import { interceptPrototype } from '@/plugin/document-intercept';
+ import type { StudioPlugin } from '@/plugin/types';
+ import { CommandDispatcher } from '@/command/dispatcher';
+ import type { EditorContext, CommandServices, EditorEditMode } from '@/command/types';
+@@ -141,10 +145,19 @@ Object.defineProperty(window, 'rhwpCommandErrors', { value: Object.freeze({
+   getState: () => inputHandler?.getCommandErrorState() ?? null,
+ }), configurable: true });
+ documentState.installBeforeUnload(window);
++// No plaintext persistence: protected documents need a session-only recovery key.
++const passwordRecoveryBlocked = () => wasm.requiresPasswordForSave && !wasm.recoveryCipher;
++// cc-rhwp: 플러그인이 복구용 자동 저장을 멈춘 동안의 토큰 (PluginHost.suspendAutosave).
++const autosaveSuspensions = new Map<symbol, string>();
++// cc-rhwp: 플러그인이 되돌리기 기록을 멈춘 동안의 토큰과 안내 (PluginHost.suspendHistory).
++const historySuspensions = new Map<symbol, string>();
++function applyHistorySuspension(): void {
++  const messages = [...historySuspensions.values()];
++  inputHandler?.setHistorySuspended(messages.length > 0 ? messages[messages.length - 1] : null);
++}
+ const autosaveManager = new AutosaveManager({
+   exportBytes: () => wasm.exportHwp(),
+-  // No plaintext persistence: protected documents need a session-only recovery key.
+-  isRecoveryBlocked: () => wasm.requiresPasswordForSave && !wasm.recoveryCipher,
++  isRecoveryBlocked: () => passwordRecoveryBlocked() || autosaveSuspensions.size > 0,
+   protectDraft: async draft => {
+     if (!wasm.requiresPasswordForSave) return draft;
+     const cipher = wasm.recoveryCipher;
+@@ -348,6 +361,10 @@ async function resolvePlugin(id: string): Promise<StudioPlugin> {
+   if (import.meta.env.DEV && id === 'dev-probe') {
+     return (await import('@/plugin/dev-probe-plugin')).devProbePlugin;
+   }
++  // cc-rhwp: 공동편집 플러그인 (다운스트림 패치, collab-client/ 참고)
++  if (id === 'collab') {
++    return (await import('@cc-rhwp/collab-plugin')).collabPlugin;
++  }
+   throw new Error(`허용되지 않은 플러그인: ${id}`);
+ }
+ 
+@@ -368,7 +385,10 @@ const plugins = new PluginHostRegistry({
+   automation,
+   eventBus,
+   getInputHandler: () => inputHandler,
+-  loadDocument: (bytes, fileName) => loadBytes(bytes, fileName ?? 'document.hwp', null),
++  // cc-rhwp: suppressDialogs 를 열기 경로로 넘긴다(생략하면 종전과 같다).
++  loadDocument: (bytes, fileName, options) => loadBytes(bytes, fileName ?? 'document.hwp', null, undefined, {
++    suppressDialogs: options?.suppressDialogs,
++  }),
+   createBlankDocument: async (options) => {
+     if (options?.confirmUnsaved && !await canReplaceCurrentDocument()) return false;
+     await createNewDocument();
+@@ -376,6 +396,24 @@ const plugins = new PluginHostRegistry({
+   },
+   resolve: resolvePlugin,
+   sidePanels,
++  // cc-rhwp: 문서 메서드 가로채기 — 모든 문서 인스턴스에 적용되도록 클래스 prototype 을 감싼다.
++  interceptDocumentCalls: (_pluginId, methods, includeMutatingRegistry, call) => {
++    const names = includeMutatingRegistry ? [...methods, ...MUTATING_METHODS] : [...methods];
++    return interceptPrototype(HwpDocumentClass.prototype, names, call).release;
++  },
++  // cc-rhwp: 플러그인별 되돌리기 기록 중지
++  suspendHistory: (pluginId, message) => {
++    const token = Symbol(pluginId);
++    historySuspensions.set(token, message);
++    applyHistorySuspension();
++    return () => { historySuspensions.delete(token); applyHistorySuspension(); };
++  },
++  // cc-rhwp: 플러그인별 자동 저장 중지 (원장이 unload 때 재개 함수를 회수한다)
++  suspendAutosave: (pluginId) => {
++    const token = Symbol(pluginId);
++    autosaveSuspensions.set(token, pluginId);
++    return () => { autosaveSuspensions.delete(token); };
++  },
+   selectTextRange: (range) => {
+     if (!inputHandler) return false;
+     navigateToSearchHit(inputHandler, {
+@@ -478,6 +516,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
+ }
+ 
+ function handleAutosaveStatus(status: AutosaveStatus): void {
++  // cc-rhwp: 플러그인이 멈춘 차단은 알리지 않는다 — 안내는 맥락을 아는 플러그인이 한다.
++  // 보호 문서 차단이 겹치면 아래 기존 문구가 우선한다.
++  if (status.state === 'blocked' && autosaveSuspensions.size > 0 && !passwordRecoveryBlocked()) return;
+   const message = document.getElementById('sb-message');
+   if (!message) return;
+   if (autosaveStatusRestoreTimer) {
+@@ -1997,7 +2038,8 @@ async function renderRecentSubmenu(): Promise<void> {
+ 
+ function shouldSkipInitialAutosaveRecovery(): boolean {
+   const params = new URLSearchParams(window.location.search);
+-  return params.has('url');
++  // cc-rhwp: 공동편집으로 열 때도 건너뛴다 — 문서는 공유 로그에서 받는다. 남은 초안은 지우지 않는다.
++  return params.has('url') || params.has('collab');
+ }
+ 
+ async function offerAutosaveRecoveryIfIdle(): Promise<void> {
+@@ -2306,6 +2348,10 @@ void initPromise.then(() => {
+   if (__RHWP_AI__ && sidePanels && window.parent === window) {
+     plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
+   }
++  // cc-rhwp: ?collab=ws://…&room=…&name=… 이면 공동편집 플러그인을 올린다.
++  if (new URLSearchParams(window.location.search).has('collab')) {
++    plugins.load('collab').catch((error) => console.error('[main] 공동편집 로드 실패', error));
++  }
+ });
+ 
+ installEmbedRuntime({
+diff --git a/rhwp-studio/src/plugin/document-intercept.ts b/rhwp-studio/src/plugin/document-intercept.ts
+new file mode 100644
+index 00000000..011add1c
+--- /dev/null
++++ b/rhwp-studio/src/plugin/document-intercept.ts
+@@ -0,0 +1,59 @@
++/**
++ * cc-rhwp: 문서 객체 메서드 가로채기 — `PluginHost.interceptDocumentCalls` 의 구현.
++ *
++ * 플러그인에 wasm 모듈을 주지 않는다는 계약(`types.ts` 의 `PluginHost` 주석)을 지키면서, 문서를 바꾸는
++ * 호출 앞뒤에 플러그인이 끼어들 공식 자리다(공동편집의 기록 훅). studio 가 `HwpDocument.prototype` 의
++ * 지정 메서드를 감싸고, 감싼 메서드는 `call(name, args, invoke)` 를 부른다. 플러그인이 `invoke()` 로
++ * 원래 메서드를 실행하므로 전후 처리를 플러그인이 쥔다. 모든 문서 인스턴스에 적용된다.
++ *
++ * 여러 번 감쌀 수 있다. 해제는 자기 감싸개만 걷는다 — 위에 다른 감싸개가 올라와 있으면 자기 것을
++ * 통과 상태로 바꿔 사슬을 끊지 않는다.
++ */
++
++/**
++ * `target` 은 호출된 문서 객체다. 훅은 prototype 에 걸리므로 모든 문서 객체의 호출이 들어온다 — studio 가
++ * 문서를 열면서 교체 전에 새 객체에 보내는 호출, hwpctl 독립 실행의 별도 객체 등. 공유 문서만 기록하려면
++ * 플러그인이 `target` 을 지금 빌린 핸들과 비교한다.
++ */
++export type DocumentCallInterceptor = (name: string, args: unknown[], invoke: () => unknown, target: unknown) => unknown;
++
++interface Wrapper {
++  (this: unknown, ...args: unknown[]): unknown;
++  __ccRhwpPassThrough?: boolean;
++}
++
++/**
++ * `proto` 의 `methods` 중 함수인 것을 감싼다. 반환값은 해제 함수(여러 번 불러도 안전).
++ * 함수가 아닌 이름은 건너뛴다(studio 합성 메서드처럼 문서 객체에 없는 이름).
++ */
++export function interceptPrototype(
++  proto: object,
++  methods: Iterable<string>,
++  call: DocumentCallInterceptor,
++): { release: () => void; wrapped: string[] } {
++  const target = proto as Record<string, unknown>;
++  const installed: Array<{ name: string; previous: unknown; wrapper: Wrapper }> = [];
++  for (const name of new Set(methods)) {
++    const previous = target[name];
++    if (typeof previous !== 'function') continue;
++    const original = previous as (...args: unknown[]) => unknown;
++    const wrapper: Wrapper = function (this: unknown, ...args: unknown[]): unknown {
++      if (wrapper.__ccRhwpPassThrough) return original.apply(this, args);
++      return call(name, args, () => original.apply(this, args), this);
++    };
++    target[name] = wrapper;
++    installed.push({ name, previous, wrapper });
++  }
++  let released = false;
++  return {
++    wrapped: installed.map((i) => i.name),
++    release: () => {
++      if (released) return;
++      released = true;
++      for (const { name, previous, wrapper } of installed.reverse()) {
++        if (target[name] === wrapper) target[name] = previous;
++        else wrapper.__ccRhwpPassThrough = true;
++      }
++    },
++  };
++}
+diff --git a/rhwp-studio/src/plugin/host.ts b/rhwp-studio/src/plugin/host.ts
+index 07a99843..7edbdfb1 100644
+--- a/rhwp-studio/src/plugin/host.ts
++++ b/rhwp-studio/src/plugin/host.ts
+@@ -15,6 +15,7 @@ import type { StudioAutomation } from '@/automation/types';
+ import type { WasmBridge } from '@/core/wasm-bridge';
+ import type { EventBus } from '@/core/event-bus';
+ import type { InputHandler } from '@/engine/input-handler';
++import type { DocumentCallInterceptor } from './document-intercept.ts';
+ import type { DocumentPosition } from '@/core/types';
+ import type { SidePanelRegistry } from '@/view/side-panel-host';
+ import { readSelectionText } from './selection-text.ts';
+@@ -25,6 +26,8 @@ import {
+   type PluginErrorCode,
+   type PluginHost,
+   type PluginCaret,
++  type PluginLoadOptions,
++  type DocumentCallInterceptSpec,
+   type PluginLedger,
+   type PluginSelectionText,
+   type PluginTextRange,
+@@ -46,7 +49,7 @@ export interface PluginHostDeps {
+   eventBus: EventBus;
+   getInputHandler: () => InputHandler | null;
+   /** 문서 교체 위임 — 원자 교체·세대 증가·이전 문서 해제는 studio 가 한다. */
+-  loadDocument: (bytes: Uint8Array, fileName?: string) => Promise<void>;
++  loadDocument: (bytes: Uint8Array, fileName?: string, options?: PluginLoadOptions) => Promise<void>;
+   createBlankDocument: (options?: { confirmUnsaved?: boolean }) => Promise<boolean>;
+   /**
+    * id 로 플러그인을 가져온다. **allowlist 는 이 훅이 쥔다** — 여기서 거절하면 호스트는
+@@ -57,8 +60,28 @@ export interface PluginHostDeps {
+   sidePanels?: SidePanelRegistry;
+   /** 편집기 선택 이동. 찾기 대화상자와 같은 경로를 쓰도록 studio 가 넘긴다. */
+   selectTextRange?: (range: PluginTextRange) => boolean;
++  /** 복구용 자동 저장 중지. 반환값은 재개 함수다. 없으면 중지 요청은 아무 일도 하지 않는다. */
++  suspendAutosave?: (pluginId: string) => () => void;
++  /**
++   * 문서 메서드 가로채기(cc-rhwp). studio 가 문서 클래스 prototype 을 감싼다. 반환값은 해제 함수.
++   * 없으면 `interceptDocumentCalls` 는 아무것도 감싸지 않는다.
++   */
++  interceptDocumentCalls?: (
++    pluginId: string,
++    methods: readonly string[],
++    includeMutatingRegistry: boolean,
++    call: DocumentCallInterceptor,
++  ) => () => void;
++  /** 되돌리기 기록 중지(cc-rhwp). 반환값은 재개 함수. 없으면 중지 요청은 아무 일도 하지 않는다. */
++  suspendHistory?: (pluginId: string, message: string) => () => void;
+ }
+ 
++/** cc-rhwp: 플러그인 이벤트 'view-changed' 의 바탕 이벤트(줌·쪽 배치·창 크기·조판 갱신). */
++const VIEW_CHANGED_SOURCES = ['zoom-changed', 'page-view-settings-changed', 'viewport-resize', 'document-changed'] as const;
++
++/** 되돌리기를 멈춘 동안 undo/redo 를 누르면 보여 줄 기본 안내. */
++export const HISTORY_SUSPENDED_MESSAGE = '공동편집 중에는 되돌리기를 지원하지 않습니다';
++
+ /** `getSelectionText` 가 한 번에 돌려주는 글자 수 상한. */
+ const SELECTION_TEXT_MAX_CHARS = 20000;
+ 
+@@ -69,7 +92,8 @@ const UNLOAD_TX_POLL_MS = 20;
+ function emptyLedger(): PluginLedger {
+   return {
+     commands: new Set(), menuItems: new Set(),
+-    eventUnsubs: [], swapUnsubs: [], uiUnsubs: [], activeTx: 0,
++    eventUnsubs: [], swapUnsubs: [], uiUnsubs: [], autosaveResumes: [],
++    interceptReleases: [], historyResumes: [], activeTx: 0,
+   };
+ }
+ 
+@@ -238,8 +262,8 @@ class PluginHostFacade implements PluginHost {
+     };
+   }
+ 
+-  async loadDocument(bytes: Uint8Array, fileName?: string): Promise<void> {
+-    await this.deps.loadDocument(bytes, fileName);
++  async loadDocument(bytes: Uint8Array, fileName?: string, options?: PluginLoadOptions): Promise<void> {
++    await this.deps.loadDocument(bytes, fileName, options);
+   }
+ 
+   createBlankDocument(options?: { confirmUnsaved?: boolean }): Promise<boolean> {
+@@ -290,6 +314,14 @@ class PluginHostFacade implements PluginHost {
+ 
+   events = {
+     on: (name: string, cb: (payload?: unknown) => void): (() => void) => {
++      // cc-rhwp: 'view-changed' = 줌·쪽 배치·조판 갱신(겹쳐 그린 것의 위치를 다시 계산할 때). 스크롤은 포함하지 않는다
++      // (겹침 층이 스크롤 내용 안에 있어 함께 움직인다).
++      if (name === 'view-changed') {
++        const offs = VIEW_CHANGED_SOURCES.map((src) => this.deps.eventBus.on(src, () => cb()));
++        const off = () => offs.forEach((f) => f());
++        this.ledger.eventUnsubs.push(off);
++        return off;
++      }
+       const off = this.deps.eventBus.on(name, cb);
+       this.ledger.eventUnsubs.push(off);
+       return off;
+@@ -305,6 +337,131 @@ class PluginHostFacade implements PluginHost {
+     return off;
+   }
+ 
++  interceptDocumentCalls(spec: DocumentCallInterceptSpec): () => void {
++    const release = this.deps.interceptDocumentCalls?.(
++      this.pluginId, spec.methods, spec.includeMutatingRegistry === true,
++      (name, args, invoke, target) => spec.call(name, args, invoke, target as HwpDocument),
++    ) ?? (() => {});
++    return this.ledgerOnce(this.ledger.interceptReleases, release);
++  }
++
++  applyExternal<T>(label: string, fn: (doc: HwpDocument) => T): T {
++    if (this.ledger.activeTx > 0) {
++      throw pluginError('NESTED_TX', `트랜잭션 중첩은 허용하지 않습니다: ${label}`);
++    }
++    const ih = this.deps.getInputHandler();
++    if (!ih) throw pluginError('DOCUMENT_RELEASED', '문서가 로드되지 않았습니다');
++    const doc = this.requireDocument();
++    this.ledger.activeTx += 1;
++    try {
++      return fn(doc);
++    } finally {
++      this.ledger.activeTx -= 1;
++      // 일부만 적용된 경우에도 화면·조판을 문서와 맞춘다.
++      try { ih.triggerAfterEdit(); } catch (error) { console.error(`[PluginHost] ${label} 갱신 실패`, error); }
++    }
++  }
++
++  suspendHistory(message: string = HISTORY_SUSPENDED_MESSAGE): () => void {
++    const resume = this.deps.suspendHistory?.(this.pluginId, message) ?? (() => {});
++    return this.ledgerOnce(this.ledger.historyResumes, resume);
++  }
++
++  setCaret(caret: PluginCaret): boolean {
++    const ih = this.deps.getInputHandler();
++    if (!ih || !this.deps.wasm.borrowDocumentHandle()) return false;
++    const pos = this.toDocumentPosition(caret);
++    return pos ? ih.placeCaret(pos) : false;
++  }
++
++  isComposing(): boolean {
++    return this.deps.getInputHandler()?.isImeComposing() ?? false;
++  }
++
++  caretRect(caret: PluginCaret): { left: number; top: number; height: number } | null {
++    const ih = this.deps.getInputHandler();
++    if (!ih || !this.deps.wasm.borrowDocumentHandle()) return null;
++    const pos = this.toDocumentPosition(caret);
++    return pos ? ih.caretRectFor(pos) : null;
++  }
++
++  /** 플러그인마다 자기 층(공유 겹침 층의 자식). unload 때 원장이 걷는다. */
++  private ownOverlay: HTMLElement | null = null;
++  overlayLayer(): HTMLElement | null {
++    const shared = this.deps.getInputHandler()?.pluginOverlayLayer() ?? null;
++    if (!shared) return null;
++    if (!this.ownOverlay || this.ownOverlay.parentElement !== shared) {
++      this.ownOverlay?.remove();
++      const own = document.createElement('div');
++      own.dataset.pluginId = this.pluginId;
++      own.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;overflow:visible;pointer-events:none;';
++      shared.appendChild(own);
++      this.ownOverlay = own;
++      this.ledger.uiUnsubs.push(() => own.remove());
++    }
++    return this.ownOverlay;
++  }
++
++  /** 해제 함수를 한 번만 실행되게 감싸 원장에 담는다. */
++  private ledgerOnce(list: Array<() => void>, release: () => void): () => void {
++    let done = false;
++    const off = () => {
++      if (done) return;
++      done = true;
++      release();
++    };
++    list.push(off);
++    return off;
++  }
++
++  /** 플러그인 좌표 → studio 좌표. 범위 밖 값은 가장 가까운 유효 위치로 자른다. */
++  private toDocumentPosition(caret: PluginCaret): DocumentPosition | null {
++    const wasm = this.deps.wasm;
++    const clamp = (v: number, max: number) => Math.max(0, Math.min(Math.trunc(v), max));
++    const sectionCount = wasm.getSectionCount?.() ?? 1;
++    const sectionIndex = clamp(caret.sectionIndex, Math.max(0, sectionCount - 1));
++    const paraCount = wasm.getParagraphCount(sectionIndex);
++    if (paraCount <= 0) return null;
++    const parentParaIndex = clamp(caret.parentParaIndex, paraCount - 1);
++    if (caret.cellPath.length === 0) {
++      const len = wasm.getLogicalLength(sectionIndex, parentParaIndex);
++      return { sectionIndex, paragraphIndex: parentParaIndex, charOffset: clamp(caret.charOffset, len) };
++    }
++    if (caret.cellPath.length === 1) {
++      const [{ controlIndex, cellIndex, cellParaIndex }] = caret.cellPath;
++      try {
++        const cellParas = wasm.getCellParagraphCount(sectionIndex, parentParaIndex, controlIndex, cellIndex);
++        const cpi = clamp(cellParaIndex, Math.max(0, cellParas - 1));
++        const len = wasm.getCellParagraphLength(sectionIndex, parentParaIndex, controlIndex, cellIndex, cpi);
++        return {
++          sectionIndex, paragraphIndex: parentParaIndex, parentParaIndex, controlIndex, cellIndex,
++          cellParaIndex: cpi, charOffset: clamp(caret.charOffset, len),
++        };
++      } catch {
++        // 표가 사라졌으면 표를 품었던 본문 문단 처음으로 물러난다.
++        return { sectionIndex, paragraphIndex: parentParaIndex, charOffset: 0 };
++      }
++    }
++    // 중첩 셀: 경로를 그대로 쓰되 글자 번호만 0 이상으로 자른다.
++    return {
++      sectionIndex, paragraphIndex: parentParaIndex, parentParaIndex,
++      cellPath: caret.cellPath.map((c) => ({ ...c })),
++      charOffset: Math.max(0, Math.trunc(caret.charOffset)),
++    } as DocumentPosition;
++  }
++
++  suspendAutosave(): () => void {
++    const resume = this.deps.suspendAutosave?.(this.pluginId) ?? (() => {});
++    let resumed = false;
++    const off = () => {
++      if (resumed) return;
++      resumed = true;
++      resume();
++    };
++    this.ledger.autosaveResumes.push(off);
++    return off;
++  }
++
+   /** 문서가 교체됐음을 이 플러그인에 알린다. 호스트도 외부 교체 때 부른다. */
+   notifySwap(): void {
+     const lease = this.borrowDocument();
+@@ -435,6 +592,15 @@ export class PluginHostRegistry {
+     for (const off of ledger.uiUnsubs.reverse()) {
+       try { off(); } catch { /* noop */ }
+     }
++    for (const resume of ledger.autosaveResumes.reverse()) {
++      try { resume(); } catch { /* noop */ }
++    }
++    for (const release of ledger.interceptReleases.reverse()) {
++      try { release(); } catch { /* noop */ }
++    }
++    for (const resume of ledger.historyResumes.reverse()) {
++      try { resume(); } catch { /* noop */ }
++    }
+     for (const off of ledger.swapUnsubs.reverse()) {
+       try { off(); } catch { /* noop */ }
+     }
+@@ -448,6 +614,9 @@ export class PluginHostRegistry {
+       this.deps.automation.unregisterCommand(commandId);
+     }
+     ledger.uiUnsubs.length = 0;
++    ledger.autosaveResumes.length = 0;
++    ledger.interceptReleases.length = 0;
++    ledger.historyResumes.length = 0;
+     ledger.swapUnsubs.length = 0;
+     ledger.eventUnsubs.length = 0;
+     ledger.menuItems.clear();
+diff --git a/rhwp-studio/src/plugin/types.ts b/rhwp-studio/src/plugin/types.ts
+index 571e2b4d..e192a433 100644
+--- a/rhwp-studio/src/plugin/types.ts
++++ b/rhwp-studio/src/plugin/types.ts
+@@ -98,6 +98,17 @@ export interface Tx {
+   deferPagination(): void;
+ }
+ 
++/**
++ * `loadDocument` 선택 사항.
++ *
++ * `suppressDialogs` 는 열기 경로의 사용자 확인 창(로컬 글꼴 감지 확인)을 띄우지 않는다. 생략하면
++ * 메뉴의 열기와 같다. 사람이 고르지 않은 문서를 프로그램이 여는 경우(공동편집의 공유 문서 등)에 쓴다.
++ * embed 호스트의 `loadFile(…, suppressDialogs)` 와 같은 옵션이다.
++ */
++export interface PluginLoadOptions {
++  suppressDialogs?: boolean;
++}
++
+ /**
+  * 플러그인이 studio 에 요청할 수 있는 전부.
+  *
+@@ -134,7 +145,7 @@ export interface PluginHost {
+    * 문서 교체 위임. 원자 교체·세대 증가·이전 문서 해제는 studio 가 한다.
+    * 비동기인 이유는 studio 의 열기 경로가 저장 안 된 변경 확인·복구 흐름을 포함하기 때문이다.
+    */
+-  loadDocument(bytes: Uint8Array, fileName?: string): Promise<void>;
++  loadDocument(bytes: Uint8Array, fileName?: string, options?: PluginLoadOptions): Promise<void>;
+   /**
+    * 빈 문서로 교체한다. 끝날 때까지 기다릴 수 있다. `confirmUnsaved` 면 메뉴의 「새 문서」처럼
+    * 저장 안 된 변경을 먼저 묻는다 — 사용자가 취소하면 `false` 이고 문서는 그대로다.
+@@ -173,6 +184,73 @@ export interface PluginHost {
+ 
+   /** 문서가 교체되면 새 lease 를 받는다. 반환값은 해지 함수다. */
+   onDocumentSwap(cb: (lease: DocumentLease) => void): () => void;
++
++  /**
++   * 복구용 자동 저장을 멈춘다. 반환값은 재개 함수다(여러 번 불러도 안전하다). 원장에 담겨 unload
++   * 때 호스트가 회수한다. 멈춘 동안 저장 시점이 오면 현재 문서의 초안을 버리고 저장하지 않는다.
++   * 문서의 정본이 이 브라우저 밖에 있어 로컬 초안을 복구하면 갈래가 생기는 경우(공동편집)에 쓴다.
++   */
++  suspendAutosave(): () => void;
++
++  /**
++   * 문서를 바꾸는 호출 앞뒤에 끼어든다(공동편집의 기록 훅). studio 가 문서 객체(`HwpDocument`)의
++   * `methods` 를 감싸고, 감싼 메서드는 `call(name, args, invoke, target)` 를 부른다. `invoke()` 가 원래
++   * 메서드를 실행하고 그 반환값을 돌려준다 — `call` 의 반환값이 호출자에게 간다. 모든 문서 인스턴스에
++   * 적용되므로 **`target`(호출된 객체)이 지금 빌린 핸들인지 플러그인이 확인한다** — studio 는 문서를 열 때
++   * 교체가 끝나기 전에 새 객체에 호출을 보내고, hwpctl 독립 실행은 자기 객체를 따로 만든다.
++   * `includeMutatingRegistry` 면 studio 의 변경 메서드 목록 전체도 감싼다(문서 객체에 있는 것만).
++   * 반환값은 해제 함수다. 원장에 담겨 unload 때 회수된다.
++   *
++   * wasm 모듈을 주지 않는다는 계약을 지키면서 기록 지점을 제공하는 자리다. `call` 안에서 같은 문서의
++   * 다른 메서드를 불러도 되고(측정 등), 그 호출이 감싼 메서드면 다시 `call` 을 거친다.
++   */
++  interceptDocumentCalls(spec: DocumentCallInterceptSpec): () => void;
++
++  /**
++   * 바깥에서 온 편집을 적용한다. `fn(doc)` 을 실행하고 **undo 기록·스냅샷 없이** 편집 뒤와 같은 전체
++   * 갱신(조판·렌더·캐럿)을 한다. `fn` 이 던져도 갱신은 한다(일부 적용됐을 수 있다). 편집 모드 게이트는
++   * 거치지 않는다 — 다른 사람의 편집은 내 편집 모드와 상관없이 반영돼야 한다. 중첩은 `transaction` 과
++   * 같이 `NESTED_TX` 로 거절한다.
++   */
++  applyExternal<T>(label: string, fn: (doc: HwpDocument) => T): T;
++
++  /**
++   * 되돌리기 기록을 멈춘다. 멈춘 동안 편집은 히스토리·스냅샷에 쌓이지 않고, 되돌리기·다시 실행은 아무것도
++   * 하지 않고 안내를 띄운다. 멈출 때 기존 히스토리는 비운다. 반환값은 재개 함수(여러 번 불러도 안전)이며
++   * 원장에 담겨 unload 때 회수된다.
++   */
++  suspendHistory(message?: string): () => void;
++
++  /**
++   * 캐럿을 옮긴다(선택은 접는다). 문서는 바꾸지 않는다. 문단·글자 번호가 범위 밖이면 가장 가까운 유효
++   * 위치로 자른다. 화면이 없는 구성이거나 옮기지 못하면 `false`.
++   */
++  setCaret(caret: PluginCaret): boolean;
++
++  /** IME 조합 중인가. 조합이 끝나면 이벤트 `composition-end` 가 나온다. */
++  isComposing(): boolean;
++
++  /**
++   * 문서 위치의 캐럿 사각형(스크롤 내용 요소 기준, px). studio 캐럿과 같은 계산(본문·셀·중첩 셀, 자르기)이다.
++   * 문서를 바꾸지 않는다. 화면이 없거나 계산할 수 없으면 `null`. 위치는 `overlayLayer()` 안 절대 위치로 쓴다.
++   */
++  caretRect(caret: PluginCaret): { left: number; top: number; height: number } | null;
++
++  /**
++   * 이 플러그인의 겹침 층 — 스크롤 내용 안에 있어 문서와 함께 스크롤되고, 포인터를 받지 않으며 캐럿보다 위·
++   * 대화상자보다 아래다. 넣은 자식은 unload 때 회수된다. 문서를 다시 열면 층이 새로 생기므로 그릴 때마다 부른다.
++   * 위치는 이벤트 `view-changed`(줌·쪽 배치·조판 갱신)와 편집 반영 뒤에 다시 계산한다(스크롤에는 필요 없다).
++   */
++  overlayLayer(): HTMLElement | null;
++}
++
++/** `interceptDocumentCalls` 의 인자. */
++export interface DocumentCallInterceptSpec {
++  /** 감쌀 문서 메서드 이름. 문서 객체에 없는 이름은 건너뛴다. */
++  methods: readonly string[];
++  /** studio 의 변경 메서드 목록(`MUTATING_METHODS`) 전체도 감싼다. */
++  includeMutatingRegistry?: boolean;
++  call: (name: string, args: unknown[], invoke: () => unknown, target: HwpDocument) => unknown;
+ }
+ 
+ /**
+@@ -212,6 +290,12 @@ export interface PluginLedger {
+   swapUnsubs: Array<() => void>;
+   /** `ui.registerSidePanel` 이 돌려준 해지 함수 */
+   uiUnsubs: Array<() => void>;
++  /** `suspendAutosave` 가 돌려준 재개 함수 */
++  autosaveResumes: Array<() => void>;
++  /** `interceptDocumentCalls` 가 돌려준 해제 함수 */
++  interceptReleases: Array<() => void>;
++  /** `suspendHistory` 가 돌려준 재개 함수 */
++  historyResumes: Array<() => void>;
+   /** 진행 중인 트랜잭션 수. 0 이 될 때까지 unload 는 기다린다. */
+   activeTx: number;
+ }
+diff --git a/rhwp-studio/tests/plugin-autosave-suspend.test.ts b/rhwp-studio/tests/plugin-autosave-suspend.test.ts
+new file mode 100644
+index 00000000..5052f728
+--- /dev/null
++++ b/rhwp-studio/tests/plugin-autosave-suspend.test.ts
+@@ -0,0 +1,76 @@
++// cc-rhwp: PluginHost.suspendAutosave 의 원장 회수 계약 (docs/collab-design.md §6.9, T8).
++import test from 'node:test';
++import assert from 'node:assert/strict';
++
++import { PluginHostRegistry, type PluginHostDeps } from '../src/plugin/host.ts';
++import { PLUGIN_API_VERSION, type PluginHost, type StudioPlugin } from '../src/plugin/types.ts';
++
++function setup(capture: (host: PluginHost) => void, withSuspend = true) {
++  const active = new Set<string>();
++  const calls: string[] = [];
++  const plugin: StudioPlugin = {
++    id: 'probe',
++    apiVersion: PLUGIN_API_VERSION,
++    activate(host) { capture(host); return {}; },
++  };
++  const deps = {
++    wasm: { borrowDocumentHandle: () => null, documentGeneration: 1 },
++    automation: { removeMenuItem: () => {}, unregisterCommand: () => {} },
++    eventBus: { on: () => () => {} },
++    getInputHandler: () => null,
++    loadDocument: async () => {},
++    createBlankDocument: async () => true,
++    resolve: async () => plugin,
++    suspendAutosave: withSuspend
++      ? (pluginId: string) => {
++        const token = `${pluginId}#${calls.length}`;
++        calls.push(token);
++        active.add(token);
++        return () => { active.delete(token); };
++      }
++      : undefined,
++  } as unknown as PluginHostDeps;
++  return { registry: new PluginHostRegistry(deps), active, calls };
++}
++
++test('suspendAutosave 는 플러그인 id 로 중지를 걸고, 재개 함수는 여러 번 불러도 한 번만 푼다', async () => {
++  let host!: PluginHost;
++  const { registry, active, calls } = setup((h) => { host = h; });
++  await registry.load('probe');
++  const resume = host.suspendAutosave();
++  assert.deepEqual(calls, ['probe#0']);
++  assert.equal(active.size, 1);
++  resume();
++  resume();
++  assert.equal(active.size, 0);
++  await registry.unload('probe');
++  assert.equal(active.size, 0, 'unload 가 이미 푼 중지를 다시 건드리지 않는다');
++});
++
++test('unload 는 풀지 않은 중지를 원장에서 회수한다', async () => {
++  let host!: PluginHost;
++  const { registry, active } = setup((h) => { host = h; });
++  await registry.load('probe');
++  host.suspendAutosave();
++  host.suspendAutosave();
++  assert.equal(active.size, 2);
++  await registry.unload('probe');
++  assert.equal(active.size, 0, '자동 저장 재개');
++});
++
++test('활성화 중 건 중지도 회수된다 (활성화 직후 호출 패턴)', async () => {
++  const { registry, active } = setup((h) => { h.suspendAutosave(); });
++  await registry.load('probe');
++  assert.equal(active.size, 1);
++  await registry.unload('probe');
++  assert.equal(active.size, 0);
++});
++
++test('호스트가 중지를 지원하지 않으면 아무 일도 하지 않는 재개 함수를 준다', async () => {
++  let host!: PluginHost;
++  const { registry } = setup((h) => { host = h; }, false);
++  await registry.load('probe');
++  const resume = host.suspendAutosave();
++  assert.doesNotThrow(() => resume());
++  await registry.unload('probe');
++});
+diff --git a/rhwp-studio/tests/plugin-collab-api.test.ts b/rhwp-studio/tests/plugin-collab-api.test.ts
+new file mode 100644
+index 00000000..1e321275
+--- /dev/null
++++ b/rhwp-studio/tests/plugin-collab-api.test.ts
+@@ -0,0 +1,320 @@
++// cc-rhwp: 공동편집용 플러그인 API (docs/collab-stage2.md §6, R2).
++// interceptDocumentCalls · applyExternal · suspendHistory · setCaret · isComposing.
++//
++// 엔진 클래스(InputHandler·CommandHistory)는 node 의 strip-only TS 로 실행할 수 없어(이 저장소의 undo
++// 테스트 관례) 그쪽 배선은 소스 가드로, 호스트·가로채기는 실행으로 검증한다.
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++import { PluginHostRegistry, HISTORY_SUSPENDED_MESSAGE, type PluginHostDeps } from '../src/plugin/host.ts';
++import { interceptPrototype } from '../src/plugin/document-intercept.ts';
++import { PLUGIN_API_VERSION, type PluginHost, type StudioPlugin } from '../src/plugin/types.ts';
++import { codeOnly } from './support/source-guard.ts';
++
++const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
++const source = (rel: string): string => codeOnly(readFileSync(join(rootDir, rel), 'utf8'));
++
++// ── 가로채기 (실행) ────────────────────────────────────────────────────
++
++class FakeDoc {
++  value = 0;
++  add(n: number): number { this.value += n; return this.value; }
++  twice(n: number): number { return this.add(n) + this.add(n); }
++}
++
++test('interceptPrototype: 지정 메서드를 감싸고 invoke 가 원래 메서드를 this 와 함께 실행한다, target 은 호출된 객체', () => {
++  const calls: Array<[string, unknown[]]> = [];
++  const targets: unknown[] = [];
++  const { release, wrapped } = interceptPrototype(FakeDoc.prototype, ['add', 'missing'], (name, args, invoke, target) => {
++    calls.push([name, args]);
++    targets.push(target);
++    return invoke();
++  });
++  assert.deepEqual(wrapped, ['add'], '함수가 아닌 이름은 건너뛴다');
++  const a = new FakeDoc(), b = new FakeDoc();
++  assert.equal(a.add(2), 2);
++  assert.equal(b.add(5), 5, '모든 인스턴스에 적용');
++  assert.deepEqual(calls, [['add', [2]], ['add', [5]]]);
++  assert.equal(targets[0], a, '공유 문서인지 가리도록 호출된 객체를 넘긴다');
++  assert.equal(targets[1], b);
++  release();
++  release();
++  a.add(1);
++  assert.equal(calls.length, 2, '해제 뒤에는 감싸지 않는다');
++  assert.equal(a.value, 3);
++});
++
++test('interceptPrototype: call 이 반환값을 바꾸거나 invoke 를 건너뛸 수 있다, 안쪽 호출도 다시 거친다', () => {
++  const names: string[] = [];
++  const { release } = interceptPrototype(FakeDoc.prototype, ['add', 'twice'], (name, _args, invoke) => {
++    names.push(name);
++    return name === 'add' ? (invoke() as number) * 10 : invoke();
++  });
++  const d = new FakeDoc();
++  assert.equal(d.twice(1), 10 + 20);
++  assert.deepEqual(names, ['twice', 'add', 'add']);
++  release();
++});
++
++test('interceptPrototype: 두 겹으로 감싼 뒤 안쪽을 먼저 풀어도 바깥은 그대로 동작한다', () => {
++  const log: string[] = [];
++  const inner = interceptPrototype(FakeDoc.prototype, ['add'], (_n, _a, invoke) => { log.push('inner'); return invoke(); });
++  const outer = interceptPrototype(FakeDoc.prototype, ['add'], (_n, _a, invoke) => { log.push('outer'); return invoke(); });
++  const d = new FakeDoc();
++  d.add(1);
++  assert.deepEqual(log, ['outer', 'inner']);
++  inner.release(); // 위에 outer 가 있으므로 통과 상태가 된다
++  log.length = 0;
++  d.add(1);
++  assert.deepEqual(log, ['outer']);
++  outer.release();
++  log.length = 0;
++  assert.equal(d.add(1), 3);
++  assert.deepEqual(log, []);
++  assert.equal(Object.prototype.hasOwnProperty.call(FakeDoc.prototype, 'add'), true);
++});
++
++// ── 호스트 facade (실행) ───────────────────────────────────────────────
++
++interface Harness {
++  registry: PluginHostRegistry;
++  host: () => PluginHost;
++  log: string[];
++  ih: Record<string, unknown> | null;
++}
++
++/** 노드에는 DOM 이 없다 — 겹침 층 시험에 필요한 만큼만 흉내 낸다. */
++interface FakeEl { name: string; dataset: Record<string, string>; style: { cssText: string }; parentElement: FakeEl | null; children: FakeEl[]; appendChild(c: FakeEl): FakeEl; remove(): void }
++function fakeElement(name = 'div'): FakeEl {
++  const el: FakeEl = {
++    name, dataset: {}, style: { cssText: '' }, parentElement: null, children: [],
++    appendChild(c) { c.parentElement?.children.splice(c.parentElement.children.indexOf(c), 1); c.parentElement = el; el.children.push(c); return c; },
++    remove() { if (el.parentElement) { el.parentElement.children.splice(el.parentElement.children.indexOf(el), 1); el.parentElement = null; } },
++  };
++  return el;
++}
++(globalThis as { document?: unknown }).document ??= { createElement: () => fakeElement() };
++
++function harness(opts: { ih?: boolean; withHooks?: boolean; composing?: boolean } = {}): Harness {
++  const log: string[] = [];
++  let captured!: PluginHost;
++  const doc = { id: 'doc' };
++  const ih = opts.ih === false ? null : {
++    triggerAfterEdit: () => log.push('afterEdit'),
++    executeOperation: () => log.push('executeOperation'),
++    placeCaret: (pos: unknown) => { log.push(`placeCaret ${JSON.stringify(pos)}`); return true; },
++    isImeComposing: () => opts.composing === true,
++    caretRectFor: (pos: unknown) => { log.push(`caretRectFor ${JSON.stringify(pos)}`); return { left: 10, top: 20, height: 16 }; },
++    pluginOverlayLayer: () => sharedLayer,
++  };
++  const sharedLayer = fakeElement('shared');
++  const plugin: StudioPlugin = {
++    id: 'probe',
++    apiVersion: PLUGIN_API_VERSION,
++    activate(host) { captured = host; return {}; },
++  };
++  const deps = {
++    wasm: {
++      borrowDocumentHandle: () => doc,
++      documentGeneration: 1,
++      getSectionCount: () => 2,
++      getParagraphCount: (sec: number) => (sec === 0 ? 3 : 1),
++      getLogicalLength: (_s: number, p: number) => [5, 0, 7][p] ?? 0,
++      getCellParagraphCount: () => 2,
++      getCellParagraphLength: () => 4,
++    },
++    automation: { removeMenuItem: () => {}, unregisterCommand: () => {} },
++    eventBus: { on: (name: string) => { log.push(`on ${name}`); return () => log.push(`off ${name}`); } },
++    getInputHandler: () => ih,
++    loadDocument: async () => {},
++    createBlankDocument: async () => true,
++    resolve: async () => plugin,
++    ...(opts.withHooks === false ? {} : {
++      interceptDocumentCalls: (id: string, methods: readonly string[], all: boolean) => {
++        log.push(`intercept ${id} ${methods.join(',')} all=${all}`);
++        return () => log.push('intercept-release');
++      },
++      suspendHistory: (id: string, message: string) => {
++        log.push(`suspendHistory ${id} ${message}`);
++        return () => log.push('history-resume');
++      },
++    }),
++  } as unknown as PluginHostDeps;
++  const registry = new PluginHostRegistry(deps);
++  return { registry, host: () => captured, log, ih };
++}
++
++test('interceptDocumentCalls: 호스트로 넘기고, 해제는 원장이 unload 때 회수한다(한 번만)', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const release = h.host().interceptDocumentCalls({ methods: ['insertText'], includeMutatingRegistry: true, call: (_n, _a, i) => i() });
++  assert.deepEqual(h.log, ['intercept probe insertText all=true']);
++  release();
++  await h.registry.unload('probe');
++  assert.deepEqual(h.log.filter((l) => l === 'intercept-release'), ['intercept-release'], '수동 해제 뒤 회수는 다시 부르지 않는다');
++
++  const h2 = harness();
++  await h2.registry.load('probe');
++  h2.host().interceptDocumentCalls({ methods: ['a'], call: (_n, _a, i) => i() });
++  await h2.registry.unload('probe');
++  assert.ok(h2.log.includes('intercept-release'), 'unload 가 회수');
++});
++
++test('applyExternal: undo 경로 없이 실행하고 전체 갱신한다, 던져도 갱신, 중첩은 거절', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const host = h.host();
++  const got = host.applyExternal('collab:remote', (doc) => { h.log.push(`fn ${(doc as unknown as { id: string }).id}`); return 7; });
++  assert.equal(got, 7);
++  assert.deepEqual(h.log, ['fn doc', 'afterEdit']);
++  assert.ok(!h.log.includes('executeOperation'), 'undo 기록(executeOperation)을 거치지 않는다');
++
++  h.log.length = 0;
++  assert.throws(() => host.applyExternal('x', () => { throw new Error('boom'); }), /boom/);
++  assert.deepEqual(h.log, ['afterEdit'], '던져도 갱신');
++
++  assert.throws(
++    () => host.applyExternal('outer', () => host.applyExternal('inner', () => 1)),
++    (e: Error & { code?: string }) => e.code === 'NESTED_TX',
++  );
++});
++
++test('applyExternal: 입력 처리기가 없으면 DOCUMENT_RELEASED', async () => {
++  const h = harness({ ih: false });
++  await h.registry.load('probe');
++  assert.throws(() => h.host().applyExternal('x', () => 1), (e: Error & { code?: string }) => e.code === 'DOCUMENT_RELEASED');
++});
++
++test('suspendHistory: 기본 안내로 호스트에 걸고, 재개는 멱등이며 unload 가 회수한다', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const resume = h.host().suspendHistory();
++  assert.deepEqual(h.log, [`suspendHistory probe ${HISTORY_SUSPENDED_MESSAGE}`]);
++  resume(); resume();
++  await h.registry.unload('probe');
++  assert.equal(h.log.filter((l) => l === 'history-resume').length, 1);
++});
++
++test('호스트가 훅을 주지 않으면 intercept·suspendHistory 는 아무 일도 하지 않는다(기본값 불변)', async () => {
++  const h = harness({ withHooks: false });
++  await h.registry.load('probe');
++  const a = h.host().interceptDocumentCalls({ methods: ['x'], call: (_n, _a, i) => i() });
++  const b = h.host().suspendHistory();
++  assert.doesNotThrow(() => { a(); b(); });
++  await h.registry.unload('probe');
++});
++
++test('setCaret: 범위 밖 값은 가장 가까운 유효 위치로 자르고 선택을 접는 placeCaret 으로 옮긴다', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const host = h.host();
++  assert.equal(host.setCaret({ sectionIndex: 0, parentParaIndex: 2, cellPath: [], charOffset: 99 }), true);
++  assert.equal(host.setCaret({ sectionIndex: 9, parentParaIndex: 9, cellPath: [], charOffset: -3 }), true);
++  assert.equal(host.setCaret({
++    sectionIndex: 0, parentParaIndex: 0, charOffset: 50,
++    cellPath: [{ controlIndex: 1, cellIndex: 2, cellParaIndex: 8 }],
++  }), true);
++  assert.deepEqual(h.log, [
++    'placeCaret {"sectionIndex":0,"paragraphIndex":2,"charOffset":7}',
++    'placeCaret {"sectionIndex":1,"paragraphIndex":0,"charOffset":0}',
++    'placeCaret {"sectionIndex":0,"paragraphIndex":0,"parentParaIndex":0,"controlIndex":1,"cellIndex":2,"cellParaIndex":1,"charOffset":4}',
++  ]);
++  const none = harness({ ih: false });
++  await none.registry.load('probe');
++  assert.equal(none.host().setCaret({ sectionIndex: 0, parentParaIndex: 0, cellPath: [], charOffset: 0 }), false);
++});
++
++test('isComposing: 입력 처리기의 조합 상태를 그대로 준다', async () => {
++  const on = harness({ composing: true });
++  await on.registry.load('probe');
++  assert.equal(on.host().isComposing(), true);
++  const off = harness({ composing: false });
++  await off.registry.load('probe');
++  assert.equal(off.host().isComposing(), false);
++  const none = harness({ ih: false });
++  await none.registry.load('probe');
++  assert.equal(none.host().isComposing(), false);
++});
++
++test('caretRect: 위치를 자른 뒤 입력 처리기의 같은 계산(caretRectFor)으로, 화면이 없으면 null (R10)', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const host = h.host();
++  assert.deepEqual(host.caretRect({ sectionIndex: 0, parentParaIndex: 2, cellPath: [], charOffset: 99 }), { left: 10, top: 20, height: 16 });
++  assert.ok(h.log.includes('caretRectFor {"sectionIndex":0,"paragraphIndex":2,"charOffset":7}'), h.log.join(' | '));
++  const none = harness({ ih: false });
++  await none.registry.load('probe');
++  assert.equal(none.host().caretRect({ sectionIndex: 0, parentParaIndex: 0, cellPath: [], charOffset: 0 }), null);
++});
++
++test('overlayLayer: 공유 겹침 층 안에 플러그인 자기 층, 다시 불러도 같은 층, unload 가 걷는다 (R10)', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const host = h.host();
++  const own = host.overlayLayer() as unknown as FakeEl;
++  assert.ok(own, '층');
++  assert.equal(own.dataset.pluginId, 'probe');
++  assert.match(own.style.cssText, /pointer-events:none/);
++  assert.equal(host.overlayLayer(), own as unknown, '같은 층');
++  const shared = own.parentElement as FakeEl;
++  assert.equal(shared.children.length, 1);
++  await h.registry.unload('probe');
++  assert.equal(shared.children.length, 0, 'unload 가 회수');
++});
++
++test("events.on('view-changed'): 줌·쪽 배치·창 크기·조판 갱신을 한데 묶고, 해지·unload 가 모두 푼다 (R10)", async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  const off = h.host().events.on('view-changed', () => {});
++  for (const src of ['zoom-changed', 'page-view-settings-changed', 'viewport-resize', 'document-changed']) {
++    assert.ok(h.log.includes(`on ${src}`), src);
++  }
++  assert.ok(!h.log.includes('on viewport-scroll'), '스크롤은 다시 계산할 필요가 없다');
++  off();
++  assert.ok(h.log.includes('off zoom-changed') && h.log.includes('off document-changed'));
++});
++
++// ── 엔진 배선 (소스 가드) ──────────────────────────────────────────────
++
++test('CommandHistory: 기록 중지 동안 execute·recordWithoutExecute 는 쌓지 않고 discard, 멈출 때 비운다', () => {
++  const history = source('src/engine/history.ts');
++  assert.match(history, /setSuspended\(on: boolean, wasm\?: WasmBridge\): void \{\s*if \(on && !this\.suspended\) this\.clear\(wasm\);/);
++  const execute = history.slice(history.indexOf('execute(command: EditCommand'), history.indexOf('// 직전 명령과 병합 시도'));
++  assert.match(execute, /if \(this\.suspended\) \{\s*command\.discard\?\.\(wasm\);\s*return cursorAfter;/);
++  const record = history.slice(history.indexOf('recordWithoutExecute('), history.indexOf('canUndo()'));
++  assert.match(record, /if \(this\.suspended\) \{\s*if \(wasm\) command\.discard\?\.\(wasm\);\s*return;/);
++});
++
++test('InputHandler: 중지 중 undo/redo 는 안내만, 조합 종료 이벤트, 캐럿 이동은 선택을 접는다', () => {
++  const ih = source('src/engine/input-handler.ts');
++  for (const fn of ['private handleUndo(): void {', 'private handleRedo(): void {']) {
++    const body = ih.slice(ih.indexOf(fn), ih.indexOf(fn) + 300);
++    assert.match(body, /if \(this\.historySuspendedMessage !== null\) \{\s*showToast\(\{ message: this\.historySuspendedMessage \}\);\s*return;/, fn);
++  }
++  assert.match(ih, /canUndo\(\): boolean \{ return this\.historySuspendedMessage !== null \|\| this\.history\.canUndo\(\); \}/);
++  assert.match(ih, /_text\.onCompositionEnd\.call\(this\);\s*(?:\/\/[^\n]*\n\s*)?if \(!this\.isComposing\) this\.eventBus\.emit\('composition-end'\);/);
++  const place = ih.slice(ih.indexOf('placeCaret(pos: DocumentPosition): boolean {'));
++  assert.match(place.slice(0, 400), /if \(this\.isComposing\) return false;[\s\S]*this\.cursor\.clearSelection\(\);\s*this\.cursor\.moveTo\(pos\);/);
++  assert.match(ih, /setHistorySuspended\(message: string \| null\): void \{\s*this\.historySuspendedMessage = message;\s*this\.history\.setSuspended\(message !== null, this\.wasm\);/);
++});
++
++test('main.ts: 가로채기는 문서 클래스 prototype 에, 레지스트리 목록 포함 선택, 중지 토큰으로 입력 처리기 갱신', () => {
++  const main = source('src/main.ts');
++  assert.match(main, /import \{ HwpDocument as HwpDocumentClass \} from '@wasm\/rhwp\.js';/);
++  assert.match(main, /interceptDocumentCalls: \(_pluginId, methods, includeMutatingRegistry, call\) => \{\s*const names = includeMutatingRegistry \? \[\.\.\.methods, \.\.\.MUTATING_METHODS\] : \[\.\.\.methods\];\s*return interceptPrototype\(HwpDocumentClass\.prototype, names, call\)\.release;/);
++  assert.match(main, /suspendHistory: \(pluginId, message\) => \{[\s\S]{0,200}historySuspensions\.set\(token, message\);\s*applyHistorySuspension\(\);/);
++  assert.match(main, /inputHandler\?\.setHistorySuspended\(messages\.length > 0 \? messages\[messages\.length - 1\] : null\);/);
++});
++
++test('InputHandler·CaretRenderer: 다른 사람 캐럿 위치는 studio 캐럿과 같은 계산, 겹침 층은 스크롤 내용 안 (R10)', () => {
++  const ih = source('src/engine/input-handler.ts');
++  assert.match(ih, /caretRectFor\(pos: DocumentPosition\)/);
++  for (const m of ['getCursorRectByPath', 'getCursorRectInCell', 'getCursorRect(']) assert.ok(ih.includes(m), m);
++  assert.match(ih, /this\.caret\.toContentRect\(rect, this\.viewportManager\.getZoom\(\)\)/);
++  assert.match(ih, /pluginOverlayLayer\(\)[\s\S]*#scroll-content[\s\S]*pointer-events:none[\s\S]*z-index:11/);
++  const caret = source('src/engine/caret-renderer.ts');
++  assert.match(caret, /toContentRect\(rect: CursorRect, zoom: number\)[\s\S]*clampCaretRect[\s\S]*calcPageLeft[\s\S]*getPageOffset/);
++});
+diff --git a/rhwp-studio/tsconfig.json b/rhwp-studio/tsconfig.json
+index 564f230e..8c680904 100644
+--- a/rhwp-studio/tsconfig.json
++++ b/rhwp-studio/tsconfig.json
+@@ -16,7 +16,8 @@
+     "paths": {
+       "@/*": ["./src/*"],
+       "@wasm/*": ["../pkg/*"],
+-      "@rhwp/hwpctrl/studio-plugin": ["./types/rhwp-hwpctrl-plugin.d.ts"]
++      "@rhwp/hwpctrl/studio-plugin": ["./types/rhwp-hwpctrl-plugin.d.ts"],
++      "@cc-rhwp/collab-plugin": ["../../../collab-client/src/plugin.ts"]
+     }
+   },
+   "include": ["src"]
+diff --git a/rhwp-studio/vite.config.ts b/rhwp-studio/vite.config.ts
+index 58c83bdd..421d2542 100644
+--- a/rhwp-studio/vite.config.ts
++++ b/rhwp-studio/vite.config.ts
+@@ -47,6 +47,8 @@ export default defineConfig({
+       // 플러그인 패키지 — 동적 import 로만 들어오므로 별도 청크가 된다.
+       // 올리지 않으면 코드도 로드되지 않는다(플러그인 없는 studio 의 초기 비용 0).
+       '@rhwp/hwpctrl/studio-plugin': resolve(configDir, '..', 'npm', 'hwpctrl-ocx', 'src', 'studio-plugin.mjs'),
++      // cc-rhwp: 공동편집 플러그인 (다운스트림 패치, collab-client/ 참고)
++      '@cc-rhwp/collab-plugin': resolve(configDir, '..', '..', '..', 'collab-client', 'src', 'plugin.ts'),
+     },
+   },
+   // AI SDK 는 질문할 때 동적 import 로만 들어온다. 개발 서버가 그때 처음 발견하면 의존성을
+@@ -75,6 +77,8 @@ export default defineConfig({
+         subsecondWasmDir,
+         resolve(configDir, '..', 'samples'),
+         resolve(configDir, '..', 'npm', 'editor'),
++        // cc-rhwp: 공동편집 플러그인 소스
++        resolve(configDir, '..', '..', '..', 'collab-client'),
+       ],
+     },
+     watch: {

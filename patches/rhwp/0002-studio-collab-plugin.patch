@@ -1,3 +1,112 @@
+diff --git a/rhwp-studio/src/core/font-policy.ts b/rhwp-studio/src/core/font-policy.ts
+new file mode 100644
+index 00000000..386c0d0e
+--- /dev/null
++++ b/rhwp-studio/src/core/font-policy.ts
+@@ -0,0 +1,39 @@
++/**
++ * cc-rhwp(S3-1): 글꼴 정책 — 공동편집 중 기기·브라우저가 달라도 같은 조판이 나오게 한다.
++ *
++ * `bundled-only` 를 누가 쥐고 있는 동안:
++ * - **조판**은 엔진 내장 규칙(기본 글꼴 환경)만 쓴다. 선언 글꼴 환경(로컬·`local()` 존재 확인·내장 웹 글꼴
++ *   프로그램 메트릭), Canvas 보충 측정(`measureText`), 네이티브 OTF/PUA 공급, 호스트 글꼴은 조판에 들어가지
++ *   않는다. Node(서버 정본·시뮬레이션)와 같은 환경이다.
++ * - **표시**는 내장 웹 글꼴만 쓴다(로컬 글꼴 스냅샷 적재·권한 안내·CanvasKit 로컬 face 준비를 건너뛴다).
++ *
++ * 여러 곳이 쥘 수 있고, 마지막 해제 때 원래 동작으로 돌아간다. 바뀔 때마다 구독자에게 알린다.
++ */
++const holders = new Set<symbol>();
++const listeners = new Set<() => void>();
++
++export function bundledFontsOnly(): boolean {
++  return holders.size > 0;
++}
++
++/** 정책을 쥔다. 반환값은 해제 함수(여러 번 불러도 안전). */
++export function acquireBundledFontPolicy(owner = 'anonymous'): () => void {
++  const token = Symbol(owner);
++  const before = bundledFontsOnly();
++  holders.add(token);
++  if (!before) notify();
++  return () => {
++    if (holders.delete(token) && !bundledFontsOnly()) notify();
++  };
++}
++
++export function onFontPolicyChanged(listener: () => void): () => void {
++  listeners.add(listener);
++  return () => { listeners.delete(listener); };
++}
++
++function notify(): void {
++  for (const listener of [...listeners]) {
++    try { listener(); } catch (error) { console.warn('[FontPolicy] 구독자 오류', error); }
++  }
++}
+diff --git a/rhwp-studio/src/core/wasm-bridge.ts b/rhwp-studio/src/core/wasm-bridge.ts
+index 9c713c46..f66e8cd6 100644
+--- a/rhwp-studio/src/core/wasm-bridge.ts
++++ b/rhwp-studio/src/core/wasm-bridge.ts
+@@ -24,6 +24,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
+ import type { DocumentInfo, PageInfo, PageDef, SectionDef, PageBorderFillSettings, EndnoteShapeSettings, NoteEditInfo, CursorRect, HitTestResult, BodyFootnoteMarkerHit, FootnoteAtCursorResult, DeleteFootnoteResult, LineInfo, TableDimensions, CellInfo, CellBbox, CellProperties, TableProperties, DocumentPosition, MoveVerticalResult, SelectionRect, CharProperties, ParaProperties, CellPathEntry, CellPathLike, NavContextEntry, FieldInfoResult, BookmarkInfo, LayerRenderProfile, PageLayerTree, CanvasKitDocumentPreflight } from './types';
+ import { parseCanvasKitDocumentPreflight } from './canvaskit-document-preflight';
+ import { LayerResourceStore } from './layer-resource-store';
++import { bundledFontsOnly } from './font-policy';
+ import { readLayerTreeTransport, type LayerTreeExportOptions } from './layer-tree-transport';
+ import {
+   normalizeHmlSaveState,
+@@ -325,6 +326,15 @@ export class WasmBridge {
+     const metafileFontGeneration = this.canvasFontGeneration;
+     if (!await this.metafileFonts.prepare(doc as unknown as MetafileFontDocument | null,
+       metafileFontGeneration, () => current() && this.canvasFontGeneration === metafileFontGeneration)) return false;
++    // cc-rhwp(S3-1): 글꼴 정책 bundled-only — 호스트 글꼴·네이티브 OTF/PUA·Canvas 보충 측정을 조판에 넣지 않는다.
++    // 메타파일 글꼴(그림 안 글자 표시용, 조판과 무관)은 위에서 그대로 준비한다.
++    if (bundledFontsOnly()) {
++      this.pageHostFontRequests = undefined;
++      this.hostCanvasFonts.reset();
++      this.nativePuaFonts.clear(doc as unknown as NativePuaFontDocument | null);
++      this.canvasMetrics.invalidate();
++      return this.canvasMetricDocument()?.selectCanvasMetrics(false) ?? false;
++    }
+     if (backend === 'canvas2d' && hasHostFontProvider()) {
+       const generation = getHostFontState().generation;
+       await prepareHostFontCatalog();
+@@ -1042,6 +1052,8 @@ export class WasmBridge {
+     const doc = this.doc;
+     // 새 조판 참여는 Canvas2D 연결에 한정하고 이전 자동 환경의 해제도 처리한다.
+     if (!doc) return false;
++    // cc-rhwp(S3-1): 글꼴 정책 bundled-only — 조판은 엔진 내장 규칙(기본 환경)만 쓴다.
++    if (bundledFontsOnly()) return this.useEngineFontEnvironment(doc);
+     const useHost = backend === 'canvas2d' && hostFontLayoutEnabled();
+     const restoreHost = this.hasHostFontLayoutEnvironment && !useHost;
+     if (!restoreHost && (backend !== 'canvas2d' || (hasHostFontProvider() && !useHost))) return false;
+@@ -1109,6 +1121,26 @@ export class WasmBridge {
+     }
+   }
+ 
++  /**
++   * cc-rhwp(S3-1): 선언·로컬·호스트 글꼴 환경을 걷고 엔진 기본 환경으로 돌린다. 진행 중인 자동 준비는
++   * 무효로 한다(돌아와도 `current()` 가 거짓). 사용자 지정 환경도 정책 동안은 쓰지 않는다.
++   */
++  private useEngineFontEnvironment(doc: HwpDocument): boolean {
++    const api = doc as unknown as Partial<DocumentFontEnvironmentApi>;
++    this.automaticFontRequest += 1;
++    const restoreHost = this.hasHostFontLayoutEnvironment;
++    this.automaticFontEnvironment = null;
++    this.automaticFontPrograms = null;
++    this.hostLayoutDocumentGeneration = null;
++    let changed = false;
++    if (typeof api.getDocumentFontSelectionPlan === 'function' && typeof api.setFontEnvironment === 'function') {
++      const plan = JSON.parse(api.getDocumentFontSelectionPlan()) as DocumentFontSelectionPlan;
++      if (plan.environmentId !== null) changed = api.setFontEnvironment(undefined);
++    }
++    if (changed || restoreHost) this.invalidateCanvasMetricFonts();
++    return changed;
++  }
++
+   getDocumentInfo(): DocumentInfo {
+     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+     return JSON.parse(this.doc.getDocumentInfo());
 diff --git a/rhwp-studio/src/engine/caret-renderer.ts b/rhwp-studio/src/engine/caret-renderer.ts
 index 1e2a6986..4caa8146 100644
 --- a/rhwp-studio/src/engine/caret-renderer.ts
@@ -207,10 +316,18 @@ index 7d251116..e3b68288 100644
    /** Undo 실행 (커맨드 시스템용) */
    performUndo(): void { this.handleUndo(); }
 diff --git a/rhwp-studio/src/main.ts b/rhwp-studio/src/main.ts
-index 50b4215d..729fa5d7 100644
+index 50b4215d..13afee55 100644
 --- a/rhwp-studio/src/main.ts
 +++ b/rhwp-studio/src/main.ts
-@@ -32,6 +32,10 @@ import { AutomationHost } from '@/automation/host';
+@@ -6,6 +6,7 @@ import { isPdfInput, type PdfInputSource } from './core/pdf-open';
+ import { showPdfImportDialog, cancelPdfImport } from './ui/pdf-import-dialog';
+ import { installCommandErrorGlobalRouting, StudioCommandError, inspectCommandError, type CommandErrorV1 } from '@/core/command-error';
+ import { hostFontLayoutEnabled, setHostFontProvider, onHostFontsChanged, hasHostFontProvider, prepareHostFontCatalog, getHostFontState, localFontFaceKey, type LocalFontRecord } from '@/core/local-fonts';
++import { acquireBundledFontPolicy, bundledFontsOnly, onFontPolicyChanged } from '@/core/font-policy';
+ import { collectHostFontRequests, collectDocumentCanvasKitFontUsage, resolveDocumentCanvasKitFontUsage, type DocumentCanvasKitFontUsage } from '@/core/host-font-requests';
+ import { WasmBridge } from '@/core/wasm-bridge';
+ import { installDocumentTitle } from '@/ui/document-title';
+@@ -32,6 +33,10 @@ import { AutomationHost } from '@/automation/host';
  import { getChromeVisibility, setChromeVisibility } from '@/automation/chrome';
  import type { ChromeVisibility } from '@/automation/types';
  import { PluginHostRegistry } from '@/plugin/host';
@@ -221,7 +338,7 @@ index 50b4215d..729fa5d7 100644
  import type { StudioPlugin } from '@/plugin/types';
  import { CommandDispatcher } from '@/command/dispatcher';
  import type { EditorContext, CommandServices, EditorEditMode } from '@/command/types';
-@@ -141,10 +145,19 @@ Object.defineProperty(window, 'rhwpCommandErrors', { value: Object.freeze({
+@@ -141,10 +146,19 @@ Object.defineProperty(window, 'rhwpCommandErrors', { value: Object.freeze({
    getState: () => inputHandler?.getCommandErrorState() ?? null,
  }), configurable: true });
  documentState.installBeforeUnload(window);
@@ -243,7 +360,7 @@ index 50b4215d..729fa5d7 100644
    protectDraft: async draft => {
      if (!wasm.requiresPasswordForSave) return draft;
      const cipher = wasm.recoveryCipher;
-@@ -348,6 +361,10 @@ async function resolvePlugin(id: string): Promise<StudioPlugin> {
+@@ -348,6 +362,10 @@ async function resolvePlugin(id: string): Promise<StudioPlugin> {
    if (import.meta.env.DEV && id === 'dev-probe') {
      return (await import('@/plugin/dev-probe-plugin')).devProbePlugin;
    }
@@ -254,7 +371,7 @@ index 50b4215d..729fa5d7 100644
    throw new Error(`허용되지 않은 플러그인: ${id}`);
  }
  
-@@ -368,7 +385,10 @@ const plugins = new PluginHostRegistry({
+@@ -368,7 +386,10 @@ const plugins = new PluginHostRegistry({
    automation,
    eventBus,
    getInputHandler: () => inputHandler,
@@ -266,7 +383,7 @@ index 50b4215d..729fa5d7 100644
    createBlankDocument: async (options) => {
      if (options?.confirmUnsaved && !await canReplaceCurrentDocument()) return false;
      await createNewDocument();
-@@ -376,6 +396,24 @@ const plugins = new PluginHostRegistry({
+@@ -376,6 +397,26 @@ const plugins = new PluginHostRegistry({
    },
    resolve: resolvePlugin,
    sidePanels,
@@ -282,6 +399,8 @@ index 50b4215d..729fa5d7 100644
 +    applyHistorySuspension();
 +    return () => { historySuspensions.delete(token); applyHistorySuspension(); };
 +  },
++  // cc-rhwp(S3-1): 글꼴 정책. 걸고 풀 때 지금 문서의 글꼴 환경을 다시 준비한다(onFontPolicyChanged).
++  setFontPolicy: (pluginId) => acquireBundledFontPolicy(pluginId),
 +  // cc-rhwp: 플러그인별 자동 저장 중지 (원장이 unload 때 재개 함수를 회수한다)
 +  suspendAutosave: (pluginId) => {
 +    const token = Symbol(pluginId);
@@ -291,7 +410,7 @@ index 50b4215d..729fa5d7 100644
    selectTextRange: (range) => {
      if (!inputHandler) return false;
      navigateToSearchHit(inputHandler, {
-@@ -478,6 +516,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
+@@ -478,6 +519,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
  }
  
  function handleAutosaveStatus(status: AutosaveStatus): void {
@@ -301,7 +420,86 @@ index 50b4215d..729fa5d7 100644
    const message = document.getElementById('sb-message');
    if (!message) return;
    if (autosaveStatusRestoreTimer) {
-@@ -1997,7 +2038,8 @@ async function renderRecentSubmenu(): Promise<void> {
+@@ -564,6 +608,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
+     ? rendererSession?.getCanvasKitRenderer() ?? null
+     : null;
+   if (!renderer || (!fontNames?.length && !refresh)) return;
++  // cc-rhwp(S3-1): 글꼴 정책 bundled-only 동안은 로컬 face 를 표시에도 쓰지 않는다.
++  if (bundledFontsOnly()) return;
+   const requestedFonts = [...(fontNames ?? [])];
+   void (async () => {
+     await loadStoredLocalFonts();
+@@ -693,9 +739,12 @@ async function initialize(): Promise<void> {
+           try {
+             // 저장된 Local Font Access 권한이 있으면 첫 replay부터 원 face의 SFNT bytes를
+             // CanvasKit에 전달한다. CSS local()에서 EBDT face가 두부로 바뀌는 경로를 타지 않는다.
+-            await loadStoredLocalFonts();
+-            requiredFontFamilies = documentFontRequirements(fontRequirements);
+-            await renderer.prepareLocalFonts(requiredFontFamilies);
++            // cc-rhwp(S3-1): 글꼴 정책 bundled-only 동안은 로컬 face 를 준비하지 않는다(내장 face 로 연다).
++            if (!bundledFontsOnly()) {
++              await loadStoredLocalFonts();
++              requiredFontFamilies = documentFontRequirements(fontRequirements);
++              await renderer.prepareLocalFonts(requiredFontFamilies);
++            }
+           } catch (error) {
+             // 로컬 권한이 만료됐거나 face 읽기에 실패해도 portable bundled face로 계속 연다.
+             console.warn(
+@@ -1313,8 +1362,29 @@ function setupEventListeners(): void {
+     }
+   });
+ 
++  // cc-rhwp(S3-1): 글꼴 정책이 바뀌면 지금 문서의 조판 환경·Canvas 측정·표시 글꼴을 새 정책으로 다시 준비한다.
++  onFontPolicyChanged(() => {
++    if (!canvasView || wasm.pageCount === 0) return;
++    const documentGeneration = wasm.documentGeneration;
++    void wasm.prepareDeclaredFontEnvironment(canvasView.getRenderBackend()).then(changed => {
++      if (!canvasView || wasm.pageCount === 0 || wasm.documentGeneration !== documentGeneration) return;
++      wasm.invalidateCanvasMetricFonts();
++      if (!changed) wasm.refreshLayout();
++      const info = wasm.getDocumentInfo();
++      setDocumentFontSubstitutions(info.fontSubstitutions);
++      currentDocumentFonts = [...new Set([
++        ...(info.fontsUsed ?? []),
++        ...(info.fontSubstitutions ?? []).map(([, target]) => target),
++      ])];
++      return canvasView.refreshFontResources();
++    }).catch(error => {
++      console.warn('[FontPolicy] 글꼴 환경 다시 준비 실패:', error);
++    });
++  });
++
+   onHostFontsChanged(() => {
+     if (!canvasView || wasm.pageCount === 0) return;
++    if (bundledFontsOnly()) return; // cc-rhwp(S3-1): 정책 동안 호스트 글꼴 변화는 조판·표시에 반영하지 않는다.
+     wasm.invalidateCanvasMetricFonts();
+     const documentGeneration = wasm.documentGeneration;
+     const hostGeneration = getHostFontState().generation;
+@@ -1343,6 +1413,7 @@ function setupEventListeners(): void {
+       clearDeclaredLocalPrograms();
+     }
+     if (!canvasView || wasm.pageCount === 0) return;
++    if (bundledFontsOnly()) return; // cc-rhwp(S3-1): 정책 동안 새로 감지한 로컬 글꼴을 반영하지 않는다.
+     const state = getLocalFontState();
+     const generation = `${state.detectedAt ?? 'none'}:${state.source ?? 'none'}:${state.count}`;
+     if (generation === lastAppliedLocalFontGeneration) return;
+@@ -1535,11 +1606,13 @@ async function initializeDocument(
+   try {
+     signal.throwIfAborted();
+     // 이미 승인된 snapshot을 권한 prompt 없이 준비한 뒤 프로그램을 선택한다.
+-    await loadStoredLocalFonts();
++    // cc-rhwp(S3-1): 글꼴 정책 bundled-only 동안은 로컬 글꼴을 읽지도, 권한을 묻지도 않는다.
++    const localFontsAllowed = !bundledFontsOnly();
++    if (localFontsAllowed) await loadStoredLocalFonts();
+     signal.throwIfAborted();
+     // 초기화 후 첫 문서 로드의 선택을 프로그램 공급·조판보다 먼저 확정한다.
+     // 감지 완료와 이전 대체 환경의 비동기 갱신이 경합하지 않게 한다.
+-    if (!options.suppressDialogs && !options.suppressLocalFontPrompt) {
++    if (localFontsAllowed && !options.suppressDialogs && !options.suppressLocalFontPrompt) {
+       await promptLocalFontsIfNeeded(displayName);
+       signal.throwIfAborted();
+     }
+@@ -1997,7 +2070,8 @@ async function renderRecentSubmenu(): Promise<void> {
  
  function shouldSkipInitialAutosaveRecovery(): boolean {
    const params = new URLSearchParams(window.location.search);
@@ -311,7 +509,7 @@ index 50b4215d..729fa5d7 100644
  }
  
  async function offerAutosaveRecoveryIfIdle(): Promise<void> {
-@@ -2306,6 +2348,10 @@ void initPromise.then(() => {
+@@ -2306,6 +2380,10 @@ void initPromise.then(() => {
    if (__RHWP_AI__ && sidePanels && window.parent === window) {
      plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
    }
@@ -388,7 +586,7 @@ index 00000000..011add1c
 +  };
 +}
 diff --git a/rhwp-studio/src/plugin/host.ts b/rhwp-studio/src/plugin/host.ts
-index 07a99843..7edbdfb1 100644
+index 07a99843..080ea2f8 100644
 --- a/rhwp-studio/src/plugin/host.ts
 +++ b/rhwp-studio/src/plugin/host.ts
 @@ -15,6 +15,7 @@ import type { StudioAutomation } from '@/automation/types';
@@ -417,7 +615,7 @@ index 07a99843..7edbdfb1 100644
    createBlankDocument: (options?: { confirmUnsaved?: boolean }) => Promise<boolean>;
    /**
     * id 로 플러그인을 가져온다. **allowlist 는 이 훅이 쥔다** — 여기서 거절하면 호스트는
-@@ -57,8 +60,28 @@ export interface PluginHostDeps {
+@@ -57,8 +60,30 @@ export interface PluginHostDeps {
    sidePanels?: SidePanelRegistry;
    /** 편집기 선택 이동. 찾기 대화상자와 같은 경로를 쓰도록 studio 가 넘긴다. */
    selectTextRange?: (range: PluginTextRange) => boolean;
@@ -435,6 +633,8 @@ index 07a99843..7edbdfb1 100644
 +  ) => () => void;
 +  /** 되돌리기 기록 중지(cc-rhwp). 반환값은 재개 함수. 없으면 중지 요청은 아무 일도 하지 않는다. */
 +  suspendHistory?: (pluginId: string, message: string) => () => void;
++  /** 글꼴 정책(cc-rhwp S3-1). 반환값은 해제 함수. 없으면 정책 요청은 아무 일도 하지 않는다. */
++  setFontPolicy?: (pluginId: string, policy: 'bundled-only') => () => void;
  }
  
 +/** cc-rhwp: 플러그인 이벤트 'view-changed' 의 바탕 이벤트(줌·쪽 배치·창 크기·조판 갱신). */
@@ -446,17 +646,17 @@ index 07a99843..7edbdfb1 100644
  /** `getSelectionText` 가 한 번에 돌려주는 글자 수 상한. */
  const SELECTION_TEXT_MAX_CHARS = 20000;
  
-@@ -69,7 +92,8 @@ const UNLOAD_TX_POLL_MS = 20;
+@@ -69,7 +94,8 @@ const UNLOAD_TX_POLL_MS = 20;
  function emptyLedger(): PluginLedger {
    return {
      commands: new Set(), menuItems: new Set(),
 -    eventUnsubs: [], swapUnsubs: [], uiUnsubs: [], activeTx: 0,
 +    eventUnsubs: [], swapUnsubs: [], uiUnsubs: [], autosaveResumes: [],
-+    interceptReleases: [], historyResumes: [], activeTx: 0,
++    interceptReleases: [], historyResumes: [], fontPolicyReleases: [], activeTx: 0,
    };
  }
  
-@@ -238,8 +262,8 @@ class PluginHostFacade implements PluginHost {
+@@ -238,8 +264,8 @@ class PluginHostFacade implements PluginHost {
      };
    }
  
@@ -467,7 +667,7 @@ index 07a99843..7edbdfb1 100644
    }
  
    createBlankDocument(options?: { confirmUnsaved?: boolean }): Promise<boolean> {
-@@ -290,6 +314,14 @@ class PluginHostFacade implements PluginHost {
+@@ -290,6 +316,14 @@ class PluginHostFacade implements PluginHost {
  
    events = {
      on: (name: string, cb: (payload?: unknown) => void): (() => void) => {
@@ -482,7 +682,7 @@ index 07a99843..7edbdfb1 100644
        const off = this.deps.eventBus.on(name, cb);
        this.ledger.eventUnsubs.push(off);
        return off;
-@@ -305,6 +337,131 @@ class PluginHostFacade implements PluginHost {
+@@ -305,6 +339,137 @@ class PluginHostFacade implements PluginHost {
      return off;
    }
  
@@ -514,6 +714,12 @@ index 07a99843..7edbdfb1 100644
 +  suspendHistory(message: string = HISTORY_SUSPENDED_MESSAGE): () => void {
 +    const resume = this.deps.suspendHistory?.(this.pluginId, message) ?? (() => {});
 +    return this.ledgerOnce(this.ledger.historyResumes, resume);
++  }
++
++  setFontPolicy(policy: 'bundled-only'): () => void {
++    if (policy !== 'bundled-only') throw new TypeError(`알 수 없는 글꼴 정책입니다: ${String(policy)}`);
++    const release = this.deps.setFontPolicy?.(this.pluginId, policy) ?? (() => {});
++    return this.ledgerOnce(this.ledger.fontPolicyReleases, release);
 +  }
 +
 +  setCaret(caret: PluginCaret): boolean {
@@ -614,7 +820,7 @@ index 07a99843..7edbdfb1 100644
    /** 문서가 교체됐음을 이 플러그인에 알린다. 호스트도 외부 교체 때 부른다. */
    notifySwap(): void {
      const lease = this.borrowDocument();
-@@ -435,6 +592,15 @@ export class PluginHostRegistry {
+@@ -435,6 +600,18 @@ export class PluginHostRegistry {
      for (const off of ledger.uiUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
@@ -627,21 +833,25 @@ index 07a99843..7edbdfb1 100644
 +    for (const resume of ledger.historyResumes.reverse()) {
 +      try { resume(); } catch { /* noop */ }
 +    }
++    for (const release of ledger.fontPolicyReleases.reverse()) {
++      try { release(); } catch { /* noop */ }
++    }
      for (const off of ledger.swapUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
-@@ -448,6 +614,9 @@ export class PluginHostRegistry {
+@@ -448,6 +625,10 @@ export class PluginHostRegistry {
        this.deps.automation.unregisterCommand(commandId);
      }
      ledger.uiUnsubs.length = 0;
 +    ledger.autosaveResumes.length = 0;
 +    ledger.interceptReleases.length = 0;
 +    ledger.historyResumes.length = 0;
++    ledger.fontPolicyReleases.length = 0;
      ledger.swapUnsubs.length = 0;
      ledger.eventUnsubs.length = 0;
      ledger.menuItems.clear();
 diff --git a/rhwp-studio/src/plugin/types.ts b/rhwp-studio/src/plugin/types.ts
-index 571e2b4d..e192a433 100644
+index 571e2b4d..a65c2ac4 100644
 --- a/rhwp-studio/src/plugin/types.ts
 +++ b/rhwp-studio/src/plugin/types.ts
 @@ -98,6 +98,17 @@ export interface Tx {
@@ -671,7 +881,7 @@ index 571e2b4d..e192a433 100644
    /**
     * 빈 문서로 교체한다. 끝날 때까지 기다릴 수 있다. `confirmUnsaved` 면 메뉴의 「새 문서」처럼
     * 저장 안 된 변경을 먼저 묻는다 — 사용자가 취소하면 `false` 이고 문서는 그대로다.
-@@ -173,6 +184,73 @@ export interface PluginHost {
+@@ -173,6 +184,81 @@ export interface PluginHost {
  
    /** 문서가 교체되면 새 lease 를 받는다. 반환값은 해지 함수다. */
    onDocumentSwap(cb: (lease: DocumentLease) => void): () => void;
@@ -713,6 +923,14 @@ index 571e2b4d..e192a433 100644
 +  suspendHistory(message?: string): () => void;
 +
 +  /**
++   * 글꼴 정책을 건다(cc-rhwp S3-1). `bundled-only` 동안 조판은 엔진 내장 규칙만, 표시는 내장 웹 글꼴만 쓴다 —
++   * 로컬 글꼴·브라우저 측정이 조판에 들어가지 않아 기기가 달라도 같은 결과가 나온다. 걸거나 풀면 지금 문서의
++   * 글꼴 환경을 다시 준비한다(문서를 열기 전에 거는 것이 좋다). 반환값은 해제 함수(여러 번 불러도 안전)이며
++   * 원장에 담겨 unload 때 회수된다.
++   */
++  setFontPolicy(policy: 'bundled-only'): () => void;
++
++  /**
 +   * 캐럿을 옮긴다(선택은 접는다). 문서는 바꾸지 않는다. 문단·글자 번호가 범위 밖이면 가장 가까운 유효
 +   * 위치로 자른다. 화면이 없는 구성이거나 옮기지 못하면 `false`.
 +   */
@@ -745,7 +963,7 @@ index 571e2b4d..e192a433 100644
  }
  
  /**
-@@ -212,6 +290,12 @@ export interface PluginLedger {
+@@ -212,6 +298,14 @@ export interface PluginLedger {
    swapUnsubs: Array<() => void>;
    /** `ui.registerSidePanel` 이 돌려준 해지 함수 */
    uiUnsubs: Array<() => void>;
@@ -755,6 +973,8 @@ index 571e2b4d..e192a433 100644
 +  interceptReleases: Array<() => void>;
 +  /** `suspendHistory` 가 돌려준 재개 함수 */
 +  historyResumes: Array<() => void>;
++  /** `setFontPolicy` 가 돌려준 해제 함수 */
++  fontPolicyReleases: Array<() => void>;
    /** 진행 중인 트랜잭션 수. 0 이 될 때까지 unload 는 기다린다. */
    activeTx: number;
  }
@@ -842,10 +1062,10 @@ index 00000000..5052f728
 +});
 diff --git a/rhwp-studio/tests/plugin-collab-api.test.ts b/rhwp-studio/tests/plugin-collab-api.test.ts
 new file mode 100644
-index 00000000..1e321275
+index 00000000..877ebd9b
 --- /dev/null
 +++ b/rhwp-studio/tests/plugin-collab-api.test.ts
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,366 @@
 +// cc-rhwp: 공동편집용 플러그인 API (docs/collab-stage2.md §6, R2).
 +// interceptDocumentCalls · applyExternal · suspendHistory · setCaret · isComposing.
 +//
@@ -989,6 +1209,10 @@ index 00000000..1e321275
 +        log.push(`suspendHistory ${id} ${message}`);
 +        return () => log.push('history-resume');
 +      },
++      setFontPolicy: (id: string, policy: string) => {
++        log.push(`fontPolicy ${id} ${policy}`);
++        return () => log.push('font-policy-release');
++      },
 +    }),
 +  } as unknown as PluginHostDeps;
 +  const registry = new PluginHostRegistry(deps);
@@ -1044,6 +1268,48 @@ index 00000000..1e321275
 +  resume(); resume();
 +  await h.registry.unload('probe');
 +  assert.equal(h.log.filter((l) => l === 'history-resume').length, 1);
++});
++
++test('setFontPolicy: 호스트에 걸고, 해제는 멱등이며 unload 가 회수한다, 모르는 정책은 거절 (S3-1)', async () => {
++  const h = harness();
++  await h.registry.load('probe');
++  assert.throws(() => h.host().setFontPolicy('anything' as 'bundled-only'), TypeError);
++  const release = h.host().setFontPolicy('bundled-only');
++  assert.deepEqual(h.log, ['fontPolicy probe bundled-only']);
++  release(); release();
++  assert.equal(h.log.filter((l) => l === 'font-policy-release').length, 1);
++  h.host().setFontPolicy('bundled-only');
++  await h.registry.unload('probe');
++  assert.equal(h.log.filter((l) => l === 'font-policy-release').length, 2);
++});
++
++test('font-policy: 여러 곳이 쥘 수 있고 첫 획득·마지막 해제 때만 알린다 (S3-1)', async () => {
++  const { acquireBundledFontPolicy, bundledFontsOnly, onFontPolicyChanged } = await import('../src/core/font-policy.ts');
++  let notified = 0;
++  const off = onFontPolicyChanged(() => { notified += 1; });
++  assert.equal(bundledFontsOnly(), false);
++  const a = acquireBundledFontPolicy('a');
++  const b = acquireBundledFontPolicy('b');
++  assert.equal(bundledFontsOnly(), true);
++  assert.equal(notified, 1);
++  a(); a();
++  assert.equal(bundledFontsOnly(), true);
++  b();
++  assert.equal(bundledFontsOnly(), false);
++  assert.equal(notified, 2);
++  off();
++});
++
++test('글꼴 정책 bundled-only: 조판은 엔진 기본 환경, Canvas 보충 측정·호스트·OTF/PUA 끔, 로컬 글꼴 읽기·안내 생략 (S3-1)', () => {
++  const bridge = source('src/core/wasm-bridge.ts');
++  assert.match(bridge, /if \(!doc\) return false;\s*if \(bundledFontsOnly\(\)\) return this\.useEngineFontEnvironment\(doc\);/);
++  assert.match(bridge, /useEngineFontEnvironment\(doc: HwpDocument\): boolean \{[\s\S]*?plan\.environmentId !== null\) changed = api\.setFontEnvironment\(undefined\)/);
++  assert.match(bridge, /if \(bundledFontsOnly\(\)\) \{\s*this\.pageHostFontRequests = undefined;\s*this\.hostCanvasFonts\.reset\(\);\s*this\.nativePuaFonts\.clear\([^)]*\);\s*this\.canvasMetrics\.invalidate\(\);\s*return this\.canvasMetricDocument\(\)\?\.selectCanvasMetrics\(false\) \?\? false;/);
++  const main = source('src/main.ts');
++  assert.match(main, /const localFontsAllowed = !bundledFontsOnly\(\);\s*if \(localFontsAllowed\) await loadStoredLocalFonts\(\);/);
++  assert.match(main, /if \(localFontsAllowed && !options\.suppressDialogs && !options\.suppressLocalFontPrompt\)/);
++  assert.match(main, /setFontPolicy: \(pluginId\) => acquireBundledFontPolicy\(pluginId\)/);
++  assert.match(main, /onFontPolicyChanged\(\(\) => \{[\s\S]{0,200}wasm\.prepareDeclaredFontEnvironment\(canvasView\.getRenderBackend\(\)\)/);
 +});
 +
 +test('호스트가 훅을 주지 않으면 intercept·suspendHistory 는 아무 일도 하지 않는다(기본값 불변)', async () => {

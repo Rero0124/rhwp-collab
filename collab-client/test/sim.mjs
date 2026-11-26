@@ -15,6 +15,7 @@
 // runInBatch(배치 괄호 안 편집 — none 분류 검증). 전송·전달 순서와 지연을 무작위로 섞는다(연결마다 FIFO).
 // 끝에서 모두 조용해지면: 모든 클라이언트 digest 동일 + 서버 로그를 새 문서에 재생한 digest 와 동일.
 // 실패하면 시드를 출력하고 종료 코드 1.
+import { gunzipSync } from 'node:zlib';
 import { loadWasm, blankBytes, paragraphs, Client, Server } from './support/harness.mjs';
 import { classify } from '../src/engine/classify.ts';
 
@@ -34,6 +35,17 @@ const FAST = !flag('no-fast');
 const REALISTIC = flag('realistic');
 /** --realistic 에서 표 만들기·붙여넣기를 빼려면 --no-struct (그 자리는 글자 입력) */
 const NO_STRUCT = flag('no-struct');
+/**
+ * --s3: 3단계 조건(docs/collab-stage3.md 관문 "R5 시뮬레이션 확장") — 서버 정본(S3-2), 무작위 연결 끊김·다시 붙기
+ * (S3-4 catchup/welcome), 체크포인트(기준점 이동, S3-3), 서버 재시작(모든 연결 끊김 + 정본을 체크포인트 + 기록으로
+ * 다시 만듦)을 섞는다. 끝에서 모두 다시 붙고 조용해지면: 모든 클라이언트 = 정본 = 처음 base + 모든 기록 재생.
+ */
+const S3 = flag('s3');
+/** --s3 사건 끄기(원인 가르기): --no-generation, --no-restart */
+const S3_GENERATION = !flag('no-generation');
+const S3_RESTART = !flag('no-restart');
+/** --s3 에서 늦은 참여자 상한 */
+const S3_MAX_CLIENTS = 6;
 
 /** mulberry32 — 시드 고정 PRNG (새 의존성 없음) */
 function prng(seed) {
@@ -427,8 +439,9 @@ async function runRealisticSeed(seed, base) {
 function finish(seed, server, clients, made, edits) {
   const digests = clients.map((c) => c.digest());
   const replay = server.replayDigest();
+  const canon = server.canonicalDigest();
   const errors = clients.flatMap((c) => c.errors.map((e) => `${c.id}: ${e}`));
-  const ok = digests.every((d) => d === digests[0]) && replay === digests[0] && errors.length === 0;
+  const ok = digests.every((d) => d === digests[0]) && replay === digests[0] && (canon === null || canon === digests[0]) && errors.length === 0;
   const droppedByClass = {};
   for (const c of clients) for (const e of c.droppedEntries) {
     const cls = e.kind === 'state' ? 'state' : classify(e.m).conc;
@@ -448,14 +461,24 @@ function finish(seed, server, clients, made, edits) {
     dropped: clients.reduce((n, c) => n + c.dropped, 0), droppedByClass,
     reasons: clients.flatMap((c) => c.drops), fast,
     digests: digests.map((d) => d.slice(0, 10)), replay: replay.slice(0, 10), errors,
+    ...(S3 ? { s3: { canon: canon?.slice(0, 10), generations: server.generations, newcomers: clients.length - CLIENTS, restarts: server.restarts, invalids: server.invalids,
+      catchups: clients.reduce((n, c) => n + c.catchups, 0), welcomes: clients.reduce((n, c) => n + c.resyncs, 0) } } : {}),
   };
   if (!ok && VERBOSE) result.paragraphs = clients.map((c) => paragraphs(c.doc));
   return result;
 }
 
+/** 플러그인처럼: 첫 참여자가 자기 문서를 내보내 그 바이트로 다시 연다(모두 같은 파싱 결과에서 출발). */
+const normalized = (m, bytes) => {
+  const d = new m.HwpDocument(bytes);
+  const out = gunzipSync(d.collabExportState());
+  d.free();
+  return out;
+};
+
 async function runSeed(seed, base) {
   const r = prng(seed);
-  const server = new Server(base);
+  const server = new Server(base, { canonical: S3 });
   const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(String.fromCharCode(65 + i), base, server, { fast: FAST, verifyFast: VERIFY_FAST }));
   const made = {};
   let edits = 0;
@@ -469,24 +492,43 @@ async function runSeed(seed, base) {
         if (k) { made[k] = (made[k] ?? 0) + 1; edits += 1; }
       } else if (x < 0.7) {
         c.flush();
+      } else if (S3 && x < 0.73) {
+        // 3단계 사건: 끊김 1% · 다시 붙기 1.5% · 빈 방 세대 전환 + 늦은 참여자 0.3% · 서버 재시작 0.2% (이 3% 구간 안 비율)
+        const y = r.next();
+        const off = clients.filter((k) => !k.online);
+        if (y < 0.33) c.disconnect();
+        else if (y < 0.83) { if (off.length) r.pick(off).reconnect(); }
+        else if (y < 0.93) {
+          // 모두 나가 방이 비고(오래) → 세대 전환 → 새 참여자가 새 세대에서 시작. 나갔던 사람은 나중에 다시 붙으며
+          // welcome(재동기화 — 끊긴 동안의 편집은 취소)을 받는다.
+          if (S3_GENERATION) {
+            for (const k of clients) k.disconnect();
+            if (server.changeGeneration(clients) && clients.length < S3_MAX_CLIENTS) {
+              clients.push(server.newcomer(String.fromCharCode(65 + clients.length), { fast: FAST, verifyFast: VERIFY_FAST }));
+            }
+          }
+        } else if (S3_RESTART) server.restart(clients);
       } else {
         // 연결마다 순서는 지키되, 어느 연결을 얼마나 받을지는 무작위(지연)
         const n = 1 + r.int(3);
         for (let i = 0; i < n; i += 1) server.deliverOne(c);
       }
     }
+    for (const c of clients) c.reconnect();
     server.drain(clients);
     return finish(seed, server, clients, made, edits);
   } finally {
     clients.forEach((c) => c.close());
+    server.closeCanonical();
   }
 }
 
 const t0 = Date.now();
 const m = await loadWasm();
-const base = MIX === 'tn' ? tableBaseBytes(m) : blankBytes();
+const base = (() => { const b = MIX === 'tn' ? tableBaseBytes(m) : blankBytes(); return S3 ? normalized(m, b) : b; })();
 const total = { seeds: 0, failed: [], edits: 0, made: {}, dropped: 0, droppedByClass: {}, reasons: {}, dropPairs: {},
-  fast: { fast: 0, slow: 0, fallback: 0, blocks: {}, fastMs: 0, slowMs: 0 }, mismatches: [], mismatchSeeds: [] };
+  fast: { fast: 0, slow: 0, fallback: 0, blocks: {}, fastMs: 0, slowMs: 0 }, mismatches: [], mismatchSeeds: [],
+  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 } };
 for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   const res = REALISTIC ? await runRealisticSeed(seed, base) : await runSeed(seed, base);
   for (const k of ['fast', 'slow', 'fallback', 'fastMs', 'slowMs']) total.fast[k] += res.fast[k];
@@ -497,6 +539,7 @@ for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
     if (total.mismatches.length < 5) total.mismatches.push(...res.fast.mismatches.slice(0, 5 - total.mismatches.length).map((x) => ({ seed, ...x })));
   }
   total.seeds += 1;
+  if (res.s3) for (const k of Object.keys(total.s3)) total.s3[k] += res.s3[k];
   total.edits += res.edits;
   total.dropped += res.dropped;
   for (const [k, v] of Object.entries(res.made)) total.made[k] = (total.made[k] ?? 0) + v;
@@ -519,7 +562,7 @@ console.log(JSON.stringify({
   seeds: total.seeds, ops: OPS, clients: CLIENTS, failed: total.failed.length, failedSeeds: total.failed.slice(0, 20),
   edits: total.edits, made: total.made, madeByClass, dropped: total.dropped, droppedByClass: total.droppedByClass,
   conflictRateByClass: rate, dropReasons: total.reasons,
-  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
+  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
   dropRate: total.edits ? `${((total.dropped / total.edits) * 100).toFixed(2)}%` : '-',
   dropPairs: Object.fromEntries(Object.entries(total.dropPairs).sort((a, b) => b[1] - a[1])),
   dropEvents: Object.values(total.reasons).reduce((n, v) => n + v, 0),

@@ -592,3 +592,120 @@ fn clipboard_ctx_round_trips_and_replays_to_the_same_paste() {
     assert_eq!(texts(&a), texts(&b));
     assert_eq!(a.digest(), b.digest(), "보낸 쪽과 받는 쪽의 붙여넣기 결과가 같다");
 }
+
+// ── S3-0 digest 에 BinData 내용 ─────────────────────────────────────────
+
+const CHART_SAMPLE: &str = "samples/chart/가로막대형/묶은가로막대형.hwp";
+const CHART_EDIT: &str = r#"{"series":[{"values":["9","2.5","3.5","4.5"]},{"values":["2.4","4.4","1.8","2.8"]},{"values":["2","2","3","5"]}]}"#;
+
+/// 차트 데이터만 바꿔도 digest 가 바뀌고, 같은 편집을 재생하면 다시 같다. 편집한 쪽(Loaded, 비압축)과
+/// 그 결과를 다시 읽은 쪽(압축 스트림)도 BinData 해시가 같다 — 저장 표현이 아니라 내용을 본다.
+#[test]
+fn digest_sees_bin_data_content_not_its_stored_form() {
+    use crate::model::bin_data::BinDataBytes;
+    let open = || CollabCore::new(DocumentCore::from_bytes(&sample(CHART_SAMPLE)).unwrap());
+    let (mut a, mut b) = (open(), open());
+    let before = a.digest();
+    assert_eq!(before, b.digest());
+    let model_only = |c: &CollabCore| {
+        let doc = &c.inner.document;
+        let mut props = doc.doc_properties.clone();
+        props.caret_list_id = 0;
+        props.caret_para_id = 0;
+        props.caret_char_pos = 0;
+        let mut parts = doc_info_model_digest(&doc.doc_info, &props).to_vec();
+        for s in &doc.sections {
+            parts.extend_from_slice(&section_model_digest(s));
+        }
+        bytes_digest(&parts)
+    };
+    let model_before = model_only(&a);
+
+    let r: Value = serde_json::from_str(&a.inner.set_chart_data_by_index_native(0, CHART_EDIT).unwrap()).unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(model_only(&a), model_before, "차트 값은 구역·DocInfo 모델 밖(BinData)에 있다 — 예전 digest 의 사각");
+    let after = a.digest();
+    assert_ne!(after, before, "BinData 만 바뀌어도 digest 가 바뀐다");
+    b.inner.set_chart_data_by_index_native(0, CHART_EDIT).unwrap();
+    assert_eq!(b.digest(), after, "같은 편집을 재생하면 다시 같다");
+
+    let mut c = open();
+    c.load_state(&a.export_state().unwrap()).unwrap();
+    assert!(matches!(a.inner.document.bin_data_content[0].data, BinDataBytes::Loaded(_)));
+    assert!(c.inner.document.bin_data_content[0].data.load_raw().is_some(), "다시 읽은 쪽은 압축 원본 스트림");
+    assert_eq!(c.bin_data_hashes(), a.bin_data_hashes(), "저장 표현이 달라도 내용이 같으면 같은 해시");
+    assert_ne!(c.bin_data_hashes(), open().bin_data_hashes());
+}
+
+/// 캐시: 두 번째 digest 는 (epoch, id) 로, 다시 읽기(state 적재)·되감기(스냅샷 복원) 뒤 첫 digest 는 저장
+/// 바이트 메모로 — 어느 쪽도 압축을 다시 풀지 않는다. 시간은 기록용으로 찍는다.
+#[test]
+fn bin_digest_cache_avoids_reinflation() {
+    let f = "samples/basic/treatise sample.hwp";
+    let mut a = CollabCore::new(DocumentCore::from_bytes(&sample(f)).unwrap());
+    let items = a.inner.document.bin_data_content.len();
+    let bytes: usize = a.inner.document.bin_data_content.iter().map(|c| c.data.len()).sum();
+    assert!(items >= 4 && bytes > 4_000_000, "큰 그림 문서여야 한다: {items}개 {bytes}B");
+    let time = |c: &CollabCore| {
+        let t = std::time::Instant::now();
+        let d = c.digest();
+        (d, t.elapsed())
+    };
+    let (d1, first) = time(&a);
+    let loads = a.bin_digest_content_loads();
+    assert_eq!(loads as usize, items, "처음에는 항목마다 한 번 푼다");
+    let (d2, second) = time(&a);
+    assert_eq!(d2, d1);
+    assert_eq!(a.bin_digest_content_loads(), loads, "두 번째는 (epoch, id) 캐시");
+
+    let id = a.snapshot_save();
+    a.inner.insert_text_native(0, 0, 0, "가").unwrap();
+    a.snapshot_restore(id).unwrap();
+    let (d3, rewind) = time(&a);
+    assert_eq!(d3, d1);
+    assert_eq!(a.bin_digest_content_loads(), loads, "되감기(epoch 올림) 뒤에도 저장 바이트 메모로 풀지 않는다");
+
+    let state = a.export_state().unwrap();
+    a.load_state(&state).unwrap();
+    let (_, reload) = time(&a);
+    assert_eq!(a.bin_digest_content_loads(), loads, "다시 읽은 뒤 첫 digest 도 풀지 않는다");
+    println!("S3-0 digest {items}개 {bytes}B: 처음 {first:?}, 두 번째 {second:?}, 되감기 뒤 {rewind:?}, 다시 읽은 뒤 {reload:?}");
+}
+
+/// epoch 를 올리지 않는 제자리 교체가 생겨도(업스트림 계약 위반) 캐시가 옛 해시를 내지 않는다.
+#[test]
+fn bin_digest_cache_checks_item_identity() {
+    use crate::model::bin_data::BinDataBytes;
+    let mut a = CollabCore::new(DocumentCore::from_bytes(&sample(CHART_SAMPLE)).unwrap());
+    a.inner.set_chart_data_by_index_native(0, CHART_EDIT).unwrap();
+    let d1 = a.digest();
+    let mut bytes = a.inner.document.bin_data_content[0].data.load();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    a.inner.document.bin_data_content[0].data = BinDataBytes::Loaded(bytes);
+    assert_ne!(a.digest(), d1);
+}
+
+/// S3-3: 편집 → 캐럿 이동 → 내보내기 → 다시 읽기에서 digest 가 같다. 캐럿은 문서 속성의 세 필드와 그 원본
+/// 레코드 사본(`raw_data` offset 14..26)에 함께 실린다 — 사본을 놓치면 다시 읽은 쪽(체크포인트·welcome)만
+/// digest 가 달라진다(전 샘플 HWP 에서 그랬다). HWPX 도 같은 경로로 본다.
+#[test]
+fn digest_survives_export_reload_after_edit_and_caret_move() {
+    for f in ["samples/biz_plan.hwp", "samples/hwpx/ref/ref_text.hwpx"] {
+        let mut a = CollabCore::new(DocumentCore::from_bytes(&sample(f)).unwrap());
+        a.load_state(&a.export_state().unwrap()).unwrap(); // 세션 시작과 같은 첫 왕복
+        a.inner.insert_text_native(0, 0, 0, "편집").unwrap();
+        a.inner.set_caret_position_native(0, 0, 2);
+        let mut b = CollabCore::new(DocumentCore::from_bytes(&sample(f)).unwrap());
+        b.load_state(&a.export_state().unwrap()).unwrap();
+        let caret_bytes = |c: &CollabCore| c.inner.document.doc_properties.raw_data.as_ref().filter(|r| r.len() >= 26).map(|r| r[14..26].to_vec());
+        if f.ends_with(".hwp") {
+            assert_ne!(caret_bytes(&a), caret_bytes(&b), "{f}: 다시 읽은 쪽 원본 레코드에 캐럿이 실려 있어야 이 시험이 그 경로를 지난다");
+        }
+        assert_eq!(a.digest(), b.digest(), "{f}: 편집·캐럿 이동 뒤 내보내기 → 다시 읽기");
+        // 캐럿만 또 옮겨도 digest 는 그대로(사용자별 메타데이터)
+        let before = b.digest();
+        b.inner.set_caret_position_native(0, 0, 1);
+        assert_eq!(b.digest(), before, "{f}: 캐럿 이동은 digest 에 들어가지 않는다");
+    }
+}

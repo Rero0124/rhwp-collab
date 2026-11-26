@@ -85,6 +85,115 @@ pub struct CollabCore {
     next_snapshot_id: u32,
     /// 재생 때 잠시 바꾼 내부 클립보드를 되돌려 놓을 자리(R13 ctx.clipboard).
     clipboard_stash: Vec<(Option<crate::document_core::ClipboardData>, u32)>,
+    /// S3-0: BinData 항목 내용 해시 캐시 (`digest` 는 `&self` 라 내부 가변).
+    bin_digest: std::sync::Mutex<BinDigestCache>,
+}
+
+/// S3-0 BinData 내용 해시 캐시 (docs/collab-stage3.md S3-0).
+///
+/// digest 는 **저장 표현이 아니라 내용**을 본다 — 편집한 쪽은 `Loaded`(비압축), 그 결과를 다시 읽은 쪽은
+/// 압축된 원본 스트림을 들고 있어도 같은 값이 나와야 한다(체크포인트·welcome 경로). 압축 해제 비용은 두 단계
+/// 캐시로 피한다:
+/// - (a) `(bin_data_epoch, id)` → 내용 해시. 업스트림 계약상 바이트를 제자리에서 바꾸는 곳은 epoch 를 올린다.
+///   항목의 정체(Lazy 리졸버·키, Loaded 버퍼 주소·길이)도 함께 맞춰 봐서, epoch 를 올리지 않는 경로가
+///   생겨도 틀린 값을 내지 않는다.
+/// - (b) 저장 바이트의 해시 → 내용 해시. 편집하지 않은 항목은 내보내기 → 다시 읽기를 거쳐도 저장 바이트가
+///   같으므로(§기록 S3-0) state 적재·되감기 뒤에도 압축을 다시 풀지 않는다.
+/// - (c) `Loaded`·메모리 공유 항목은 이미 풀린 바이트라 그대로 해시한다.
+#[derive(Default)]
+struct BinDigestCache {
+    epoch: Option<u32>,
+    by_id: std::collections::HashMap<u16, (BinIdent, [u8; 32])>,
+    by_stored: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    /// 저장 표현이 있는 항목의 내용을 실제로 꺼낸(압축 해제) 횟수 — 시험용.
+    content_loads: u64,
+}
+
+/// 캐시 항목이 가리키던 BinData 값의 정체. Lazy 는 리졸버를 `Weak` 로 쥐어 주소 재사용을 막는다.
+enum BinIdent {
+    Lazy(std::sync::Weak<dyn crate::model::bin_data::BinDataResolver>, String),
+    Loaded(usize, usize),
+}
+
+impl BinIdent {
+    fn of(data: &crate::model::bin_data::BinDataBytes) -> Self {
+        use crate::model::bin_data::BinDataBytes;
+        match data {
+            BinDataBytes::Loaded(v) => BinIdent::Loaded(v.as_ptr() as usize, v.len()),
+            BinDataBytes::Lazy { resolver, key } => BinIdent::Lazy(std::sync::Arc::downgrade(resolver), key.clone()),
+        }
+    }
+
+    fn same(&self, data: &crate::model::bin_data::BinDataBytes) -> bool {
+        use crate::model::bin_data::BinDataBytes;
+        match (self, data) {
+            (BinIdent::Loaded(p, n), BinDataBytes::Loaded(v)) => *p == v.as_ptr() as usize && *n == v.len(),
+            (BinIdent::Lazy(w, k), BinDataBytes::Lazy { resolver, key }) => {
+                k == key && w.strong_count() > 0 && std::ptr::addr_eq(w.as_ptr(), std::sync::Arc::as_ptr(resolver))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// (b) 의 메모가 끝없이 자라지 않게 하는 상한.
+const BIN_STORED_MEMO_MAX: usize = 8192;
+
+impl BinDigestCache {
+    /// 항목 하나의 내용 해시.
+    fn item(&mut self, epoch: u32, content: &crate::model::bin_data::BinDataContent) -> [u8; 32] {
+        use crate::model::bin_data::BinDataBytes;
+        if self.epoch != Some(epoch) {
+            self.epoch = Some(epoch);
+            self.by_id.clear();
+        }
+        if let Some((ident, hash)) = self.by_id.get(&content.id) {
+            if ident.same(&content.data) {
+                return *hash;
+            }
+        }
+        let hash = match &content.data {
+            BinDataBytes::Loaded(v) => bytes_digest(v),
+            BinDataBytes::Lazy { .. } => {
+                let stored = Self::stored_digest(&content.data);
+                match stored.and_then(|k| self.by_stored.get(&k).copied()) {
+                    Some(hash) => hash,
+                    None => {
+                        let hash = bytes_digest(&content.data.load_shared());
+                        if let Some(k) = stored {
+                            self.content_loads += 1;
+                            if self.by_stored.len() >= BIN_STORED_MEMO_MAX {
+                                self.by_stored.clear();
+                            }
+                            self.by_stored.insert(k, hash);
+                        }
+                        hash
+                    }
+                }
+            }
+        };
+        self.by_id.insert(content.id, (BinIdent::of(&content.data), hash));
+        hash
+    }
+
+    /// 저장 표현(압축을 풀지 않은 원본 바이트)의 해시. HWP5 는 원본 스트림, HWPX 는 deflate 엔트리.
+    /// 메모리 공유 항목처럼 저장 표현이 없으면 `None`.
+    fn stored_digest(data: &crate::model::bin_data::BinDataBytes) -> Option<[u8; 32]> {
+        let mut h = blake3::Hasher::new();
+        if let Some(raw) = data.load_raw() {
+            h.update(b"raw");
+            h.update(&[raw.compressed as u8]);
+            h.update(&raw.bytes);
+        } else if let Some(zip) = data.load_deflated_zip_entry() {
+            h.update(b"zip");
+            h.update(&zip.crc32.to_le_bytes());
+            h.update(&zip.uncompressed_size.to_le_bytes());
+            h.update(&zip.compressed_bytes);
+        } else {
+            return None;
+        }
+        Some(*h.finalize().as_bytes())
+    }
 }
 
 /// `measure` 인자 오류.
@@ -94,7 +203,7 @@ fn bad_args(method: &str, detail: impl std::fmt::Display) -> HwpError {
 
 impl CollabCore {
     pub fn new(inner: DocumentCore) -> Self {
-        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new() }
+        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default() }
     }
 
     // ── 자체 스냅샷 (§5) ────────────────────────────────────────────────
@@ -540,18 +649,51 @@ impl CollabCore {
     // ── 문서 지문 (1단계 T6) ─────────────────────────────────────────────
 
     /// 문서 모델의 지문(blake3, hex 64자). 사용자별 메타데이터(문서 속성의 캐럿 세 필드)는 뺀다.
+    ///
+    /// S3-0: DocInfo·구역 모델 지문에 **BinData 항목별 내용 해시**(id 순)를 더한다 — 그림·OLE·차트 바이트만
+    /// 갈려도 잡힌다. 저장 표현이 아니라 압축을 푼 내용을 보며, 비용은 [`BinDigestCache`] 가 줄인다.
+    /// `extra_streams`·`hwpx_aux_entries`(라운드트립 보존용 원본 조각)는 편집으로 바뀌지 않아 넣지 않는다.
     pub fn digest(&self) -> String {
         let doc = &self.inner.document;
         let mut props = doc.doc_properties.clone();
         props.caret_list_id = 0;
         props.caret_para_id = 0;
         props.caret_char_pos = 0;
-        let mut parts = Vec::with_capacity(32 * (1 + doc.sections.len()));
+        // S3-3: 원본 레코드 사본(`raw_data`)의 같은 세 필드(offset 14..26, serializer/doc_info.rs)도 지운다 — 내보낼
+        // 때 캐럿이 실려 다시 읽은 쪽만 값이 달라진다(체크포인트·welcome 경로의 거짓 어긋남).
+        if let Some(raw) = props.raw_data.as_mut() {
+            if raw.len() >= 26 {
+                raw[14..26].fill(0);
+            }
+        }
+        let mut parts = Vec::with_capacity(32 * (1 + doc.sections.len()) + 34 * doc.bin_data_content.len() + 16);
         parts.extend_from_slice(&doc_info_model_digest(&doc.doc_info, &props));
         for section in &doc.sections {
             parts.extend_from_slice(&section_model_digest(section));
         }
+        let bins = self.bin_data_hashes();
+        parts.extend_from_slice(b"bindata");
+        parts.extend_from_slice(&(bins.len() as u32).to_le_bytes());
+        for (id, hash) in bins {
+            parts.extend_from_slice(&id.to_le_bytes());
+            parts.extend_from_slice(&hash);
+        }
         bytes_digest(&parts).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// BinData 항목별 `(id, 내용 해시)`, id 순.
+    pub(crate) fn bin_data_hashes(&self) -> Vec<(u16, [u8; 32])> {
+        let contents = &self.inner.document.bin_data_content;
+        let mut order: Vec<usize> = (0..contents.len()).collect();
+        order.sort_by_key(|&i| contents[i].id);
+        let mut cache = self.bin_digest.lock().unwrap_or_else(|e| e.into_inner());
+        let epoch = self.inner.bin_data_epoch;
+        order.into_iter().map(|i| (contents[i].id, cache.item(epoch, &contents[i]))).collect()
+    }
+
+    /// S3-0 시험용: 저장 표현이 있는 BinData 의 내용을 실제로 꺼낸 누적 횟수.
+    pub fn bin_digest_content_loads(&self) -> u64 {
+        self.bin_digest.lock().unwrap_or_else(|e| e.into_inner()).content_loads
     }
 }
 

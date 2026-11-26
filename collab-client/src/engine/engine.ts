@@ -40,6 +40,9 @@ export interface EngineDoc {
   collabMapCaret(remoteJson: string, catalogJson: string, caretJson: string): string;
   collabDigest(): string;
   collabFlushLayout(): void;
+  /** rhwp 배치 괄호 — 안의 편집은 쪽 배치(pagination)를 끝에 한 번만 한다(R1 감사: 쪽 소속 확정만 미룸). */
+  beginBatch?(): string;
+  endBatch?(): string;
   /** R13 ctx.clipboard: 기록 쪽 — 내부 클립보드를 직렬화→다시 읽은 값으로 바꾸고 그 JSON. */
   collabNormalizeClipboard(): string;
   /** 재생 쪽 — 기록의 클립보드로 잠시 바꾼다 / 되돌린다. */
@@ -514,6 +517,34 @@ export class CollabEngine {
   /** 마지막으로 기록한 내 기록(다른 사람 커서를 옮기는 데 쓴다). */
   get lastLocal(): Entry | null {
     return this.unconfirmed[this.unconfirmed.length - 1] ?? null;
+  }
+
+  /**
+   * 여러 묶음을 한 번에 재생한다(늦은 참여·재동기화·정본 복원, S3-3). 상태를 비우고 적용한다(기록하지 않음).
+   * 묶음마다 쪽 배치를 하지 않고 rhwp 배치 괄호(beginBatch/endBatch)로 끝에 한 번만 한다 — 조판에 기대는 연산
+   * (`layout`)과 state 기록 앞에서는 괄호를 닫아 쪽 배치를 맞춘 뒤 적용한다. 결과는 묶음마다 재생한 것과 같다
+   * (S3-3 측정: 20쪽 문서 10,000 묶음 digest 같음, 86.8s → 0.9s).
+   */
+  replayAll(batches: readonly { entries: readonly Entry[] }[]): void {
+    const doc = this.doc;
+    if (!doc) throw new Error('공유 문서가 없습니다');
+    this.reset();
+    this.replaying = true;
+    const canBatch = typeof doc.beginBatch === 'function' && typeof doc.endBatch === 'function';
+    let open = false;
+    try {
+      for (const batch of batches) {
+        for (const e of batch.entries) {
+          const needsLayout = e.kind === 'state' || this.classifyFn(e.m).layout === true;
+          if (canBatch && needsLayout && open) { doc.endBatch!(); open = false; }
+          if (canBatch && !needsLayout && !open) { doc.beginBatch!(); open = true; }
+          this.applyEntry(doc, structuredClone(e) as Entry);
+        }
+      }
+    } finally {
+      if (open) doc.endBatch!();
+      this.replaying = false;
+    }
   }
 
   /** 재동기화·늦은 참여의 로그 재생. 상태를 비우고 적용한다(기록하지 않음). */

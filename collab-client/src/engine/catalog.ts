@@ -3,12 +3,12 @@
 import type { CatalogEntry } from './types.ts';
 
 /** 엔진 지문: 업스트림 커밋-패치 해시-보정·기록 코드 해시-분류표 해시. 방의 참여자는 모두 같아야 한다. */
-export const ENGINE_FINGERPRINT = "981ce66b4183-e8d758caad07-7e8d4e474b0c-636d54aaf611";
+export const ENGINE_FINGERPRINT = "981ce66b4183-54d21c92aa3f-2865265bc9ee-918b1ab60cc4";
 
 /** studio 합성 메서드(레지스트리에 있으나 export 가 아님). 내부에서 분류표의 export 를 부른다. */
 export const COMPOSED_METHODS: readonly string[] = ["setPageMargin","insertHyperlink","updateHyperlink","replaceHyperlinkText","removeHyperlink"];
 
-/** {"total":314,"op":180,"state":64,"local":1,"none":69,"watch":0,"text":23,"neutral":46,"structural":111,"ctx":25,"layout":11,"unreviewed":0} */
+/** {"total":314,"op":182,"state":62,"local":1,"none":69,"watch":0,"text":23,"neutral":47,"structural":112,"ctx":25,"layout":11,"unreviewed":0} */
 export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
   "addBookmark": {
     "sync": "op",
@@ -1943,7 +1943,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": 0,
     "reviewed": true,
-    "why": "동작 동일성 검사: 이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 rich(합성) [0,0,8,10,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
+    "why": "동작 동일성 검사: 이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 biz_plan.hwp [0,28,10,10,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
     "reach": "none"
   },
   "insertMemoByPath": {
@@ -1959,7 +1959,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": 0,
     "reviewed": true,
-    "why": "동작 동일성 검사: 이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 rich(합성) [0,2,\"[{\\\"controlIndex\\\":0,\\\"cellIndex\\\":5,\\\"cellParaIndex\\\":0}]\",0,2,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
+    "why": "동작 동일성 검사: 이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 exam_social-p1.hwp [0,2,\"[{\\\"controlIndex\\\":0,\\\"cellIndex\\\":0,\\\"cellParaIndex\\\":0}]\",0,1,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
     "reach": "none"
   },
   "insertMemoReply": {
@@ -3741,7 +3741,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "reach": "studio"
   },
   "setChartData": {
-    "sync": "state",
+    "sync": "op",
     "conc": "neutral",
     "params": [
       "section_idx",
@@ -3756,19 +3756,19 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
         "arg": 1
       }
     ],
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 25/300)",
+    "why": "차트 데이터(바이너리 슬롯)만 바꾼다",
     "reviewed": true,
     "reach": "plugin"
   },
   "setChartDataByIndex": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "index",
       "edits_json"
     ],
     "section": null,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 25/300)",
+    "why": "문서 전체 차트 순번으로 찾는다(위치로 옮길 수 없음)",
     "reviewed": true,
     "reach": "studio"
   },
@@ -4447,7 +4447,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": null,
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 3개 < 5, 성공 300/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 300/300)",
     "reach": "none"
   },
   "splitParaAtCursor": {

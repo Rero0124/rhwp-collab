@@ -2,7 +2,7 @@
 // 엔진 지문 불일치 → incompatible 안내, base 가 메시지 상한을 넘음 → 시작 거절, digest 어긋남 → 재동기화로 회복.
 //
 // 준비: node server/server.mjs (8787) + (cd upstream/rhwp/rhwp-studio && npx vite) (7700)
-//       상한 시험용으로 이 스크립트가 COLLAB_MAX_MESSAGE_BYTES=2000 서버를 8789 에 직접 띄운다.
+//       상한 시험용으로 COLLAB_MAX_MESSAGE_BYTES=2000 서버를 8789 에, 지문 시험용으로 다른 엔진 서버를 8791 에 직접 띄운다.
 // 실행: node collab-client/e2e/r7-lifecycle.mjs
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -11,7 +11,6 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const studioDir = path.resolve(here, '../../upstream/rhwp/rhwp-studio');
 const puppeteer = createRequire(path.join(studioDir, 'package.json'))('puppeteer-core');
-const { WebSocket } = createRequire(path.resolve(here, '../../server/package.json'))('ws');
 const { startServer } = await import(path.resolve(here, '../../server/server.mjs'));
 
 const STUDIO = process.env.STUDIO_URL ?? 'http://127.0.0.1:7700';
@@ -108,18 +107,16 @@ async function swapLeavesRoom(browser) {
 
 async function incompatibleNotice(browser) {
   const room = `r7-incompat-${Date.now()}`;
-  // 다른 엔진 지문으로 방을 먼저 만든다
-  const ws = new WebSocket(COLLAB);
-  await new Promise((r) => ws.once('open', r));
-  ws.send(JSON.stringify({ type: 'hello', room, clientId: 'old-engine', name: 'old', engine: 'old-engine-fingerprint' }));
-  await new Promise((r) => ws.once('message', r));
+  // 다른 엔진으로 도는 서버(S3-2: 정본을 켜면 서버 자신의 엔진이 방의 엔진이다)
+  const old = startServer({ port: 8791, log: () => {}, engine: 'old-engine-fingerprint' });
+  await old.ready;
   const ctx = await browser.createBrowserContext();
-  const C = await openTab(ctx, { collab: COLLAB, room }, 'C', { waitReady: false });
+  const C = await openTab(ctx, { collab: 'ws://127.0.0.1:8791', room }, 'C', { waitReady: false });
   const sc = await waitFor(C, (s) => s.left, 15_000);
   const text = await banner(C);
   record('지문 불일치: incompatible 안내 후 방을 나감', sc.left && /엔진 버전이 방과 다릅니다/.test(text ?? ''), text ?? '배너 없음');
-  ws.close();
   await ctx.close();
+  await old.close();
 }
 
 async function tooLargeBase(browser) {
@@ -150,13 +147,17 @@ async function resyncRecovers(browser) {
     d.collabLoadState(other); // 기록되지 않는 되돌림 → F 문서만 '!' 가 빠진다
   });
   await type(E, 0, 0, 'x');
-  const states = await Promise.all([E, F].map((p) => waitFor(p, (s) => s.resyncCount > 0 && !s.resyncing && !s.inflight && !s.pending && s.digestSentSeq === s.lastSeq, 25_000)));
+  // S3-2: 서버 정본이 digest 기준 — 어긋난 F 에만 diverged 가 가고 F 만 재동기화한다(E 는 그대로).
+  const fState = await waitFor(F, (s) => s.resyncCount > 0 && !s.resyncing && !s.inflight && !s.pending && s.digestSentSeq === s.lastSeq, 25_000);
+  await settled([E, F]);
   await sleep(1500);
   const digests = await Promise.all([E, F].map((p) => p.evaluate(() => window.__collab.digest())));
   const after = await Promise.all([E, F].map(status));
   record('재동기화: 어긋남 → 재동기화로 같은 문서', digests[0] === digests[1] && after.every((s) => !s.desynced),
     after.map((s) => `${s.name}: resync ${s.resyncCount} desync ${s.desynced}`).join('; ') + `, digest ${digests.map((d) => d.slice(0, 10)).join(' ')}`);
-  record('재동기화: 한도(1분 3회) 안', states.every((s) => s.resyncCount <= 3), states.map((s) => s.resyncCount).join(','));
+  record('재동기화: 어긋난 F 만 재동기화, E 는 그대로 (S3-2 정본 기준)', after[1].resyncCount > 0 && after[0].resyncCount === 0,
+    after.map((s) => `${s.name}: resync ${s.resyncCount}`).join(', '));
+  record('재동기화: 한도(1분 3회) 안', [fState, ...after].every((s) => s.resyncCount <= 3), after.map((s) => s.resyncCount).join(','));
   await ctx.close();
 }
 

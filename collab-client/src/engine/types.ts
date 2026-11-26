@@ -14,6 +14,13 @@
 export type Sync = 'op' | 'state' | 'local' | 'none' | 'watch';
 
 /** 결과에 영향을 주는 로컬 세션 상태 — 기록 때 실측해 담고 재생 때 그 값으로 맞춘다. */
+/**
+ * S3-1 글꼴 정책 — 공동편집 중 조판은 엔진 내장 규칙만, 표시는 내장 웹 글꼴만(studio `host.setFontPolicy`).
+ * Node(서버 정본·시뮬레이션)와 같은 조판 환경이다. 이 값은 엔진 코드라 엔진 지문(코드 해시)에 들어간다 —
+ * 정책이 다른 참여자는 같은 방에 들어오지 못한다.
+ */
+export const FONT_POLICY = 'bundled-only' as const;
+
 export type CtxKey = 'activeField' | 'clipboard';
 
 /** `text`: §4.4 정밀 보정 / `neutral`: 구조 불변(§4.5) / `structural`: 구조를 바꿈(§4.5) */

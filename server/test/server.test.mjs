@@ -7,7 +7,7 @@ import { startServer, DEFAULT_MAX_MESSAGE_BYTES as MAX } from '../server.mjs';
 let server;
 let url;
 before(async () => {
-  server = startServer({ port: 0, log: () => {}, delayMs: 0 });
+  server = startServer({ port: 0, log: () => {}, delayMs: 0, canonical: false });
   await server.ready;
   url = `ws://127.0.0.1:${server.port}`;
 });
@@ -207,7 +207,7 @@ test('엔진 지문이 방의 첫 참여자와 다르면 incompatible 로 거절
 });
 
 test('COLLAB_DELAY_MS: 모든 송신을 늦추되 연결마다 순서를 지킨다', async () => {
-  const slow = startServer({ port: 0, log: () => {}, delayMs: 60 });
+  const slow = startServer({ port: 0, log: () => {}, delayMs: 60, canonical: false });
   await slow.ready;
   const surl = `ws://127.0.0.1:${slow.port}`;
   const a = await client('d1', 'A', 'E1', surl);
@@ -225,7 +225,7 @@ test('COLLAB_DELAY_MS: 모든 송신을 늦추되 연결마다 순서를 지킨�
 });
 
 test('메시지 상한: 넘는 ops 는 버리고 too-large 로 알린다, 넘는 base 는 연결을 닫는다', async () => {
-  const small = startServer({ port: 0, log: () => {}, delayMs: 0, maxMessageBytes: 2000 });
+  const small = startServer({ port: 0, log: () => {}, delayMs: 0, maxMessageBytes: 2000, canonical: false });
   await small.ready;
   const surl = `ws://127.0.0.1:${small.port}`;
   const a = await client('m1', 'A', 'E1', surl);
@@ -268,3 +268,63 @@ test('cursor: 다른 참여자에게만 중계(초당 20회까지), 나가면 cu
   assert.deepEqual(left, { type: 'cursor-leave', clientId: 'A' });
   await b.close();
 });
+
+test('S3-4 catchup: lastSeq 가 기준점 + 기록 범위 안이면 그 뒤 묶음만(batchId 포함), 범위 밖이면 welcome', async () => {
+  const a = await client('catchup', 'A');
+  await a.next();
+  a.send({ type: 'base', data: 'BASE' });
+  const b = await client('catchup', 'B');
+  await b.next();
+  for (let i = 0; i < 3; i += 1) {
+    a.send({ type: 'ops', base: i, entries: [op(`a${i}`)], batchId: `A:${i + 1}` });
+    const ack = await a.next();
+    assert.equal(ack.batchId, `A:${i + 1}`, 'ack 에 batchId');
+    await b.next();
+  }
+  // B 가 끊기기 직전에 보낸 묶음(ack 를 못 받음)
+  b.send({ type: 'ops', base: 3, entries: [op('b')], batchId: 'B:1' });
+  await a.next();
+  await b.close();
+  a.send({ type: 'ops', base: 4, entries: [op('a3')], batchId: 'A:4' });
+  await a.next();
+  // B 가 다시 붙는다(같은 clientId, 마지막으로 받은 seq 3)
+  const b3 = await rawHello('catchup', 'B', 3);
+  const cu = await b3.next();
+  assert.equal(cu.type, 'catchup');
+  assert.equal(cu.seq, 5);
+  assert.deepEqual(cu.log.map((x) => [x.seq, x.batchId]), [[4, 'B:1'], [5, 'A:4']], '끊긴 동안 묶음 — 내 묶음(B:1)이 받아졌는지 알 수 있다');
+  await b3.close();
+  // 범위 밖: state 기준점(seq 6) 앞에서 끊긴 참여자는 welcome
+  a.send({ type: 'ops', base: 5, entries: [{ kind: 'state', data: 'STATE6' }] });
+  await a.next();
+  const b4 = await rawHello('catchup', 'B', 4);
+  const w = await b4.next();
+  assert.equal(w.type, 'welcome');
+  assert.equal(w.base, 'STATE6');
+  await b4.close();
+  const b5 = await rawHello('catchup', 'B', 6);
+  assert.deepEqual((await b5.next()).log, [], '기준점 seq 에서 끊겼으면 빈 catchup');
+  await b5.close();
+  await a.close();
+});
+
+/** hello 를 직접 보내는 클라이언트(lastSeq 를 실어) */
+async function rawHello(room, clientId, lastSeq) {
+  const ws = new WebSocket(url);
+  const queue = [];
+  const waiters = [];
+  ws.on('message', (data) => {
+    const msg = JSON.parse(data.toString());
+    const w = waiters.shift();
+    if (w) w(msg); else queue.push(msg);
+  });
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  ws.send(JSON.stringify({ type: 'hello', room, clientId, name: clientId, engine: 'E1', lastSeq }));
+  return {
+    next: (ms = 1000) => (queue.length ? Promise.resolve(queue.shift()) : new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${clientId}: 메시지 없음`)), ms);
+      waiters.push((m) => { clearTimeout(timer); resolve(m); });
+    })),
+    close: () => new Promise((r) => { ws.once('close', r); ws.close(); }),
+  };
+}

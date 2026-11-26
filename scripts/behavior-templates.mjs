@@ -199,6 +199,8 @@ export const TEMPLATES = {
   // ── R14: studio 로 닿는 기능 ──
   applyEndnoteShape: (r) => [0, JSON.stringify(NOTE_SHAPE[r.int(NOTE_SHAPE.length)])],
   applyFootnoteShape: (r) => [0, JSON.stringify(NOTE_SHAPE[r.int(NOTE_SHAPE.length)])],
+  // 도형·그림을 뒤집는다(원래 상태로 되돌리기 org_state 는 끔 — 바뀌는 호출만). 무작위 생성은 개체를 잘 못 맞힌다.
+  setControlFlipAt: (r, s) => { const xs = gso(s); if (!xs.length) return null; const c = xs[r.int(xs.length)]; return [c.para, c.controlIndex, r.int(2) === 1, false]; },
   applyShapeZOrderPairs: (r, s) => { const xs = gso(s); if (!xs.length) return null; const c = xs[r.int(xs.length)]; return [0, JSON.stringify([{ ppi: c.para, ci: c.controlIndex, z: 1 + r.int(60) }])]; },
   groupShapes: withTwoShapes((p, cis) => [groupJson(p, cis)]),
   ungroupShape: withTwoShapes((p, cis) => ({ prep: [['groupShapes', [groupJson(p, cis)]]], args: [0, p, Math.min(...cis)] })),

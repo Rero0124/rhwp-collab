@@ -18,11 +18,11 @@
    "basic/BlogForm_Recipe.hwp"
   ],
   "features": 236,
-  "same": 180,
+  "same": 182,
   "differ": 2,
   "replay": 0,
-  "nocase": 54,
-  "seconds": 146
+  "nocase": 52,
+  "seconds": 137
  },
  "downgraded": {
   "applyCharFormatInCellEx": "사례 부족 (문서를 바꾼 성공 호출 1개 < 5, 성공 225/300)",
@@ -48,8 +48,8 @@
   "insertCharOverlapByPath": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "insertCharOverlapInFootnote": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "insertClickHereFieldByPathEx": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
-  "insertMemo": "이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 rich(합성) [0,0,8,10,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
-  "insertMemoByPath": "이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 rich(합성) [0,2,\"[{\\\"controlIndex\\\":0,\\\"cellIndex\\\":5,\\\"cellParaIndex\\\":0}]\",0,2,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
+  "insertMemo": "이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 biz_plan.hwp [0,28,10,10,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
+  "insertMemoByPath": "이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 exam_social-p1.hwp [0,2,\"[{\\\"controlIndex\\\":0,\\\"cellIndex\\\":0,\\\"cellParaIndex\\\":0}]\",0,1,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
   "insertMemoReply": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "insertRuby": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "insertRubyByPath": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
@@ -63,8 +63,6 @@
   "removeFieldAtInCellEx": "사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 300/300)",
   "removeMemo": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "removeTableCellFormulas": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 225/300)",
-  "setChartData": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 25/300)",
-  "setChartDataByIndex": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 25/300)",
   "setComposeControl": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "setComposeControlByPath": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "setComposeControlInFootnote": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
@@ -77,7 +75,7 @@
   "setNoteEquationProperties": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "setNoteEquationPropertiesEx": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "setTableCellFormula": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
-  "setTextBoxAt": "사례 부족 (문서를 바꾼 성공 호출 3개 < 5, 성공 300/300)",
+  "setTextBoxAt": "사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 300/300)",
   "tableEditAtCursor": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "tableMergeAtCursor": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
   "updateConnectorsInSection": "사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 300/300)"

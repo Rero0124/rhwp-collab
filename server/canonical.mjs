@@ -1,0 +1,86 @@
+// S3-2 서버 정본 — 방마다 워커 하나(`canonical-worker.mjs`)에 정본 문서를 둔다. 패닉 격리: rhwp 가 패닉하면
+// (WASM trap) 그 인스턴스 메모리를 더 믿을 수 없으므로 워커를 버리고 기준점 + 기록으로 새로 만든다.
+// 워커가 응답하지 않으면(무한 루프 등) 시간 제한 뒤 같은 취급을 한다.
+import { Worker } from 'node:worker_threads';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export const DEFAULT_PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../upstream/rhwp/pkg');
+
+export class Canonical {
+  constructor({ pkg = DEFAULT_PKG, timeoutMs = 30_000, log = () => {} } = {}) {
+    this.pkg = pkg;
+    this.timeoutMs = timeoutMs;
+    this.log = log;
+    this.worker = null;
+    this.pending = new Map();
+    this.nextId = 1;
+    /** 워커를 새로 만든 횟수(패닉·시간 초과 뒤 재생성 포함) */
+    this.generation = 0;
+  }
+
+  start() {
+    const worker = new Worker(new URL('./canonical-worker.mjs', import.meta.url), { workerData: { pkg: this.pkg } });
+    this.worker = worker;
+    this.generation += 1;
+    worker.on('message', ({ id, ...res }) => {
+      const p = this.pending.get(id);
+      if (!p) return;
+      this.pending.delete(id);
+      clearTimeout(p.timer);
+      p.resolve(res);
+    });
+    const fail = (reason) => {
+      if (this.worker !== worker) return;
+      for (const [id, p] of this.pending) {
+        clearTimeout(p.timer);
+        p.resolve({ ok: false, panic: true, reason });
+        this.pending.delete(id);
+      }
+      this.worker = null;
+    };
+    worker.on('error', (e) => fail(`정본 워커 오류: ${e?.message ?? e}`));
+    worker.on('exit', (code) => fail(`정본 워커 종료(${code})`));
+  }
+
+  call(op, payload = {}) {
+    if (!this.worker) this.start();
+    const id = this.nextId++;
+    const worker = this.worker;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        this.log(`정본 워커가 ${this.timeoutMs}ms 안에 답하지 않음(${op}) — 버림`);
+        if (this.worker === worker) { this.worker = null; worker.terminate(); }
+        resolve({ ok: false, panic: true, reason: `정본 워커 시간 초과(${op})` });
+      }, this.timeoutMs);
+      this.pending.set(id, { resolve, timer });
+      worker.postMessage({ id, op, ...payload });
+    });
+  }
+
+  load(base) { return this.call('load', { base }); }
+  apply(entries) { return this.call('apply', { entries }); }
+  digest() { return this.call('digest'); }
+  export() { return this.call('export'); }
+
+  /** 워커를 버리고 기준점 + 기록으로 새로 만든다(기록은 한 번에 — 쪽 배치는 끝에 한 번). 반환: 마지막 digest 또는 실패 사유. */
+  async rebuild(base, log) {
+    await this.terminate();
+    const loaded = await this.load(base);
+    if (!loaded.ok || log.length === 0) return loaded;
+    const res = await this.call('replayAll', { log });
+    return res.ok ? res : { ok: false, reason: `재생성 중 기록 적용 실패: ${res.reason}`, panic: res.panic };
+  }
+
+  async terminate() {
+    const worker = this.worker;
+    this.worker = null;
+    for (const [id, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.resolve({ ok: false, panic: true, reason: '정본 워커를 닫음' });
+      this.pending.delete(id);
+    }
+    if (worker) await worker.terminate();
+  }
+}

@@ -13,15 +13,18 @@ import type { DocumentLease, PluginCaret, PluginHost, PluginSurface, StudioPlugi
 import { CollabEngine, type Entry, type EngineDoc, type TextCaret } from './engine/engine.ts';
 import { CATALOG, ENGINE_FINGERPRINT } from './engine/catalog.ts';
 import { base64ToBytes, bytesToBase64 } from './engine/codec.ts';
+import { FONT_POLICY } from './engine/types.ts';
 
-type LogItem = { seq: number; clientId: string; entries: Entry[] };
+type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string };
 type ServerMessage =
-  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number }
-  | { type: 'ops'; seq: number; clientId: string; entries: Entry[] }
-  | { type: 'reject'; seq: number }
+  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number }
+  | { type: 'ops'; seq: number; clientId: string; entries: Entry[]; batchId?: string }
+  | { type: 'catchup'; seq: number; log: LogItem[]; maxMessageBytes?: number; cont?: boolean }
+  | { type: 'reject'; seq: number; batchId?: string }
   | { type: 'diverged'; seq: number }
   | { type: 'incompatible'; engine: string }
   | { type: 'too-large'; what: string; bytes: number; limit: number }
+  | { type: 'invalid'; what: 'ops' | 'base'; reason: string; batchId?: string }
   | { type: 'cursor'; clientId: string; name: string; seq: number; caret: TextCaret | null }
   | { type: 'cursor-leave'; clientId: string }
   | { type: 'error'; error: string };
@@ -34,11 +37,37 @@ const RESYNC_LIMIT = 3;
 /** 공유 문서 열기는 확인 창 없이 (1단계 §6.2) */
 const OPEN_OPTIONS = { suppressDialogs: true } as const;
 const AUTOSAVE_NOTICE = '공동편집 중에는 로컬 자동 저장을 하지 않습니다 — 서버 문서가 기준입니다';
+/** S3-1: 공동편집 중 조판은 엔진 내장 글꼴 규칙 — 문서 글꼴이 설치된 기기에서는 혼자 편집할 때와 배치가 다를 수 있다. */
+const FONT_POLICY_NOTICE = '공동편집 중에는 모든 참여자가 같은 결과를 보도록 내장 글꼴 규칙으로 배치합니다 — 문서 글꼴이 설치된 기기에서는 혼자 편집할 때와 줄·쪽 나눔이 다를 수 있습니다';
 const NOTICE_MS = 8000;
+/** S3-4 재접속: 지수 백오프 상한, 오래 끊김 안내 기준 */
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 10_000;
+const LONG_DISCONNECT_MS = 10 * 60_000;
+const LONG_DISCONNECT_PENDING = 2000;
+const DISCONNECT_BANNER = '연결이 끊겼습니다. 편집은 다시 연결되면 보내집니다';
+const LONG_DISCONNECT_NOTICE = '오래 끊겨 있습니다 — 다시 연결되면 동시 편집 충돌로 취소되는 편집이 많을 수 있습니다';
+const RESUME_FALLBACK_NOTICE = '오래 끊겨 서버 문서로 다시 맞췄습니다. 끊긴 동안의 편집 일부가 취소됐을 수 있습니다';
+/** S3-2: 서버 정본이 내 편집을 거절했다 — 재동기화로 그 편집을 버리고 서버 문서로 맞춘다. */
+const INVALID_NOTICE = '서버가 편집 하나를 적용하지 못해 거절했습니다. 서버 문서로 다시 맞춥니다';
 /** 내 캐럿을 보내는 간격(ms) — 바뀌었을 때만. 서버는 참여자마다 초당 20회까지 중계한다. */
 const CURSOR_INTERVAL_MS = 150;
 const CURSOR_COLORS = ['#e53935', '#1e88e5', '#43a047', '#fb8c00', '#8e24aa', '#00897b', '#6d4c41', '#3949ab'];
 const TOO_LARGE_NOTICE = '문서가 커서 이 편집은 공동편집으로 보낼 수 없습니다';
+
+/**
+ * S3-1: 글꼴 정책이 문서에 실제로 걸렸는지 — 선언 글꼴 환경이 없고(엔진 기본) Canvas 보충 측정이 꺼져 있다.
+ * 패치가 빠진 studio 처럼 정책이 먹지 않으면 조판이 기기마다 달라지므로 방에 들어가지 않는다.
+ */
+function fontPolicyHolds(doc: EngineDoc): boolean {
+  const d = doc as unknown as { getDocumentFontSelectionPlan?: () => string; canvasMetricsActive?: () => boolean };
+  try {
+    const plan = d.getDocumentFontSelectionPlan ? JSON.parse(d.getDocumentFontSelectionPlan()) as { environmentId: string | null } : null;
+    return (plan?.environmentId ?? null) === null && !(d.canvasMetricsActive?.() ?? false);
+  } catch {
+    return false;
+  }
+}
 
 /** R12: 결과·base 는 gzip 으로 감싸 온다(`collabExportState`). studio 열기에는 원본 바이트가 필요하다. */
 const isGzip = (b: Uint8Array) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
@@ -75,11 +104,30 @@ export const collabPlugin = {
     const room = params.get('room') || 'demo';
     const name = params.get('name') || 'anon';
     const fast = params.get('collabFast') !== '0';
+    /** 오래 끊김 안내 기준(시험에서 줄일 수 있다) */
+    const longDisconnectMs = Number(params.get('collabLongDisconnectMs') ?? LONG_DISCONNECT_MS);
     const clientId = crypto.randomUUID();
 
     // ── 상태 (§7) ─────────────────────────────────────────────────────
     let lastSeq = 0;
     let inflight = 0;
+    /** S3-3: 방의 세대(welcome 이 알려 줌). 다시 붙을 때 실어 보낸다 — 세대가 바뀌었으면 따라잡기 대신 welcome. */
+    let generation = 0;
+    /** S3-4: 보낸 묶음의 이름(clientId:순번) — 끊긴 뒤 따라잡기에서 내 묶음이 받아졌는지 가린다 */
+    let batchCounter = 0;
+    let inflightBatch: string | null = null;
+    /** S3-4 재접속 상태 */
+    let reconnectAttempts = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 시험용: 이 시각까지 다시 붙지 않는다(끊긴 동안의 편집을 만들려고) */
+    let reconnectHoldUntil = 0;
+    let disconnectedAt = 0;
+    let longDisconnectWarned = false;
+    /** 다시 붙으며 lastSeq 를 실어 hello 를 보냈다 — 답(catchup 또는 welcome)을 기다리는 중 */
+    let resuming = false;
+    /** 나가거나 내릴 때 — 끊겨도 다시 붙지 않는다 */
+    let closing = false;
+    let reconnects = 0;
     /** 서버 메시지 상한(welcome 이 알려 줌, R12) */
     let maxMessageBytes = Number.POSITIVE_INFINITY;
     let ready = false;
@@ -108,6 +156,8 @@ export const collabPlugin = {
     // ── 숨은 기능: 자동 저장·되돌리기 중지, 기록 훅 ─────────────────────
     const resumeAutosave = host.suspendAutosave();
     const resumeHistory = host.suspendHistory();
+    // S3-1: 문서를 열기 전에 글꼴 정책을 건다 — 기기·브라우저가 달라도 같은 조판.
+    const releaseFontPolicy = host.setFontPolicy(FONT_POLICY);
     let flushQueued = false;
     const engine = new CollabEngine({
       onLocal: () => {
@@ -164,6 +214,7 @@ export const collabPlugin = {
       banner.textContent = text;
       document.body.appendChild(banner);
     };
+    const hideBanner = () => { banner?.remove(); banner = null; };
     const markDesynced = (reason: string) => {
       if (desynced) return;
       desynced = true;
@@ -175,15 +226,18 @@ export const collabPlugin = {
     };
 
     // ── 서버 연결 ─────────────────────────────────────────────────────
-    const ws = new WebSocket(url);
+    // S3-4: 끊기면 지수 백오프로 다시 붙는다(connect). 그동안 엔진 상태(미확정·lastSeq)는 그대로 두고 편집은 계속 쌓인다.
+    let ws: WebSocket | null = null;
     const send = (msg: Record<string, unknown>) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     };
 
     /** 방에서 나간다(예상치 못한 문서 교체 등). 기록 훅·중지를 모두 푼다. */
     const leave = (reason: string) => {
       if (left) return;
       left = true;
+      closing = true;
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       for (const c of cursors.values()) c.el?.remove();
       cursors.clear();
       ready = false;
@@ -191,8 +245,9 @@ export const collabPlugin = {
       releaseIntercept();
       resumeHistory();
       resumeAutosave();
+      releaseFontPolicy();
       if (digestTimer !== null) clearTimeout(digestTimer);
-      try { ws.close(); } catch { /* noop */ }
+      try { ws?.close(); } catch { /* noop */ }
       showBanner(`공동편집에서 나왔습니다 (${reason})`);
       log(`방을 나감: ${reason}`);
       render();
@@ -269,18 +324,22 @@ export const collabPlugin = {
 
     // ── 보내기 (§7 flush) ─────────────────────────────────────────────
     const flush = () => {
-      if (!ready || left || desynced || resyncing || inflight > 0 || connection !== 'open' || host.isComposing()) return;
+      // 다시 붙은 뒤 서버 답(catchup·welcome)을 받기 전에는 보내지 않는다(resuming) — 옛 base 묶음의 늦은 reject 가
+      // 따라잡기 뒤의 새 묶음을 건드리지 않게.
+      if (!ready || left || desynced || resyncing || resuming || inflight > 0 || connection !== 'open' || host.isComposing()) return;
       const entries = engine.takePending();
       if (entries.length === 0) return;
-      const payload = JSON.stringify({ type: 'ops', base: lastSeq, entries });
+      const batchId = `${clientId}:${++batchCounter}`;
+      const payload = JSON.stringify({ type: 'ops', base: lastSeq, entries, batchId });
       if (payload.length > maxMessageBytes) {
         // 보내지 않는다. 미확정을 버리고 서버 문서로 되돌린다(R12).
         notice(TOO_LARGE_NOTICE, 'too-large');
         requestResync(`편집이 메시지 상한 ${maxMessageBytes}바이트를 넘음`);
         return;
       }
-      if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+      ws?.send(payload);
       inflight = entries.length;
+      inflightBatch = batchId;
       sentEntries += entries.length;
       render();
     };
@@ -296,6 +355,11 @@ export const collabPlugin = {
       renderCursors();
     });
     const cursorTimer = setInterval(() => {
+      if (ready && !left && connection !== 'open' && !longDisconnectWarned && disconnectedAt
+        && (Date.now() - disconnectedAt > longDisconnectMs || engine.pendingCount > LONG_DISCONNECT_PENDING)) {
+        longDisconnectWarned = true;
+        notice(LONG_DISCONNECT_NOTICE, 'long-disconnect');
+      }
       if (!ready || left || desynced || connection !== 'open') return;
       const doc = handle();
       if (!doc) return;
@@ -351,20 +415,27 @@ export const collabPlugin = {
       engine.attach(doc);
       host.applyExternal('collab:resync', () => {
         doc.collabLoadState(base64ToBytes(msg.base as string));
-        for (const item of msg.log) engine.replay(item.entries);
+        engine.replayAll(msg.log);
       });
       lastSeq = msg.seq;
       inflight = 0;
+      inflightBatch = null;
     };
 
     // ── 메시지 처리 ────────────────────────────────────────────────────
     const onWelcome = async (msg: Extract<ServerMessage, { type: 'welcome' }>) => {
       if (typeof msg.maxMessageBytes === 'number') maxMessageBytes = msg.maxMessageBytes;
-      if (msg.resync) {
+      if (typeof msg.generation === 'number') generation = msg.generation;
+      // S3-4: 다시 붙었는데 서버가 따라잡기를 못 해 주면(기준점이 그 뒤로 옮겨 감) 재동기화와 같다 — 미확정을 버린다.
+      const resumeFallback = resuming && ready && msg.base !== null;
+      resuming = false;
+      // 재동기화 요청 중에 끊겼다 다시 붙은 경우의 welcome 도 제자리 재동기화다.
+      if (msg.resync || resumeFallback || (resyncing && ready && msg.base !== null)) {
         applyWelcomeInPlace(msg);
         resyncing = false;
         engine.setRecording(true);
-        notice('동기화를 다시 맞췄습니다. 일부 입력이 취소됐을 수 있습니다');
+        if (resumeFallback) { reconnected(); notice(RESUME_FALLBACK_NOTICE, 'resume-fallback'); }
+        else notice('동기화를 다시 맞췄습니다. 일부 입력이 취소됐을 수 있습니다');
         render();
         scheduleDigest();
         return;
@@ -387,15 +458,17 @@ export const collabPlugin = {
           await host.loadDocument(raw, fileNameFor(room, raw), OPEN_OPTIONS);
           const doc = handle();
           if (!doc) throw new Error('문서를 열지 못했습니다');
+          if (!fontPolicyHolds(doc)) { leave('글꼴 환경을 고정하지 못했습니다'); return; }
           engine.attach(doc);
         } else {
           const raw = await gunzip(base64ToBytes(msg.base));
           await host.loadDocument(raw, fileNameFor(room, raw), OPEN_OPTIONS);
           const doc = handle();
           if (!doc) throw new Error('문서를 열지 못했습니다');
+          if (!fontPolicyHolds(doc)) { leave('글꼴 환경을 고정하지 못했습니다'); return; }
           engine.attach(doc);
           if (msg.log.length > 0) {
-            host.applyExternal('collab:replay', () => { for (const item of msg.log) engine.replay(item.entries); });
+            host.applyExternal('collab:replay', () => engine.replayAll(msg.log));
           }
           log(`welcome seq=${msg.seq}, 기준점 뒤 ${msg.log.length}건 재생`);
         }
@@ -407,6 +480,7 @@ export const collabPlugin = {
       engine.setRecording(true);
       render();
       notice(AUTOSAVE_NOTICE, 'notice');
+      notice(FONT_POLICY_NOTICE, 'font-policy');
       scheduleDigest();
     };
 
@@ -418,20 +492,29 @@ export const collabPlugin = {
       if (msg.clientId === clientId) {
         engine.ack(inflight);
         inflight = 0;
+        inflightBatch = null;
         lastSeq = msg.seq;
         render();
         flush();
         scheduleDigest();
         return;
       }
+      if (!applyRemote(msg)) return;
+      render();
+      flush();
+      scheduleDigest();
+    };
+
+    /** 남의 묶음 하나를 받는다(되감기·보정, 캐럿·다른 사람 커서 옮기기). 실패하면 재동기화를 걸고 false. */
+    const applyRemote = (msg: { seq: number; entries: Entry[] }): boolean => {
       const doc = handle();
-      if (!doc) return;
+      if (!doc) return false;
       const before = host.getCaret();
       const result = host.applyExternal('collab:remote', () => engine.receiveRemote(msg.entries, toTextCaret(doc, before)));
       lastSeq = msg.seq;
       if (!result.ok) {
         requestResync(`원격 적용 실패: ${result.error}`);
-        return;
+        return false;
       }
       const caret = toPluginCaret(doc, result.caret, before);
       if (caret && before) host.setCaret(caret);
@@ -443,6 +526,57 @@ export const collabPlugin = {
         const names = (es: readonly Entry[] | undefined) => (es ?? []).map((e) => (e.kind === 'state' ? 'state' : e.m)).join(',');
         console.warn(`[collab ${name}] 충돌: ${result.dropReason} — 취소 [${names(result.droppedEntries)}], 원격 [${names(msg.entries)}]`);
       }
+      return true;
+    };
+
+    /** 다시 붙음: 끊김 표시를 걷는다. */
+    const reconnected = () => {
+      disconnectedAt = 0;
+      longDisconnectWarned = false;
+      reconnects += 1;
+      hideBanner();
+    };
+
+    /**
+     * S3-4 따라잡기: 끊긴 동안의 묶음을 원격 수신과 같이 받는다(되감기·보정). 끊기는 순간 보낸 묶음(inflightBatch)이
+     * 그 안에 있으면 남의 편집이 아니라 확정(ack)이다 — 다시 적용하지 않는다. 없으면 받아지지 않은 것이라 다시 보낸다.
+     */
+    const onCatchup = (msg: Extract<ServerMessage, { type: 'catchup' }>) => {
+      resuming = false;
+      if (typeof msg.maxMessageBytes === 'number') maxMessageBytes = msg.maxMessageBytes;
+      let acked = false;
+      for (const item of msg.log) {
+        if (item.seq !== lastSeq + 1) {
+          requestResync(`따라잡기 seq 가 건너뛰었습니다 (기대 ${lastSeq + 1}, 받음 ${item.seq})`);
+          return;
+        }
+        const mine = item.batchId !== undefined ? item.batchId === inflightBatch : item.clientId === clientId;
+        if (mine && inflight > 0) {
+          engine.ack(inflight);
+          inflight = 0;
+          inflightBatch = null;
+          lastSeq = item.seq;
+          acked = true;
+          continue;
+        }
+        if (!applyRemote(item)) return;
+      }
+      if (inflight > 0) {
+        // 끊기기 전에 보낸 묶음이 서버에 닿지 않았다 — 미확정 앞에 되돌려 다시 보낸다.
+        engine.requeue();
+        inflight = 0;
+        inflightBatch = null;
+      }
+      if (msg.cont) {
+        // 나눠 보낸 welcome 의 이어지는 조각(S3-3 — 기준점 + 긴 기록이 메시지 상한을 넘을 때)
+        render();
+        flush();
+        scheduleDigest();
+        return;
+      }
+      reconnected();
+      log(`따라잡기 seq ${msg.seq}: ${msg.log.length}건${acked ? ' (끊길 때 보낸 내 묶음 확정)' : ''}`);
+      notice(`다시 연결했습니다 — 끊긴 동안의 편집 ${msg.log.length}건을 받았습니다`, 'reconnected');
       render();
       flush();
       scheduleDigest();
@@ -454,14 +588,26 @@ export const collabPlugin = {
       switch (msg.type) {
         case 'welcome': return onWelcome(msg);
         case 'ops': return onOps(msg);
+        case 'catchup': return onCatchup(msg);
         case 'reject':
+          if (msg.batchId !== undefined && msg.batchId !== inflightBatch) return; // 늦게 온 옛 묶음의 reject
           engine.requeue();
           inflight = 0;
+          inflightBatch = null;
           flush();
           return;
         case 'diverged': return requestResync(`참여자 간 문서 지문이 다릅니다 (seq ${msg.seq})`);
         case 'incompatible':
           leave('엔진 버전이 방과 다릅니다. 새로고침하세요');
+          return;
+        case 'invalid':
+          if (msg.what === 'base') {
+            leave(`서버가 이 문서를 열지 못했습니다 (${msg.reason})`);
+            return;
+          }
+          if (msg.batchId !== undefined && msg.batchId !== inflightBatch) return;
+          notice(INVALID_NOTICE, 'invalid');
+          requestResync(`서버 정본이 편집을 거절: ${msg.reason}`);
           return;
         case 'too-large':
           if (msg.what === 'base') {
@@ -495,7 +641,7 @@ export const collabPlugin = {
         requestResync(`처리 중 오류: ${error instanceof Error ? error.message : String(error)}`);
       });
     };
-    ws.addEventListener('message', (event) => {
+    const onSocketMessage = (event: MessageEvent) => {
       let msg: ServerMessage;
       try {
         msg = JSON.parse(String(event.data)) as ServerMessage;
@@ -508,24 +654,49 @@ export const collabPlugin = {
         return;
       }
       enqueue(msg);
-    });
+    };
     host.events.on('composition-end', () => {
       // 조합 중 보류한 원격 메시지를 순서대로 처리하고, 조합 중 쌓인 내 편집을 보낸다.
       const pending = held.splice(0);
       for (const msg of pending) enqueue(msg);
       queue = queue.then(() => flush());
     });
-    ws.addEventListener('open', () => {
-      connection = 'open';
+    const connect = () => {
+      reconnectTimer = null;
+      if (closing || left) return;
+      connection = 'connecting';
       render();
-      send({ type: 'hello', room, clientId, name, engine: ENGINE_FINGERPRINT });
-      log(`연결 ${url} room=${room} 엔진 ${ENGINE_FINGERPRINT}`);
-    });
-    ws.addEventListener('close', () => {
-      connection = 'closed';
-      render();
-      log('연결 끊김');
-    });
+      const socket = new WebSocket(url);
+      ws = socket;
+      socket.addEventListener('message', (event) => { if (socket === ws) onSocketMessage(event); });
+      socket.addEventListener('open', () => {
+        if (socket !== ws) return;
+        connection = 'open';
+        reconnectAttempts = 0;
+        // 이미 방에 들어와 있었으면(재접속) 마지막으로 받은 seq 를 싣는다 → 서버가 따라잡기(catchup) 또는 welcome.
+        resuming = ready && !resyncing && !desynced;
+        render();
+        send({ type: 'hello', room, clientId, name, engine: ENGINE_FINGERPRINT, ...(resuming ? { lastSeq, generation } : {}) });
+        log(`연결 ${url} room=${room} 엔진 ${ENGINE_FINGERPRINT}${resuming ? ` (다시 붙음, lastSeq ${lastSeq})` : ''}`);
+      });
+      socket.addEventListener('close', () => {
+        if (socket !== ws) return;
+        connection = 'closed';
+        render();
+        if (closing || left) return;
+        if (!disconnectedAt) disconnectedAt = Date.now();
+        // 재동기화 중에 끊겼으면 그 요청은 사라졌다 — resyncing 을 그대로 두면 다시 붙을 때 lastSeq 없이 hello 를 보내고,
+        // 받은 welcome 을 제자리 재동기화로 처리한다(onWelcome).
+        for (const c of cursors.values()) c.el?.remove();
+        cursors.clear();
+        if (ready) showBanner(DISCONNECT_BANNER);
+        const delay = Math.max(Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts), reconnectHoldUntil - Date.now());
+        reconnectAttempts += 1;
+        log(`연결 끊김 — ${Math.round(delay)}ms 뒤 다시 연결`);
+        reconnectTimer = setTimeout(connect, delay);
+      });
+    };
+    connect();
     render();
 
     // ── 표면: 콘솔 검증용 ──────────────────────────────────────────────
@@ -535,9 +706,12 @@ export const collabPlugin = {
         pending: engine.pendingCount, unsent: engine.unsentCount, sentEntries, droppedTotal,
         lastDigest, digestSentSeq, resyncCount: resyncTimes.length, engine: ENGINE_FINGERPRINT,
         cursors: [...cursors.entries()].map(([id, c]) => ({ clientId: id, name: c.name, caret: c.caret })),
+        reconnects, disconnectedAt, inflightBatch,
         fast: { enabled: fast, ...engine.fastStats, mismatches: engine.fastStats.mismatches.length },
       }),
       digest: () => handle()?.collabDigest() ?? '',
+      /** 시험용(S3-4): 연결을 끊고 ms 동안 다시 붙지 않는다 — 그동안의 편집은 쌓였다가 다시 붙으면 보내진다. */
+      simulateDisconnect: (ms = 0) => { reconnectHoldUntil = Date.now() + ms; ws?.close(); },
     };
     (window as unknown as { __collab?: typeof surface }).__collab = surface;
     teardown = () => {
@@ -549,7 +723,10 @@ export const collabPlugin = {
       releaseIntercept();
       resumeHistory();
       resumeAutosave();
-      try { ws.close(); } catch { /* noop */ }
+      releaseFontPolicy();
+      closing = true;
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      try { ws?.close(); } catch { /* noop */ }
       panel.remove();
       banner?.remove();
       delete (window as unknown as { __collab?: unknown }).__collab;

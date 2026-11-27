@@ -130,6 +130,13 @@ impl HwpDocument {
         self.rewrite_state(state).map_err(js_err)
     }
 
+    /// 6단계 S2(서버 정본, 방을 열 때 한 번): 원본 바이트 캐시를 모두 버리고 모델에서만 쓴 결과를 지금 저장본과 견준다.
+    /// 반환 JSON 문자열 `{ok, lost: [{kind, count, detail?}], irDiff}`. 이 문서는 바꾸지 않는다.
+    #[wasm_bindgen(js_name = collabRoundtripCheck)]
+    pub fn collab_roundtrip_check(&self) -> Result<String, JsValue> {
+        self.roundtrip_check().map(|v| v.to_string()).map_err(js_err)
+    }
+
     /// 5단계 D4(클라이언트 문): 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가.
     #[wasm_bindgen(js_name = collabFieldContains)]
     pub fn collab_field_contains(&self, method: &str, args_json: &str, active_field_json: &str) -> Result<bool, JsValue> {

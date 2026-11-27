@@ -205,6 +205,89 @@ fn keep_known_section_tails(doc: &mut Document, canon: &Document) -> bool {
     changed
 }
 
+/// 6단계 S2: 원본 바이트 캐시를 모두 버린다 — 저장기가 모든 부분을 모델에서 쓴다(편집했을 때와 같다).
+fn strip_raw_caches(doc: &mut Document) {
+    for section in &mut doc.sections {
+        section.raw_stream = None;
+        section.raw_provenance = None;
+    }
+    let info = &mut doc.doc_info;
+    info.raw_stream = None;
+    info.raw_provenance = None;
+    for font in info.font_faces.iter_mut().flatten() {
+        font.raw_data = None;
+    }
+    for x in &mut info.border_fills {
+        x.raw_data = None;
+    }
+    for x in &mut info.char_shapes {
+        x.raw_data = None;
+    }
+    for x in &mut info.tab_defs {
+        x.raw_data = None;
+    }
+    for x in &mut info.numberings {
+        x.raw_data = None;
+    }
+    for x in &mut info.bullets {
+        x.raw_data = None;
+    }
+    for x in &mut info.para_shapes {
+        x.raw_data = None;
+    }
+    for x in &mut info.styles {
+        x.raw_data = None;
+    }
+    doc.doc_properties.raw_data = None;
+}
+
+/// 6단계 S2: 스트림(DocInfo·구역 순번)마다 레코드 태그 멀티셋에서 사라진 레코드 수와 태그별 요약.
+fn lost_records(before: &Document, after: &Document) -> (usize, String) {
+    use crate::parser::record::Record;
+    let tags = |raw: Option<&Vec<u8>>| -> Option<std::collections::BTreeMap<u16, usize>> {
+        let mut m = std::collections::BTreeMap::new();
+        for r in Record::read_all(raw?).ok()? {
+            *m.entry(r.tag_id).or_default() += 1;
+        }
+        Some(m)
+    };
+    let mut by_tag: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    let mut pairs = vec![(before.doc_info.raw_stream.as_ref(), after.doc_info.raw_stream.as_ref())];
+    pairs.extend(before.sections.iter().zip(&after.sections).map(|(a, b)| (a.raw_stream.as_ref(), b.raw_stream.as_ref())));
+    for (a, b) in pairs {
+        let (Some(a), Some(b)) = (tags(a), tags(b)) else { continue };
+        for (tag, n) in a {
+            let have = b.get(&tag).copied().unwrap_or(0);
+            if n > have {
+                *by_tag.entry(tag).or_default() += n - have;
+            }
+        }
+    }
+    let total = by_tag.values().sum();
+    let name = |tag: u16| match crate::parser::tags::tag_name(tag) {
+        "UNKNOWN" | "" => format!("0x{tag:03x}"),
+        n => n.to_string(),
+    };
+    (total, summarize(by_tag.iter().map(|(t, n)| format!("{}×{n}", name(*t))), 6))
+}
+
+/// 앞의 `max` 개를 "; " 로 잇고, 남으면 "외 N" 을 붙인다.
+fn summarize(items: impl Iterator<Item = String>, max: usize) -> String {
+    let all: Vec<String> = items.collect();
+    let mut s = all.iter().take(max).cloned().collect::<Vec<_>>().join("; ");
+    if all.len() > max {
+        s.push_str(&format!(" 외 {}", all.len() - max));
+    }
+    s
+}
+
+fn bytes_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 /// gzip 이면 풀고, 아니면(HWP·HWPX 원본) 그대로 돌려준다.
 pub fn unpack_state(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, HwpError> {
     use std::io::Read;
@@ -924,6 +1007,79 @@ impl CollabCore {
             _ => tmp.export_hwp_native()?,
         };
         pack_state(&out)
+    }
+
+    /// 6단계 S2(docs/collab-stage6.md): 방을 열 때 왕복 점검. rhwp 는 저장할 때 손대지 않은 부분의 원본 바이트를 그대로
+    /// 써서 "저장 후 비교"는 rhwp 가 모르는 기능이 있어도 통과한다. 그 부분을 편집하면 모델에서 다시 쓰므로, **원본 바이트
+    /// 캐시를 모두 버리고 모델에서만 쓴 결과**를 지금 문서의 저장본(원본)과 견준다. 이 문서는 바꾸지 않는다.
+    ///
+    /// 결과 `{ok, lost: [{kind, count, detail}], irDiff}` — `kind`:
+    /// - `ir`: 다시 읽은 모델의 차이(업스트림 저장 자기검증 `diff_exported_hwp(x)_documents` — 저장기가 다시 만드는 줄
+    ///   캐시는 빼고 견준다). `count` = `irDiff`, `detail` = 앞의 몇 건.
+    /// - `record`(HWP): 스트림(DocInfo·구역)마다 레코드 태그 멀티셋에서 사라진 레코드 — 파서가 모델에 남기지 않는 레코드.
+    ///   `detail` = 태그별 개수.
+    /// - `bindata`: 그림·첨부 데이터의 내용 멀티셋에서 사라진 것(HWP 는 업스트림 `hwp5_roundtrip_batch` 의 검사).
+    /// - `ole-clsid`(HWP): BinData 안 OLE 개체의 루트 CLSID 가 사라진 것(같은 검사 — 한컴이 개체를 알아보지 못한다).
+    /// - `cfb`(HWP): 저장본 CFB 구조(필수 스트림·구역 수). `package`(HWPX): 패키지 구조(업스트림 `check_package`).
+    ///
+    /// 버리는 캐시(HWP): 구역·DocInfo 원본 바이트와 그 봉인, DocInfo 항목별 원본 레코드(`raw_data`), 문서 속성 원본.
+    /// 모델 안의 날 바이트 자리(개체 `ctrl_data_records` 등 — 편집해도 남는다)는 모델의 일부로 둔다. HWPX 저장기는 원본
+    /// 캐시 없이 늘 모델(과 원문 조각)에서 쓰므로 그대로 저장한다.
+    pub fn roundtrip_check(&self) -> Result<Value, HwpError> {
+        use crate::diagnostics::hwp5_roundtrip_batch::{bindata_fingerprint, cfb_structure_ok, multiset_lost, nested_ole_clsid_fingerprint};
+        let hwpx = matches!(self.inner.source_format, crate::parser::FileFormat::Hwpx);
+        let export = |core: &DocumentCore| if hwpx { core.export_hwpx_native() } else { core.export_hwp_native() };
+        let orig = export(&self.inner)?;
+        let mut tmp = DocumentCore::from_bytes(&orig)?;
+        let before = tmp.document.clone();
+        if !hwpx {
+            strip_raw_caches(&mut tmp.document);
+        }
+        let out = export(&tmp)?;
+        let after = DocumentCore::from_bytes(&out)?.document;
+        let mut lost: Vec<Value> = Vec::new();
+        let mut push = |kind: &str, count: usize, detail: String| {
+            if count > 0 {
+                lost.push(if detail.is_empty() { json!({ "kind": kind, "count": count }) } else { json!({ "kind": kind, "count": count, "detail": detail }) });
+            }
+        };
+        let diff = if hwpx {
+            crate::serializer::hwpx::roundtrip::diff_exported_hwpx_documents(&before, &after)
+        } else {
+            crate::serializer::hwpx::roundtrip::diff_exported_hwp_documents(&before, &after)
+        };
+        let ir_diff = diff.differences.len();
+        push("ir", ir_diff, summarize(diff.differences.iter().map(|d| d.to_string()), 3));
+        if hwpx {
+            let contents = |d: &Document| {
+                let mut m: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+                for c in &d.bin_data_content {
+                    *m.entry(bytes_hash(&c.data.load_shared())).or_default() += 1;
+                }
+                m
+            };
+            let (a, b) = (contents(&before), contents(&after));
+            let n = multiset_lost(&a, &b);
+            push("bindata", n, format!("{n}/{}", a.values().sum::<usize>()));
+            let pkg = crate::serializer::hwpx::package_check::check_package(&out, &before);
+            push("package", pkg.problems.len(), summarize(pkg.problems.iter().cloned(), 3));
+        } else {
+            let (records, detail) = lost_records(&before, &after);
+            push("record", records, detail);
+            if let (Some(a), Some(b)) = (bindata_fingerprint(&orig), bindata_fingerprint(&out)) {
+                let n = multiset_lost(&a, &b);
+                push("bindata", n, format!("{n}/{}", a.values().sum::<usize>()));
+            }
+            if let (Some(a), Some(b)) = (nested_ole_clsid_fingerprint(&orig), nested_ole_clsid_fingerprint(&out)) {
+                let n = multiset_lost(&a, &b);
+                push("ole-clsid", n, format!("{n}/{}", a.values().sum::<usize>()));
+            }
+            let (ok, problems) = cfb_structure_ok(&out, before.sections.len());
+            if !ok {
+                push("cfb", 1, problems);
+            }
+        }
+        Ok(json!({ "ok": lost.is_empty(), "lost": lost, "irDiff": ir_diff }))
     }
 
     /// 5단계 D4 클라이언트 문: 글자 연산 호출(`method`·`args`, 호출 전)이 활성 누름틀(`active_field`) 안에 완전히 드는가.

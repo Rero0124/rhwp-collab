@@ -1308,3 +1308,30 @@ fn rewrite_state_rewrites_extension_master_pages_from_the_model() {
     assert_eq!(tail(&reread(&s2)), tail(&canon2));
     assert_eq!(digest_of(&s2), digest_of(&c2));
 }
+
+#[test]
+fn roundtrip_check_passes_a_document_rhwp_writes_fully_from_its_model() {
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    let before = c.digest();
+    let v = c.roundtrip_check().unwrap();
+    assert_eq!(v, serde_json::json!({ "ok": true, "lost": [], "irDiff": 0 }));
+    assert_eq!(c.digest(), before, "문서를 바꾸지 않는다");
+    // HWPX 출처(형식 계열 그대로 점검)
+    let hwpx = c.export_hwpx_native().unwrap();
+    let h = CollabCore::new(DocumentCore::from_bytes(&hwpx).unwrap());
+    assert!(matches!(h.source_format, crate::parser::FileFormat::Hwpx));
+    assert_eq!(h.roundtrip_check().unwrap(), serde_json::json!({ "ok": true, "lost": [], "irDiff": 0 }));
+}
+
+#[test]
+fn roundtrip_check_reports_records_only_the_cached_bytes_keep() {
+    // 원본 바이트 캐시 덕에 저장하면 남지만(그대로 저장은 통과) 그 구역을 편집하면 사라지는 레코드 — 점검이 알려야 한다.
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    let packed = with_injected_record(&mut c);
+    assert!(sections_carry_marker(&packed), "그대로 저장하면 남는다(전제)");
+    let doc = CollabCore::new(reread(&packed));
+    let v = doc.roundtrip_check().unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["irDiff"], 0, "모델에는 없던 레코드라 다시 읽은 모델은 같다");
+    assert_eq!(v["lost"], serde_json::json!([{ "kind": "record", "count": 1, "detail": "0x3f0×1" }]));
+}

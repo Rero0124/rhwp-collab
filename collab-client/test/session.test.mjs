@@ -78,6 +78,8 @@ test('왕복 점검 문구(6단계 S2): 통과, 경고(종류 이름·개수, �
   assert.equal(roundtripText({ ok: false, lost: [{ kind: 'ole-clsid', count: 2 }, { kind: 'mystery', count: 1 }], irDiff: 0 }),
     '이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다: OLE 개체 2개, mystery 1개. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다');
   assert.match(roundtripText({ ok: false, lost: [], irDiff: 4 }), /내용 차이 4곳/);
+  // collab-core 가 내는 종류: ir(곳)·record·bindata·ole-clsid·cfb·package
+  assert.match(roundtripText({ ok: false, lost: [{ kind: 'ir', count: 4 }, { kind: 'bindata', count: 1 }, { kind: 'package', count: 2 }], irDiff: 4 }), /: 내용 차이 4곳, 그림·첨부 데이터 1개, 파일 구조 2개\./);
   assert.equal(roundtripBlockedText({ ok: false, lost: [{ kind: 'record', count: 3 }], irDiff: 0 }), 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다: rhwp 가 모르는 레코드 3개');
   assert.equal(roundtripBlockedText(null), 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다');
 });

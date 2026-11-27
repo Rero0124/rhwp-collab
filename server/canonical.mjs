@@ -64,7 +64,11 @@ export class Canonical {
    * 기록 열을 적용해 본다. confine(['form'] | ['comment'] | 둘 다)이 있으면 바뀐 곳이 그 부분뿐인지 결과로 확인하고,
    * 벗어나면 되돌린 뒤 {ok: false, forbidden: true, reason} 을 준다(5단계 D4).
    */
-  apply(entries, { confine } = {}) { return this.call('apply', { entries, ...(confine?.length ? { confine } : {}) }); }
+  apply(entries, { confine, memoOwner } = {}) {
+    return this.call('apply', { entries, ...(confine?.length ? { confine } : {}), ...(typeof memoOwner === 'string' ? { memoOwner } : {}) });
+  }
+  /** 5단계 D5: 암호 문서(원본 바이트)를 암호로 열어 결과 전송 형식(암호 없음, gzip base64)으로. 정본은 그대로. */
+  decrypt(raw, password) { return this.call('decrypt', { data: Buffer.from(raw).toString('base64'), password }); }
   digest() { return this.call('digest'); }
   export() { return this.call('export'); }
 

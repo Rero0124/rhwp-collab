@@ -23,7 +23,7 @@ import {
 
 type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string };
 type ServerMessage =
-  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number; user?: SessionUser }
+  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number; user?: SessionUser; allowEncrypted?: boolean; encryptedSource?: boolean }
   | { type: 'ops'; seq: number; clientId: string; entries: Entry[]; batchId?: string }
   | { type: 'catchup'; seq: number; log: LogItem[]; maxMessageBytes?: number; cont?: boolean; user?: SessionUser }
   | { type: 'reject'; seq: number; batchId?: string }
@@ -123,6 +123,26 @@ const FORBIDDEN_NOTICE: Record<string, string> = {
   unsupported: '이 서버는 양식·메모 권한의 편집을 아직 받지 않습니다. 서버 문서로 되돌립니다',
 };
 const VIEW_ONLY_NOTICE = '보기 전용으로 들어왔습니다. 문서를 고칠 수 없습니다';
+/** 5단계 D5: 암호 문서. 기본은 막고, 서버가 허용하면(welcome.allowEncrypted) 원래 암호 문서였다고 알리며 올린다. */
+const ENCRYPTED_REFUSED = '암호 문서는 공동편집할 수 없습니다';
+const ENCRYPTED_NOTICE = '원래 암호가 걸린 문서입니다. 공동편집 중에는 암호가 풀린 상태로 서버에 저장됩니다';
+
+/**
+ * D5: 지금 열린 문서가 암호 문서인가. studio 가 알려 주면(`requiresPasswordForSave` — 암호로 연 문서) 그것을 쓰고, 아니면
+ * 문서 정보의 `encrypted`(HWP 파일 머리 표시 — 암호로 연 HWPX 는 false 라 못 가린다)를 본다.
+ * 실수로 공유하는 것을 막는 장치다. 서버는 받은 바이트(암호 없음)로 원래 암호 문서였는지 알 수 없다.
+ */
+function documentIsEncrypted(host: PluginHost, doc: EngineDoc): boolean {
+  const studio = host as unknown as { requiresPasswordForSave?: () => boolean };
+  if (typeof studio.requiresPasswordForSave === 'function') {
+    try { if (studio.requiresPasswordForSave()) return true; } catch { /* 모름 — 아래로 */ }
+  }
+  try {
+    return JSON.parse((doc as unknown as { getDocumentInfo(): string }).getDocumentInfo()).encrypted === true;
+  } catch {
+    return false;
+  }
+}
 /** 5단계 D4: 권한 문 안내를 다시 띄우기까지(같은 문구) */
 const DENIED_NOTICE_MS = 3000;
 
@@ -560,6 +580,7 @@ export const collabPlugin = {
     // ── 메시지 처리 ────────────────────────────────────────────────────
     const onWelcome = async (msg: Extract<ServerMessage, { type: 'welcome' }>) => {
       onAdmitted(msg.user);
+      if (msg.encryptedSource) noticeEncrypted();
       if (typeof msg.maxMessageBytes === 'number') maxMessageBytes = msg.maxMessageBytes;
       if (typeof msg.generation === 'number') generation = msg.generation;
       // S3-4: 다시 붙었는데 서버가 따라잡기를 못 해 주면(기준점이 그 뒤로 옮겨 감) 재동기화와 같다 — 미확정을 버린다.
@@ -582,13 +603,17 @@ export const collabPlugin = {
         if (msg.base === null) {
           // 첫 참여자: 지금 문서를 base 로 올리고 같은 바이트로 다시 연다(모두 같은 파싱 결과에서 출발).
           if (!host.borrowDocument()) await host.createBlankDocument();
+          // 5단계 D5: 암호 문서는 서버가 허용할 때만 올린다
+          const encrypted = host.read((d) => documentIsEncrypted(host, d as unknown as EngineDoc));
+          if (encrypted && !msg.allowEncrypted) { leave(ENCRYPTED_REFUSED); return; }
           const packed = host.read((d) => (d as unknown as EngineDoc).collabExportState());
           const data = bytesToBase64(packed);
           if (data.length + 64 > maxMessageBytes) {
             leave('문서가 커서 공동편집을 시작할 수 없습니다');
             return;
           }
-          send({ type: 'base', data });
+          send({ type: 'base', data, ...(encrypted ? { encryptedSource: true } : {}) });
+          if (encrypted) noticeEncrypted();
           const raw = await gunzip(packed);
           log(`base 전송 ${packed.length}B (원본 ${raw.length}B)`);
           await host.loadDocument(raw, fileNameFor(room, raw), OPEN_OPTIONS);
@@ -723,6 +748,9 @@ export const collabPlugin = {
 
     // ── 5단계 D1: 인증 결과 (규칙은 ./session, 여기서는 studio 안내만) ────────────────
     let viewOnlyNoticed = false;
+    let encryptedNoticed = false;
+    /** D5: 원래 암호 문서였다는 경고를 한 번 */
+    const noticeEncrypted = () => { if (!encryptedNoticed) { encryptedNoticed = true; notice(ENCRYPTED_NOTICE, 'encrypted-source'); } };
     /** 방에 들어갔다: 서버가 확인한 이름·권한을 받는다(인증을 끈 서버는 user 가 없다). */
     const onAdmitted = (user: SessionUser | undefined) => {
       auth.admitted(user ?? null);

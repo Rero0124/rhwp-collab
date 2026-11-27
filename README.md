@@ -154,6 +154,7 @@ COLLAB_DATA_DIR=./data node server/server.mjs
 | `COLLAB_AUTH_SECRET` | 없음 | `hs256` 비밀키(32바이트 이상). `COLLAB_AUTH_SECRET_FILE` 로 파일에서 읽을 수도 있습니다 |
 | `COLLAB_AUTH_URL` | 없음 | `url` 방식에서 `{token, room}` 을 POST 할 주소. `{ok, sub, name, scope}` 를 돌려줘야 합니다 |
 | `COLLAB_INVITE_TTL` | `24h` | 방을 만들 때 서버가 만드는 초대 링크의 수명(`hs256` 만). `30m`, `7d`, 초 단위 숫자 |
+| `COLLAB_ALLOW_ENCRYPTED` | 없음 | `1` 이면 암호 문서로도 방을 엽니다. 그 방의 문서는 암호가 풀린 상태로 저장되고 오갑니다(기본은 거절) |
 | `COLLAB_ALLOWED_ORIGINS` | 없음 | 쉼표로 구분한 출처 목록. 있으면 그 밖의 브라우저 출처에서 오는 WebSocket·방 만들기를 거절합니다. 같은 출처는 언제나 허용합니다 |
 | `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | 없음 | PEM 인증서와 키 파일. 둘 다 있으면 HTTPS/wss 로 뜹니다 |
 | `COLLAB_STATIC_DIR` | 없음 | 함께 내줄 편집기 빌드(`scripts/build-studio.sh` 의 `target/studio`) |
@@ -262,6 +263,11 @@ node collab-client/test/sim.mjs --seeds 500 --ops 200 --clients 3
 - 편집기 안에서 "공동편집 시작"으로 지금 문서를 방으로 만드는 메뉴는 아직 없습니다. 업로드 페이지(`/upload`)나 API 를 씁니다.
 - 양식 입력·메모 링크의 편집은 서버의 판정 기능이 들어갈 때까지 거절됩니다. 보기 링크는 편집 화면을 막지 않습니다(입력은
   보내지지 않고 되돌아갑니다).
+- 암호가 걸린 문서는 기본으로 공동편집할 수 없습니다. `COLLAB_ALLOW_ENCRYPTED=1` 로 허용하면 업로드 페이지에서 문서 암호를
+  받아 열지만, 그 방의 문서는 암호 없이 저장되고 내려받은 파일에도 암호가 없습니다.
+- 편집 권한자는 결과 전송으로 rhwp가 해석하지 않는 레코드를 문서에 넣을 수 있습니다. 신뢰하는 사람에게만 편집 권한을 주세요.
+  양식 입력·메모 권한은 결과 전송을 보낼 수 없어서 이 경로가 없습니다. 서버가 받은 문서를 다시 써서 모두에게 같은 바이트를
+  보내는 방식은 다음 단계 후보입니다.
 - 링크 하나로 받은 토큰은 갱신되지 않습니다. 만료되면 링크를 다시 받아야 합니다.
 - 웹 브라우저에서만 동작합니다.
 - Linux 브라우저에서는 시험하지 않았습니다.

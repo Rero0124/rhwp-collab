@@ -60,6 +60,11 @@ export interface CatalogEntry {
   why?: string;
   /** studio 호출처(R14): 메뉴·도구·단축키 경로 / 플러그인·hwpctl 경로나 다리에서만 / 부르지 않음. */
   reach?: 'studio' | 'plugin' | 'none';
+  /**
+   * 5단계 D4: 이 편집에 필요한 권한(좁은 권한). `form` = 양식 값(누름틀 값·양식 개체), `memo` = 메모. 없으면 `edit`
+   * (새 함수도 `edit` — 좁은 권한에서는 막힌다). 글자 연산의 누름틀 안 입력은 `form` 권한에서 따로 판정한다.
+   */
+  perm?: Perm;
   /** 사람이 감사한 항목인가. `false` 면 새 업스트림 기능이라 보수적 기본값(레지스트리 안은 state, 밖은 watch)이다. */
   reviewed: boolean;
 }
@@ -74,7 +79,11 @@ export interface CatalogOverride {
   layout?: boolean;
   ctx?: readonly CtxKey[];
   why?: string;
+  perm?: Perm;
 }
+
+/** 5단계 D4: 좁은 권한 표시(분류표 `perm`). */
+export type Perm = 'form' | 'memo';
 
 /** 분류표에 없는 레지스트리 이름의 처리(사용자 결정: 새 기능은 느려도 동작한다). */
 export const UNCLASSIFIED: Omit<CatalogEntry, 'params' | 'section'> = {

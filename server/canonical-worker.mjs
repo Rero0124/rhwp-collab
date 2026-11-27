@@ -50,17 +50,10 @@ function validate(entries) {
  */
 function checkConfined(snap, kinds) {
   if (typeof doc.collabCheckConfined !== 'function') return { ok: false, reason: 'unsupported', detail: 'collabCheckConfined 가 없다' };
-  // 권한이 여럿이면(form comment) 그중 하나로 설명되면 통과한다. 보조의 반환 형식은 보조가 합쳐질 때 정한다 —
-  // 여기서는 {ok, detail?}(JSON 문자열 또는 객체)이나 boolean 을 받는다.
-  // TODO(D4, 보조 합친 뒤): 한 묶음이 양식과 메모를 함께 바꾸는 경우는 kind 를 합쳐 한 번에 판정해야 한다.
-  let detail = '';
-  for (const kind of kinds) {
-    const raw = doc.collabCheckConfined(snap, kind);
-    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (res === true || res?.ok === true) return { ok: true };
-    detail = String(res?.detail ?? res?.reason ?? detail);
-  }
-  return { ok: false, reason: 'confined', detail };
+  // 권한 목록을 한 번에 넘긴다(`"form comment"`) — 보조가 두 권한의 허용 부분을 함께 가리고 비교하므로, 한 묶음이
+  // 양식과 메모를 함께 바꿔도 판정된다. 반환은 {"ok":true} | {"ok":false,"reason":"confined","detail":".."}(JSON 문자열).
+  const res = JSON.parse(doc.collabCheckConfined(snap, kinds.join(' ')));
+  return res.ok === true ? { ok: true } : { ok: false, reason: res.reason ?? 'confined', detail: String(res.detail ?? '') };
 }
 
 /** 판정 보조가 있는지 — 없으면 적용해 보지도 않고 거절한다. */

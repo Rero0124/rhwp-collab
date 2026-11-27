@@ -1,5 +1,5 @@
 /** collab 엔진 공개 표면. studio·wasm 모듈을 import 하지 않는다. */
-export { CollabEngine, type Entry, type EngineDoc, type EngineOptions, type LocalLogItem, type ReceiveResult, type TextCaret, type UndoPosition } from './engine.ts';
+export { CollabEngine, PermissionDenied, DENIED_TEXT, type Entry, type EngineDoc, type EngineOptions, type LocalLogItem, type ReceiveResult, type TextCaret, type UndoPosition } from './engine.ts';
 export { classify, methodsToIntercept } from './classify.ts';
 export { CATALOG, ENGINE_FINGERPRINT, COMPOSED_METHODS } from './catalog.ts';
 export { bytesToBase64, base64ToBytes, encodeArgs, decodeArgs } from './codec.ts';

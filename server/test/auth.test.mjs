@@ -298,14 +298,15 @@ test('view: 편집·base 는 forbidden(연결 유지, seq 그대로, 방송 없�
   await Promise.all([e.close(), v.close()]);
 });
 
-test('form·comment: 결과 판정 보조(collabCheckConfined)가 합쳐지기 전에는 편집을 forbidden(unsupported)', async () => {
+test('form·comment: 정본이 결과로 판정 — 허용 밖 편집(본문 입력)은 forbidden(confined), seq 그대로', async () => {
+  // collabCheckConfined(5단계 D4 보조)가 합쳐진 뒤의 동작. 허용 부분의 편집·우회 사례 전체는 따로 시험한다.
   const { room, invite } = await makeRoom();
   for (const scope of ['form', 'comment']) {
     const c = await client(room, scope, { token: invite[scope] });
     const w = await c.next();
     assert.deepEqual(w.user.scope, [scope]);
-    c.send({ type: 'ops', base: 0, entries: [{ kind: 'op', m: 'setFieldValueByName', a: ['x', 'y'] }], batchId: `${scope}:1` });
-    assert.deepEqual(await c.next(), { type: 'forbidden', what: 'ops', reason: 'unsupported', batchId: `${scope}:1` });
+    c.send({ type: 'ops', base: 0, entries: [{ kind: 'op', m: 'insertText', a: [0, 0, 0, '본문'], meta: { len: 2 } }], batchId: `${scope}:1` });
+    assert.deepEqual(await c.next(), { type: 'forbidden', what: 'ops', reason: 'confined', batchId: `${scope}:1` });
     await c.close();
   }
   await server.settle(room);

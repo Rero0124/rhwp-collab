@@ -33,6 +33,8 @@ use crate::renderer::render_normalization::RenderPath;
 
 #[path = "ot.rs"]
 pub mod ot;
+// 5단계 D4: 좁은 권한(form·comment) 편집의 결과 판정·누름틀 범위 판정
+mod confine;
 
 #[cfg(feature = "wasm-api")]
 #[path = "wasm.rs"]
@@ -653,6 +655,40 @@ impl CollabCore {
     /// S3-0: DocInfo·구역 모델 지문에 **BinData 항목별 내용 해시**(id 순)를 더한다 — 그림·OLE·차트 바이트만
     /// 갈려도 잡힌다. 저장 표현이 아니라 압축을 푼 내용을 보며, 비용은 [`BinDigestCache`] 가 줄인다.
     /// `extra_streams`·`hwpx_aux_entries`(라운드트립 보존용 원본 조각)는 편집으로 바뀌지 않아 넣지 않는다.
+    /// 5단계 D4: 스냅샷(`snapshot_id`) 뒤의 변경이 `kind`(`form`·`comment`·`form comment`)가 허용하는 부분뿐인가.
+    /// `{"ok":true}` 또는 `{"ok":false,"reason":"confined","detail":".."}`.
+    pub fn check_confined(&self, snapshot_id: u32, kind: &str) -> Result<Value, HwpError> {
+        let kinds = confine::Kinds::parse(kind).map_err(HwpError::RenderError)?;
+        let (_, snap) = self
+            .snapshots
+            .iter()
+            .find(|(id, _)| *id == snapshot_id)
+            .ok_or_else(|| HwpError::RenderError(format!("collab 스냅샷 {snapshot_id} 없음")))?;
+        Ok(match confine::check(&snap.document, &self.inner.document, kinds) {
+            Ok(()) => json!({ "ok": true }),
+            Err(detail) => json!({ "ok": false, "reason": "confined", "detail": detail }),
+        })
+    }
+
+    /// 5단계 D4 클라이언트 문: 글자 연산 호출(`method`·`args`, 호출 전)이 활성 누름틀(`active_field`) 안에 완전히 드는가.
+    /// `insertTextLogical` 은 논리 오프셋을 텍스트 좌표로 바꿔 본다.
+    pub fn field_contains_call(&self, method: &str, args: &[Value], active_field: &Value) -> Result<bool, HwpError> {
+        if active_field.is_null() {
+            return Ok(false);
+        }
+        let mut rec = json!({ "kind": "op", "m": method, "a": args });
+        if method == "insertTextLogical" {
+            let n = |i: usize| args.get(i).and_then(Value::as_u64).map(|v| v as usize).ok_or_else(|| bad_args(method, format!("인자 {i}")));
+            let (off, after) = self.logical_to_text(n(0)?, n(1)?, n(2)?)?;
+            let len = args.get(3).and_then(Value::as_str).map(|t| t.chars().count()).unwrap_or(0);
+            rec["meta"] = json!({ "offset": off, "afterControl": after, "len": len });
+        }
+        Ok(match ot::parse_text(&rec) {
+            Some(op) => confine::field_contains(self, &op, active_field),
+            None => false,
+        })
+    }
+
     pub fn digest(&self) -> String {
         let doc = &self.inner.document;
         let mut props = doc.doc_properties.clone();

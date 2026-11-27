@@ -115,6 +115,21 @@ impl HwpDocument {
         Ok(super::ot::map_positions(&recs, &catalog, &items).to_string())
     }
 
+    /// 5단계 D4(서버 정본): 스냅샷 뒤의 변경이 좁은 권한(`form`·`comment`·`form comment`)이 허용하는 부분뿐인가.
+    /// `{"ok":true}` | `{"ok":false,"reason":"confined","detail":".."}`.
+    #[wasm_bindgen(js_name = collabCheckConfined)]
+    pub fn collab_check_confined(&self, snapshot_id: u32, kind: &str) -> Result<String, JsValue> {
+        self.check_confined(snapshot_id, kind).map(|v| v.to_string()).map_err(js_err)
+    }
+
+    /// 5단계 D4(클라이언트 문): 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가.
+    #[wasm_bindgen(js_name = collabFieldContains)]
+    pub fn collab_field_contains(&self, method: &str, args_json: &str, active_field_json: &str) -> Result<bool, JsValue> {
+        let args = parse(args_json, "args")?.as_array().cloned().unwrap_or_default();
+        let af = parse(active_field_json, "activeField")?;
+        self.field_contains_call(method, &args, &af).map_err(js_err)
+    }
+
     /// 4단계: 명령이 만든 기록 열의 발자국 `{items, whole, nested}`(순수 함수).
     #[wasm_bindgen(js_name = collabFootprint)]
     pub fn collab_footprint(&self, entries_json: &str, catalog_json: &str) -> Result<String, JsValue> {

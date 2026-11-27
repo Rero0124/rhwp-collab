@@ -1,3 +1,37 @@
+diff --git a/rhwp-studio/src/core/document-dirty-state.ts b/rhwp-studio/src/core/document-dirty-state.ts
+index c28ff9b9..5cbcf759 100644
+--- a/rhwp-studio/src/core/document-dirty-state.ts
++++ b/rhwp-studio/src/core/document-dirty-state.ts
+@@ -15,8 +15,14 @@ export class DocumentDirtyState {
+   private dirty = false;
+   private beforeUnloadWindow: Window | null = null;
+   private readonly eventBus: EventBus;
++  /**
++   * cc-rhwp(공동편집): 이탈 확인을 플러그인이 정한다. 있으면 저장 안 한 변경(dirty) 대신 이 판정으로 확인창을 띄운다 —
++   * 공동편집 중 문서는 서버가 들고 있으므로, 아직 보내지 못한 편집이 있을 때만 확인한다.
++   */
++  private readonly unloadGuards = new Map<symbol, () => boolean>();
+   private readonly beforeUnloadHandler = (event: BeforeUnloadEvent): string | void => {
+-    if (!this.dirty) return;
++    const block = this.unloadGuards.size > 0 ? [...this.unloadGuards.values()].some((guard) => guard()) : this.dirty;
++    if (!block) return;
+     event.preventDefault();
+     event.returnValue = '';
+     return '';
+@@ -30,6 +36,13 @@ export class DocumentDirtyState {
+     return this.dirty;
+   }
+ 
++  /** cc-rhwp: 이탈 확인 판정을 건다(여러 개면 하나라도 참이면 확인). 반환은 해제 함수. */
++  guardUnload(check: () => boolean): () => void {
++    const token = Symbol('unload-guard');
++    this.unloadGuards.set(token, check);
++    return () => { this.unloadGuards.delete(token); };
++  }
++
+   markDirty(reason?: string): void {
+     this.setDirty(true, reason);
+   }
 diff --git a/rhwp-studio/src/core/font-policy.ts b/rhwp-studio/src/core/font-policy.ts
 new file mode 100644
 index 00000000..386c0d0e
@@ -798,7 +832,7 @@ index 7d251116..fb99ce2b 100644
    /** Undo 실행 (커맨드 시스템용) */
    performUndo(): void { this.handleUndo(); }
 diff --git a/rhwp-studio/src/main.ts b/rhwp-studio/src/main.ts
-index 50b4215d..c2221a28 100644
+index 50b4215d..b0a8e990 100644
 --- a/rhwp-studio/src/main.ts
 +++ b/rhwp-studio/src/main.ts
 @@ -6,6 +6,7 @@ import { isPdfInput, type PdfInputSource } from './core/pdf-open';
@@ -865,7 +899,7 @@ index 50b4215d..c2221a28 100644
    createBlankDocument: async (options) => {
      if (options?.confirmUnsaved && !await canReplaceCurrentDocument()) return false;
      await createNewDocument();
-@@ -376,6 +397,32 @@ const plugins = new PluginHostRegistry({
+@@ -376,6 +397,34 @@ const plugins = new PluginHostRegistry({
    },
    resolve: resolvePlugin,
    sidePanels,
@@ -881,6 +915,8 @@ index 50b4215d..c2221a28 100644
 +    applyHistorySuspension();
 +    return () => { historySuspensions.delete(token); applyHistorySuspension(); };
 +  },
++  // cc-rhwp: 공동편집 중 이탈 확인 — studio 의 저장 안 한 변경 확인 대신 플러그인 판정(보내지 못한 편집이 있을 때만)
++  guardUnload: (_pluginId, check) => documentState.guardUnload(check),
 +  // cc-rhwp(4단계): 공동편집 되돌리기 훅 — 걸면 기록을 멈추지 않고 훅이 위치를 옮기고 막힘을 판정한다.
 +  enableCollabUndo: (_pluginId, hook) => {
 +    const controller = inputHandler?.setCollabHistory(hook) ?? null;
@@ -898,7 +934,7 @@ index 50b4215d..c2221a28 100644
    selectTextRange: (range) => {
      if (!inputHandler) return false;
      navigateToSearchHit(inputHandler, {
-@@ -478,6 +525,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
+@@ -478,6 +527,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
  }
  
  function handleAutosaveStatus(status: AutosaveStatus): void {
@@ -908,7 +944,7 @@ index 50b4215d..c2221a28 100644
    const message = document.getElementById('sb-message');
    if (!message) return;
    if (autosaveStatusRestoreTimer) {
-@@ -564,6 +614,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
+@@ -564,6 +616,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
      ? rendererSession?.getCanvasKitRenderer() ?? null
      : null;
    if (!renderer || (!fontNames?.length && !refresh)) return;
@@ -917,7 +953,7 @@ index 50b4215d..c2221a28 100644
    const requestedFonts = [...(fontNames ?? [])];
    void (async () => {
      await loadStoredLocalFonts();
-@@ -693,9 +745,12 @@ async function initialize(): Promise<void> {
+@@ -693,9 +747,12 @@ async function initialize(): Promise<void> {
            try {
              // 저장된 Local Font Access 권한이 있으면 첫 replay부터 원 face의 SFNT bytes를
              // CanvasKit에 전달한다. CSS local()에서 EBDT face가 두부로 바뀌는 경로를 타지 않는다.
@@ -933,7 +969,7 @@ index 50b4215d..c2221a28 100644
            } catch (error) {
              // 로컬 권한이 만료됐거나 face 읽기에 실패해도 portable bundled face로 계속 연다.
              console.warn(
-@@ -1313,8 +1368,29 @@ function setupEventListeners(): void {
+@@ -1313,8 +1370,29 @@ function setupEventListeners(): void {
      }
    });
  
@@ -963,7 +999,7 @@ index 50b4215d..c2221a28 100644
      wasm.invalidateCanvasMetricFonts();
      const documentGeneration = wasm.documentGeneration;
      const hostGeneration = getHostFontState().generation;
-@@ -1343,6 +1419,7 @@ function setupEventListeners(): void {
+@@ -1343,6 +1421,7 @@ function setupEventListeners(): void {
        clearDeclaredLocalPrograms();
      }
      if (!canvasView || wasm.pageCount === 0) return;
@@ -971,7 +1007,7 @@ index 50b4215d..c2221a28 100644
      const state = getLocalFontState();
      const generation = `${state.detectedAt ?? 'none'}:${state.source ?? 'none'}:${state.count}`;
      if (generation === lastAppliedLocalFontGeneration) return;
-@@ -1535,11 +1612,13 @@ async function initializeDocument(
+@@ -1535,11 +1614,13 @@ async function initializeDocument(
    try {
      signal.throwIfAborted();
      // 이미 승인된 snapshot을 권한 prompt 없이 준비한 뒤 프로그램을 선택한다.
@@ -987,22 +1023,34 @@ index 50b4215d..c2221a28 100644
        await promptLocalFontsIfNeeded(displayName);
        signal.throwIfAborted();
      }
-@@ -1997,7 +2076,8 @@ async function renderRecentSubmenu(): Promise<void> {
+@@ -1995,9 +2076,20 @@ async function renderRecentSubmenu(): Promise<void> {
+   panel.closest('.md-sub')?.classList.toggle('disabled', recents.length === 0);
+ }
  
++/**
++ * cc-rhwp: 공동편집으로 여는 주소인가 — `?collab`(서버 주소, 비면 같은 출처), 또는 조각의 `token`(초대·인증 링크)·
++ * `room`(플러그인이 토큰을 읽어 주소에서 지운 뒤의 새로고침). studio 는 주소 조각을 다른 데 쓰지 않는다.
++ */
++function isCollabLaunch(): boolean {
++  if (new URLSearchParams(window.location.search).has('collab')) return true;
++  const frag = new URLSearchParams(window.location.hash.replace(/^#/, ''));
++  return frag.has('token') || frag.has('room');
++}
++
  function shouldSkipInitialAutosaveRecovery(): boolean {
    const params = new URLSearchParams(window.location.search);
 -  return params.has('url');
 +  // cc-rhwp: 공동편집으로 열 때도 건너뛴다 — 문서는 공유 로그에서 받는다. 남은 초안은 지우지 않는다.
-+  return params.has('url') || params.has('collab');
++  return params.has('url') || isCollabLaunch();
  }
  
  async function offerAutosaveRecoveryIfIdle(): Promise<void> {
-@@ -2306,6 +2386,10 @@ void initPromise.then(() => {
+@@ -2306,6 +2398,10 @@ void initPromise.then(() => {
    if (__RHWP_AI__ && sidePanels && window.parent === window) {
      plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
    }
-+  // cc-rhwp: ?collab=ws://…&room=…&name=… 이면 공동편집 플러그인을 올린다.
-+  if (new URLSearchParams(window.location.search).has('collab')) {
++  // cc-rhwp: ?collab=ws://…&room=…&name=… 또는 #token=…&room=… 이면 공동편집 플러그인을 올린다.
++  if (isCollabLaunch()) {
 +    plugins.load('collab').catch((error) => console.error('[main] 공동편집 로드 실패', error));
 +  }
  });
@@ -1074,7 +1122,7 @@ index 00000000..011add1c
 +  };
 +}
 diff --git a/rhwp-studio/src/plugin/host.ts b/rhwp-studio/src/plugin/host.ts
-index 07a99843..fa1ca32c 100644
+index 07a99843..5bfa06a9 100644
 --- a/rhwp-studio/src/plugin/host.ts
 +++ b/rhwp-studio/src/plugin/host.ts
 @@ -15,6 +15,8 @@ import type { StudioAutomation } from '@/automation/types';
@@ -1104,7 +1152,7 @@ index 07a99843..fa1ca32c 100644
    createBlankDocument: (options?: { confirmUnsaved?: boolean }) => Promise<boolean>;
    /**
     * id 로 플러그인을 가져온다. **allowlist 는 이 훅이 쥔다** — 여기서 거절하면 호스트는
-@@ -57,8 +61,32 @@ export interface PluginHostDeps {
+@@ -57,8 +61,34 @@ export interface PluginHostDeps {
    sidePanels?: SidePanelRegistry;
    /** 편집기 선택 이동. 찾기 대화상자와 같은 경로를 쓰도록 studio 가 넘긴다. */
    selectTextRange?: (range: PluginTextRange) => boolean;
@@ -1122,6 +1170,8 @@ index 07a99843..fa1ca32c 100644
 +  ) => () => void;
 +  /** 되돌리기 기록 중지(cc-rhwp). 반환값은 재개 함수. 없으면 중지 요청은 아무 일도 하지 않는다. */
 +  suspendHistory?: (pluginId: string, message: string) => () => void;
++  /** 이탈 확인 판정(cc-rhwp). 반환값은 해제 함수. 없으면 판정 요청은 아무 일도 하지 않는다(studio 기본 확인 그대로). */
++  guardUnload?: (pluginId: string, check: () => boolean) => () => void;
 +  /** 공동편집 되돌리기 훅(cc-rhwp 4단계). 없거나 `null` 이면 지원하지 않는 것. */
 +  enableCollabUndo?: (pluginId: string, hook: CollabHistoryHook) => { controller: CollabHistoryController; release: () => void } | null;
 +  /** 글꼴 정책(cc-rhwp S3-1). 반환값은 해제 함수. 없으면 정책 요청은 아무 일도 하지 않는다. */
@@ -1137,7 +1187,7 @@ index 07a99843..fa1ca32c 100644
  /** `getSelectionText` 가 한 번에 돌려주는 글자 수 상한. */
  const SELECTION_TEXT_MAX_CHARS = 20000;
  
-@@ -69,7 +97,8 @@ const UNLOAD_TX_POLL_MS = 20;
+@@ -69,7 +99,8 @@ const UNLOAD_TX_POLL_MS = 20;
  function emptyLedger(): PluginLedger {
    return {
      commands: new Set(), menuItems: new Set(),
@@ -1147,7 +1197,7 @@ index 07a99843..fa1ca32c 100644
    };
  }
  
-@@ -238,8 +267,8 @@ class PluginHostFacade implements PluginHost {
+@@ -238,8 +269,8 @@ class PluginHostFacade implements PluginHost {
      };
    }
  
@@ -1158,7 +1208,7 @@ index 07a99843..fa1ca32c 100644
    }
  
    createBlankDocument(options?: { confirmUnsaved?: boolean }): Promise<boolean> {
-@@ -290,6 +319,14 @@ class PluginHostFacade implements PluginHost {
+@@ -290,6 +321,14 @@ class PluginHostFacade implements PluginHost {
  
    events = {
      on: (name: string, cb: (payload?: unknown) => void): (() => void) => {
@@ -1173,7 +1223,7 @@ index 07a99843..fa1ca32c 100644
        const off = this.deps.eventBus.on(name, cb);
        this.ledger.eventUnsubs.push(off);
        return off;
-@@ -305,6 +342,145 @@ class PluginHostFacade implements PluginHost {
+@@ -305,6 +344,151 @@ class PluginHostFacade implements PluginHost {
      return off;
    }
  
@@ -1205,6 +1255,12 @@ index 07a99843..fa1ca32c 100644
 +  suspendHistory(message: string = HISTORY_SUSPENDED_MESSAGE): () => void {
 +    const resume = this.deps.suspendHistory?.(this.pluginId, message) ?? (() => {});
 +    return this.ledgerOnce(this.ledger.historyResumes, resume);
++  }
++
++  guardUnload(check: () => boolean): () => void {
++    const release = this.deps.guardUnload?.(this.pluginId, check) ?? (() => {});
++    // 되돌리기 기록 중지와 같은 원장 — unload 때 풀린다
++    return this.ledgerOnce(this.ledger.historyResumes, release);
 +  }
 +
 +  enableCollabUndo(hook: CollabHistoryHook): (CollabHistoryController & { release(): void }) | null {
@@ -1319,7 +1375,7 @@ index 07a99843..fa1ca32c 100644
    /** 문서가 교체됐음을 이 플러그인에 알린다. 호스트도 외부 교체 때 부른다. */
    notifySwap(): void {
      const lease = this.borrowDocument();
-@@ -435,6 +611,18 @@ export class PluginHostRegistry {
+@@ -435,6 +619,18 @@ export class PluginHostRegistry {
      for (const off of ledger.uiUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
@@ -1338,7 +1394,7 @@ index 07a99843..fa1ca32c 100644
      for (const off of ledger.swapUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
-@@ -448,6 +636,10 @@ export class PluginHostRegistry {
+@@ -448,6 +644,10 @@ export class PluginHostRegistry {
        this.deps.automation.unregisterCommand(commandId);
      }
      ledger.uiUnsubs.length = 0;
@@ -1350,7 +1406,7 @@ index 07a99843..fa1ca32c 100644
      ledger.eventUnsubs.length = 0;
      ledger.menuItems.clear();
 diff --git a/rhwp-studio/src/plugin/types.ts b/rhwp-studio/src/plugin/types.ts
-index 571e2b4d..75aae724 100644
+index 571e2b4d..3bec5fd4 100644
 --- a/rhwp-studio/src/plugin/types.ts
 +++ b/rhwp-studio/src/plugin/types.ts
 @@ -9,6 +9,7 @@
@@ -1388,7 +1444,7 @@ index 571e2b4d..75aae724 100644
    /**
     * 빈 문서로 교체한다. 끝날 때까지 기다릴 수 있다. `confirmUnsaved` 면 메뉴의 「새 문서」처럼
     * 저장 안 된 변경을 먼저 묻는다 — 사용자가 취소하면 `false` 이고 문서는 그대로다.
-@@ -173,6 +185,88 @@ export interface PluginHost {
+@@ -173,6 +185,94 @@ export interface PluginHost {
  
    /** 문서가 교체되면 새 lease 를 받는다. 반환값은 해지 함수다. */
    onDocumentSwap(cb: (lease: DocumentLease) => void): () => void;
@@ -1437,6 +1493,12 @@ index 571e2b4d..75aae724 100644
 +  enableCollabUndo(hook: CollabHistoryHook): (CollabHistoryController & { release(): void }) | null;
 +
 +  /**
++   * 이탈(새로고침·닫기) 확인을 플러그인이 정한다(cc-rhwp). 걸려 있는 동안 studio 의 "저장하지 않은 변경" 확인 대신
++   * `check()` 가 참일 때만 확인창을 띄운다. 반환값은 해제 함수(원장에 담겨 unload 때 회수된다).
++   */
++  guardUnload(check: () => boolean): () => void;
++
++  /**
 +   * 글꼴 정책을 건다(cc-rhwp S3-1). `bundled-only` 동안 조판은 엔진 내장 규칙만, 표시는 내장 웹 글꼴만 쓴다 —
 +   * 로컬 글꼴·브라우저 측정이 조판에 들어가지 않아 기기가 달라도 같은 결과가 나온다. 걸거나 풀면 지금 문서의
 +   * 글꼴 환경을 다시 준비한다(문서를 열기 전에 거는 것이 좋다). 반환값은 해제 함수(여러 번 불러도 안전)이며
@@ -1477,7 +1539,7 @@ index 571e2b4d..75aae724 100644
  }
  
  /**
-@@ -212,6 +306,14 @@ export interface PluginLedger {
+@@ -212,6 +312,14 @@ export interface PluginLedger {
    swapUnsubs: Array<() => void>;
    /** `ui.registerSidePanel` 이 돌려준 해지 함수 */
    uiUnsubs: Array<() => void>;
@@ -1948,10 +2010,10 @@ index 00000000..877ebd9b
 +});
 diff --git a/rhwp-studio/tests/plugin-collab-undo.test.ts b/rhwp-studio/tests/plugin-collab-undo.test.ts
 new file mode 100644
-index 00000000..3dd1a1fa
+index 00000000..5ef8f1d3
 --- /dev/null
 +++ b/rhwp-studio/tests/plugin-collab-undo.test.ts
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,285 @@
 +// cc-rhwp(4단계 U1): 공동편집 되돌리기 — 명령 위치 표(engine/collab-undo.ts)와 히스토리·호스트 배선.
 +//
 +// 명령 클래스(command.ts)와 CommandHistory 는 node 의 strip-only TS 로 실행할 수 없어(이 저장소의 undo 테스트
@@ -2137,7 +2199,7 @@ index 00000000..3dd1a1fa
 +
 +// ── 호스트 (실행) ────────────────────────────────────────────────────
 +
-+function hostWith(enable: PluginHostDeps['enableCollabUndo'] | undefined) {
++function hostWith(enable: PluginHostDeps['enableCollabUndo'] | undefined, extra: Partial<PluginHostDeps> = {}) {
 +  let captured: PluginHost | null = null;
 +  const plugin: StudioPlugin = { id: 'probe', apiVersion: PLUGIN_API_VERSION, activate(host) { captured = host; return {}; } };
 +  const deps = {
@@ -2149,6 +2211,7 @@ index 00000000..3dd1a1fa
 +    createBlankDocument: async () => true,
 +    resolve: async () => plugin,
 +    ...(enable ? { enableCollabUndo: enable } : {}),
++    ...extra,
 +  } as unknown as PluginHostDeps;
 +  return { registry: new PluginHostRegistry(deps), host: () => captured! };
 +}
@@ -2187,6 +2250,54 @@ index 00000000..3dd1a1fa
 +  assert.match(main, /enableCollabUndo: \(_pluginId, hook\) => \{\s*const controller = inputHandler\?\.setCollabHistory\(hook\) \?\? null;[\s\S]{0,120}release: \(\) => \{ inputHandler\?\.setCollabHistory\(null\); \}/);
 +  const ih = source('src/engine/input-handler.ts');
 +  assert.match(balancedFrom(ih, 'setCollabHistory(hook: CollabHistoryHook | null)', '{'), /describe: \(command\) => describeCollabUndo\(command\)/);
++});
++
++// ── 공동편집 이탈 확인·여는 주소 (cc-rhwp) ─────────────────────────────────────
++
++test('이탈 확인: 판정을 걸면 저장 안 한 변경 대신 그 판정으로 묻고, 풀면 원래대로', async () => {
++  const { DocumentDirtyState } = await import('../src/core/document-dirty-state.ts');
++  const state = new DocumentDirtyState({ emit() {} } as never);
++  const listeners: Array<(e: { preventDefault(): void; returnValue: unknown }) => unknown> = [];
++  state.installBeforeUnload({ addEventListener: (_: string, fn: never) => listeners.push(fn), removeEventListener() {} } as never);
++  const asks = () => {
++    let prevented = false;
++    listeners[0]({ preventDefault() { prevented = true; }, returnValue: undefined });
++    return prevented;
++  };
++  state.markDirty();
++  assert.equal(asks(), true, '기본: 저장 안 한 변경이면 묻는다');
++  let unsent = false;
++  const release = state.guardUnload(() => unsent);
++  assert.equal(asks(), false, '공동편집: 저장 안 한 변경이 있어도 보내지 못한 편집이 없으면 묻지 않는다');
++  unsent = true;
++  assert.equal(asks(), true, '보내지 못한 편집이 있으면 묻는다');
++  release();
++  unsent = false;
++  assert.equal(asks(), true, '풀면 다시 저장 안 한 변경으로');
++});
++
++test('guardUnload: 호스트로 넘기고 원장이 unload 때 회수한다(지원하지 않으면 아무 일도 없음)', async () => {
++  const log: string[] = [];
++  const h = hostWith(undefined, {
++    guardUnload: (id, check) => {
++      log.push(`guard ${id} ${check()}`);
++      return () => { log.push('unguard'); };
++    },
++  });
++  await h.registry.load('probe');
++  h.host().guardUnload(() => true);
++  await h.registry.unload('probe');
++  assert.deepEqual(log, ['guard probe true', 'unguard']);
++});
++
++test('main.ts: ?collab 또는 #token·#room 이면 공동편집 플러그인을 올리고 자동 저장 복구를 건너뛴다, 이탈 확인은 dirty state 로', () => {
++  const main = source('src/main.ts');
++  const launch = balancedFrom(main, 'function isCollabLaunch(): boolean', '{');
++  assert.match(launch, /\.has\('collab'\)/);
++  assert.match(launch, /frag\.has\('token'\) \|\| frag\.has\('room'\)/);
++  assert.match(main, /return params\.has\('url'\) \|\| isCollabLaunch\(\);/);
++  assert.match(main, /if \(isCollabLaunch\(\)\) \{\s*plugins\.load\('collab'\)/);
++  assert.match(main, /guardUnload: \(_pluginId, check\) => documentState\.guardUnload\(check\)/);
 +});
 diff --git a/rhwp-studio/tsconfig.json b/rhwp-studio/tsconfig.json
 index 564f230e..8c680904 100644

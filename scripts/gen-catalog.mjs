@@ -148,6 +148,8 @@ function validateOverride(name, o, params) {
   if ((['state', 'local', 'none'].includes(o.sync) || o.conc === 'neutral') && !o.why) fail(`${where}: state·local·none·neutral 은 why 가 필요합니다`);
   if (['local', 'none'].includes(o.sync) && (o.conc || o.roles || o.ctx || o.layout)) fail(`${where}: local·none 은 기록하지 않으므로 conc·roles·ctx·layout 을 쓰지 않습니다`);
   for (const c of o.ctx ?? []) if (!['activeField', 'clipboard'].includes(c)) fail(`${where}: ctx 값 ${c}`);
+  if (o.perm !== undefined && !['form', 'memo'].includes(o.perm)) fail(`${where}: perm 값 ${o.perm}(form·memo, 없으면 edit)`);
+  if (o.perm !== undefined && ['local', 'none'].includes(o.sync)) fail(`${where}: local·none 은 기록하지 않으므로 perm 을 쓰지 않습니다`);
   if (o.conc === 'neutral' && !Array.isArray(o.roles)) fail(`${where}: neutral 은 roles 가 필요합니다(위치 인자가 없으면 [])`);
   // R13: 구조 연산은 발자국의 기준(anchor: 문단 인자, 표 구조 연산은 + control: 개체 인자)만 쓴다.
   if (o.roles && o.conc !== 'neutral' && !(o.conc !== 'text' && o.roles.every((r) => r.kind === 'anchor'))) fail(`${where}: roles 는 neutral 과 구조 연산의 anchor 에만 씁니다`);
@@ -192,6 +194,7 @@ for (const name of targets.sort()) {
   if (o.roles) entry.roles = o.roles;
   if (o.layout) entry.layout = true;
   if (o.ctx?.length) entry.ctx = o.ctx;
+  if (o.perm) entry.perm = o.perm;
   if (o.why) entry.why = o.why;
   entry.reviewed = true;
   if (drift[name] && entry.sync === 'op') {
@@ -263,6 +266,8 @@ const summary = {
   structural: counts((e) => e.sync === 'op' && e.conc === 'structural'),
   ctx: counts((e) => e.ctx?.length > 0),
   layout: counts((e) => e.layout === true),
+  permForm: counts((e) => e.perm === 'form'),
+  permMemo: counts((e) => e.perm === 'memo'),
   unreviewed: counts((e) => !e.reviewed),
 };
 const out = `// 생성 파일 — 직접 고치지 않는다. scripts/gen-catalog.mjs 가 만든다.

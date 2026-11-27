@@ -709,3 +709,176 @@ fn digest_survives_export_reload_after_edit_and_caret_move() {
         assert_eq!(b.digest(), before, "{f}: 캐럿 이동은 digest 에 들어가지 않는다");
     }
 }
+
+// ── 5단계 D4: 좁은 권한 결과 판정(collabCheckConfined)·누름틀 범위(collabFieldContains) ─────────────────
+
+/// 스냅샷 → 편집 → 판정 → 되돌림. 판정 결과 JSON.
+fn confined(core: &mut CollabCore, kind: &str, edit: impl FnOnce(&mut CollabCore)) -> Value {
+    let snap = core.snapshot_save();
+    edit(core);
+    let verdict = core.check_confined(snap, kind).unwrap();
+    core.snapshot_restore(snap).unwrap();
+    core.snapshot_discard(snap);
+    verdict
+}
+fn passes(v: &Value) -> bool {
+    v["ok"] == json!(true)
+}
+
+fn ctrl_index(core: &CollabCore, para: usize, pick: impl Fn(&crate::model::control::Control) -> bool) -> usize {
+    core.document.sections[0].paragraphs[para].controls.iter().position(pick).expect("개체")
+}
+fn click_here(c: &crate::model::control::Control) -> bool {
+    matches!(c, crate::model::control::Control::Field(f) if f.field_type == crate::model::control::FieldType::ClickHere)
+}
+fn field_id_in(paras: &[crate::model::paragraph::Paragraph]) -> u32 {
+    paras.iter().flat_map(|p| p.controls.iter()).find_map(|c| match c {
+        crate::model::control::Control::Field(f) if f.field_type == crate::model::control::FieldType::ClickHere => Some(f.field_id),
+        _ => None,
+    }).expect("누름틀")
+}
+
+/// 양식 문서: 문단 0 "이름: [누름틀=abc] 끝", 문단 1 에 표(칸 0 에 "칸 [누름틀=xy]"), 머리말, 각주, 글상자.
+/// (구역 0 문단 번호, 표 개체 번호, 글상자 문단·개체 번호)
+fn form_doc() -> (CollabCore, usize, usize, (usize, usize)) {
+    let mut c = CollabCore::new(blank());
+    c.insert_text_native(0, 0, 0, "이름:  끝").unwrap();
+    c.insert_click_here_field_at(0, 0, 4, "이름", "", "name", true).unwrap();
+    let id = field_id_in(&c.document.sections[0].paragraphs);
+    c.set_field_value_by_id(id, "abc").unwrap();
+    let len0 = c.document.sections[0].paragraphs[0].text.chars().count();
+    c.split_paragraph_native(0, 0, len0, None).unwrap();
+    c.create_table_native(0, 1, 0, 1, 2).unwrap();
+    let tbl_para = (0..c.document.sections[0].paragraphs.len())
+        .find(|&p| c.document.sections[0].paragraphs[p].controls.iter().any(|x| matches!(x, crate::model::control::Control::Table(_))))
+        .unwrap();
+    let ci = ctrl_index(&c, tbl_para, |x| matches!(x, crate::model::control::Control::Table(_)));
+    c.insert_text_in_cell_native(0, tbl_para, ci, 0, 0, 0, "칸 ").unwrap();
+    c.insert_click_here_field_at_in_cell(0, tbl_para, ci, 0, 0, 2, false, "칸값", "", "cell", true).unwrap();
+    c.create_header_footer_native(0, true, 0).unwrap();
+    c.insert_text_in_header_footer_native(0, true, 0, 0, 0, "머리말").unwrap();
+    c.insert_footnote_native(0, 0, 1).unwrap();
+    let fn_ci = ctrl_index(&c, 0, |x| matches!(x, crate::model::control::Control::Footnote(_)));
+    c.insert_text_in_footnote_native(0, 0, fn_ci, 0, 0, "각주").unwrap();
+    let last = c.document.sections[0].paragraphs.len() - 1;
+    c.create_shape_control_native(0, last, 0, 8000, 4000, 0, 0, true, "Square", "textbox", false, false, &[]).unwrap();
+    let tb_ci = ctrl_index(&c, last, |x| matches!(x, crate::model::control::Control::Shape(_)));
+    (c, tbl_para, ci, (last, tb_ci))
+}
+
+#[test]
+fn confined_form_accepts_field_values_and_typing_inside_fields() {
+    let (mut c, tbl_para, ci, _) = form_doc();
+    let body_id = field_id_in(&c.document.sections[0].paragraphs[..1]);
+    assert!(passes(&confined(&mut c, "form", |c| { c.set_field_value_by_id(body_id, "홍길동").unwrap(); })), "누름틀 값");
+    // 누름틀 안 입력(본문) — 범위 [4, 7) 의 가운데
+    let r = confined(&mut c, "form", |c| { c.insert_text_native(0, 0, 5, "Z").unwrap(); });
+    assert!(passes(&r), "누름틀 안 입력: {r}");
+    // 칸 안 누름틀 안 입력
+    let r = confined(&mut c, "form", |c| { c.insert_text_in_cell_native(0, tbl_para, ci, 0, 0, 2, "Q").unwrap(); });
+    // 칸 누름틀은 비어 있어 시작 = 끝 = 2 — 그 자리 입력이 누름틀 안인지는 개체 앞뒤에 달렸다. 값을 채운 뒤 가운데에 넣는다.
+    let cell_id = {
+        let crate::model::control::Control::Table(t) = &c.document.sections[0].paragraphs[tbl_para].controls[ci] else { panic!() };
+        field_id_in(&t.cells[0].paragraphs)
+    };
+    let _ = r;
+    c.set_field_value_by_id(cell_id, "xy").unwrap();
+    let r = confined(&mut c, "form", |c| { c.insert_text_in_cell_native(0, tbl_para, ci, 0, 0, 3, "Q").unwrap(); });
+    assert!(passes(&r), "칸 누름틀 안 입력: {r}");
+    // 양식 개체 값(샘플)
+    let mut f = CollabCore::new(DocumentCore::from_bytes(&sample("samples/form-01.hwp")).unwrap());
+    let (para, fci) = f.document.sections[0].paragraphs.iter().enumerate()
+        .find_map(|(p, para)| para.controls.iter().position(|x| matches!(x, crate::model::control::Control::Form(_))).map(|i| (p, i)))
+        .expect("양식 개체");
+    let r = confined(&mut f, "form", |f| { f.set_form_value_native(0, para, fci, r#"{"value":1,"text":"채움"}"#).unwrap(); });
+    assert!(passes(&r), "양식 값: {r}");
+}
+
+#[test]
+fn confined_form_rejects_everything_outside_fields_in_every_container() {
+    let (mut c, tbl_para, ci, (tb_para, tb_ci)) = form_doc();
+    let no = |v: Value, what: &str| assert!(!passes(&v) && v["reason"] == json!("confined"), "{what} 은 거절이어야: {v}");
+    no(confined(&mut c, "form", |c| { c.insert_text_native(0, 0, 0, "X").unwrap(); }), "누름틀 밖 본문");
+    no(confined(&mut c, "form", |c| { c.insert_text_in_cell_native(0, tbl_para, ci, 0, 0, 0, "X").unwrap(); }), "누름틀 밖 칸 문단");
+    no(confined(&mut c, "form", |c| { c.insert_text_in_cell_native(0, tbl_para, ci, 1, 0, 0, "X").unwrap(); }), "다른 칸");
+    no(confined(&mut c, "form", |c| { c.insert_text_in_header_footer_native(0, true, 0, 0, 0, "X").unwrap(); }), "머리말");
+    let fn_ci = ctrl_index(&c, 0, |x| matches!(x, crate::model::control::Control::Footnote(_)));
+    no(confined(&mut c, "form", |c| { c.insert_text_in_footnote_native(0, 0, fn_ci, 0, 0, "X").unwrap(); }), "각주");
+    no(confined(&mut c, "form", |c| { c.insert_text_in_cell_by_path(0, tb_para, &[(tb_ci, 0, 0)], 0, "X").unwrap(); }), "글상자 안 문단");
+    no(confined(&mut c, "form", |c| { c.create_table_native(0, 0, 5, 1, 1).unwrap(); }), "누름틀 안에 표 넣기");
+    no(confined(&mut c, "form", |c| { c.rename_field_by_name("name", "other").unwrap(); }), "누름틀 이름 바꾸기");
+    no(confined(&mut c, "form", |c| { c.document.doc_info.char_shapes[0].base_size += 100; }), "기존 글자 모양 고치기");
+    // state 바이트로 본문 바꾸기: 다른 문서에서 본문을 고쳐 내보낸 결과를 적재
+    let forged = {
+        let mut other = CollabCore::new(blank());
+        other.load_state(&c.export_state().unwrap()).unwrap();
+        other.insert_text_native(0, 0, 0, "위조").unwrap();
+        other.export_state().unwrap()
+    };
+    no(confined(&mut c, "form", |c| { c.load_state(&forged).unwrap(); }), "state 바이트로 본문 바꾸기");
+    // 메모는 form 이 아니다
+    no(confined(&mut c, "form", |c| { c.insert_memo_at(0, 0, 0, 2, "나", "메모").unwrap(); }), "form 으로 메모");
+}
+
+#[test]
+fn confined_comment_accepts_memo_operations_only() {
+    let (mut c, ..) = form_doc();
+    let r = confined(&mut c, "comment", |c| { c.insert_memo_at(0, 0, 0, 2, "나", "첫 메모").unwrap(); });
+    assert!(passes(&r), "메모 넣기: {r}");
+    // 메모가 있는 상태에서 답글·고치기·지우기·모양
+    c.insert_memo_at(0, 0, 0, 2, "나", "첫 메모").unwrap();
+    let id = c.document.sections[0].paragraphs[0].controls.iter().find_map(|x| match x {
+        crate::model::control::Control::Field(f) if f.field_type == crate::model::control::FieldType::Memo => Some(f.field_id),
+        _ => None,
+    }).unwrap();
+    for (what, r) in [
+        ("답글", confined(&mut c, "comment", |c| { c.insert_memo_reply_json_native(id, r#"{"author":"너","text":"답"}"#).unwrap(); })),
+        ("고치기", confined(&mut c, "comment", |c| { c.set_memo_text(id, "고친 메모").unwrap(); })),
+        ("지우기", confined(&mut c, "comment", |c| { c.remove_memo(id).unwrap(); })),
+        ("모양", confined(&mut c, "comment", |c| {
+            c.set_memo_shape_json(Some(0), r##"{"width":12000,"lineType":1,"lineWidth":2,"lineColor":"#112233","fillColor":"#FFFFCC","activeColor":"#FFCC00"}"##).unwrap();
+        })),
+    ] {
+        assert!(passes(&r), "메모 {what}: {r}");
+    }
+    let no = |v: Value, what: &str| assert!(!passes(&v), "{what} 은 거절이어야: {v}");
+    no(confined(&mut c, "comment", |c| { c.insert_text_native(0, 0, 0, "X").unwrap(); }), "comment 로 본문");
+    let body_id = field_id_in(&c.document.sections[0].paragraphs[..1]);
+    no(confined(&mut c, "comment", |c| { c.set_field_value_by_id(body_id, "x").unwrap(); }), "comment 로 누름틀 값");
+    no(confined(&mut c, "comment", |c| { c.document.doc_info.char_shapes[0].base_size += 100; }), "comment 로 기존 글자 모양");
+    // 두 권한을 함께 가지면 한 묶음에 양식과 메모가 섞여도 통과
+    let mixed = |c: &mut CollabCore| {
+        c.set_field_value_by_id(body_id, "섞음").unwrap();
+        let end = c.document.sections[0].paragraphs[0].text.chars().count();
+        c.insert_memo_at(0, 0, end - 1, end, "나", "섞음 메모").unwrap();
+    };
+    assert!(passes(&confined(&mut c, "form comment", mixed)), "form comment: 섞인 묶음");
+    no(confined(&mut c, "form", mixed), "form 만으로는 섞인 묶음");
+}
+
+#[test]
+fn field_contains_checks_the_active_click_here_range() {
+    let (c, tbl_para, ci, _) = form_doc();
+    let fci = ctrl_index(&c, 0, click_here);
+    let af = json!({ "section": 0, "para": 0, "control": fci, "cellPath": null });
+    let yes = |m: &str, a: Value| c.field_contains_call(m, a.as_array().unwrap(), &af).unwrap();
+    // 본문 누름틀 범위 [4, 7) — 끝 지점 입력까지
+    assert!(yes("insertText", json!([0, 0, 5, "x"])));
+    assert!(yes("insertText", json!([0, 0, 7, "x"])));
+    assert!(yes("deleteText", json!([0, 0, 4, 3])));
+    assert!(!yes("insertText", json!([0, 0, 2, "x"])), "누름틀 밖");
+    assert!(!yes("deleteText", json!([0, 0, 3, 2])), "걸침");
+    assert!(!yes("splitParagraph", json!([0, 0, 5])), "문단 나누기");
+    assert!(!yes("insertText", json!([0, 1, 0, "x"])), "다른 문단");
+    assert!(!c.field_contains_call("insertText", json!([0, 0, 5, "x"]).as_array().unwrap(), &Value::Null).unwrap(), "활성 누름틀 없음");
+    // 칸 안 누름틀
+    let cell_fci = {
+        let crate::model::control::Control::Table(t) = &c.document.sections[0].paragraphs[tbl_para].controls[ci] else { panic!() };
+        t.cells[0].paragraphs[0].controls.iter().position(click_here).unwrap()
+    };
+    let caf = json!({ "section": 0, "para": tbl_para, "control": cell_fci, "cellPath": [[ci, 0, 0]] });
+    assert!(c.field_contains_call("insertTextInCell", json!([0, tbl_para, ci, 0, 0, 2, "q"]).as_array().unwrap(), &caf).unwrap());
+    assert!(!c.field_contains_call("insertTextInCell", json!([0, tbl_para, ci, 0, 0, 0, "q"]).as_array().unwrap(), &caf).unwrap(), "칸 누름틀 밖");
+    assert!(!c.field_contains_call("insertTextInCell", json!([0, tbl_para, ci, 1, 0, 0, "q"]).as_array().unwrap(), &caf).unwrap(), "다른 칸");
+}
+

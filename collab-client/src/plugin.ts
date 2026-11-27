@@ -122,7 +122,9 @@ const FORBIDDEN_NOTICE: Record<string, string> = {
   confined: '이 링크로 바꿀 수 있는 부분이 아니라 서버가 거절했습니다. 서버 문서로 되돌립니다',
   unsupported: '이 서버는 양식·메모 권한의 편집을 아직 받지 않습니다. 서버 문서로 되돌립니다',
 };
-const VIEW_ONLY_NOTICE = '보기 전용으로 들어왔습니다. 편집은 다른 사람에게 보내지지 않습니다';
+const VIEW_ONLY_NOTICE = '보기 전용으로 들어왔습니다. 문서를 고칠 수 없습니다';
+/** 5단계 D4: 권한 문 안내를 다시 띄우기까지(같은 문구) */
+const DENIED_NOTICE_MS = 3000;
 
 const safeStorage = (kind: 'sessionStorage' | 'localStorage') => {
   try { return window[kind]; } catch { return null; }
@@ -260,14 +262,41 @@ export const collabPlugin = {
         queueMicrotask(() => { flushQueued = false; flush(); });
       },
       onWarn: (m) => console.warn(`[collab ${name}] ${m}`),
+      // 5단계 D4: 권한 문이 막았다 — 문서는 그대로, 안내만(같은 안내는 잠깐 동안 한 번)
+      onDenied: (message) => {
+        const now = Date.now();
+        if (message === lastDenied && now - lastDeniedAt < DENIED_NOTICE_MS) return;
+        lastDenied = message;
+        lastDeniedAt = now;
+        notice(message, 'denied');
+      },
       fast,
     });
+    let lastDenied = '';
+    let lastDeniedAt = 0;
+    /** 5단계 D4: form 권한이면 studio 를 양식 모드로(누름틀·양식 개체만 고치는 화면). 우리가 켰으면 나갈 때 끈다. */
+    let formModeByUs = false;
+    const applyFormMode = (scope: readonly string[] | null) => {
+      const want = !!scope && !scope.includes('edit') && scope.includes('form');
+      const isForm = document.documentElement.dataset.editMode === 'form';
+      if (want && !isForm) {
+        try { host.automation.execute('view:form-mode'); formModeByUs = true; } catch (error) { console.warn(`[collab ${name}] 양식 모드 전환 실패`, error); }
+      } else if (!want && isForm && formModeByUs) {
+        try { host.automation.execute('view:form-mode'); } catch { /* noop */ }
+        formModeByUs = false;
+      }
+    };
     // 4단계: 되돌리기는 내 편집만, 남이 같은 자리를 고쳤으면 막는다(docs/collab-stage4.md). studio 가 훅을 모르면
     // (또는 꺼 두면) 예전처럼 되돌리기 기록을 멈춘다.
     const undo = new CollabUndo(engine, (text) => notice(text, 'undo'));
     const undoController = undoEnabled && typeof host.enableCollabUndo === 'function' ? host.enableCollabUndo(undo.hook) : null;
     undo.attach(undoController);
     const resumeHistory = undoController ? undoController.release : host.suspendHistory();
+    // 새로고침·닫기 확인: studio 의 "저장하지 않은 변경" 대신, 아직 서버에 확정되지 않은 내 편집(보내는 중·끊긴 동안 쌓인
+    // 것)이 있을 때만 묻는다 — 문서는 서버가 들고 있다.
+    const releaseUnloadGuard = typeof host.guardUnload === 'function'
+      ? host.guardUnload(() => !left && (engine.pendingCount > 0 || inflight > 0))
+      : () => {};
     const releaseIntercept = host.interceptDocumentCalls({
       methods: Object.keys(CATALOG),
       includeMutatingRegistry: true,
@@ -342,8 +371,11 @@ export const collabPlugin = {
       cursors.clear();
       ready = false;
       engine.detach();
+      engine.setScope(null);
+      applyFormMode(null);
       releaseIntercept();
       resumeHistory();
+      releaseUnloadGuard();
       resumeAutosave();
       releaseFontPolicy();
       if (digestTimer !== null) clearTimeout(digestTimer);
@@ -693,6 +725,9 @@ export const collabPlugin = {
     /** 방에 들어갔다: 서버가 확인한 이름·권한을 받는다(인증을 끈 서버는 user 가 없다). */
     const onAdmitted = (user: SessionUser | undefined) => {
       auth.admitted(user ?? null);
+      // 5단계 D4: 권한 문(엔진 — 모든 호출 경로가 지나는 자리)과 studio 양식 모드. 인증을 끈 서버는 user 가 없다 = edit.
+      engine.setScope(user?.scope ?? null);
+      applyFormMode(user?.scope ?? null);
       if (!user) return;
       if (user.name && user.name !== name) { name = user.name; render(); }
       if (editLevel(user.scope) === 'none' && !viewOnlyNoticed) { viewOnlyNoticed = true; notice(VIEW_ONLY_NOTICE, 'view-only'); }
@@ -863,8 +898,11 @@ export const collabPlugin = {
       if (digestTimer !== null) clearTimeout(digestTimer);
       for (const t of noticeTimers) clearTimeout(t);
       engine.detach();
+      engine.setScope(null);
+      applyFormMode(null);
       releaseIntercept();
       resumeHistory();
+      releaseUnloadGuard();
       resumeAutosave();
       releaseFontPolicy();
       closing = true;

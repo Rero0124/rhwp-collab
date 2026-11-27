@@ -42,6 +42,8 @@ export interface EngineDoc {
   collabMapPositions?(recsJson: string, catalogJson: string, itemsJson: string): string;
   /** 4단계: 명령이 만든 기록 열의 발자국. */
   collabFootprint?(entriesJson: string, catalogJson: string): string;
+  /** 5단계 D4 클라이언트 문: 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가. */
+  collabFieldContains?(method: string, argsJson: string, activeFieldJson: string): boolean;
   collabDigest(): string;
   collabFlushLayout(): void;
   /** rhwp 배치 괄호 — 안의 편집은 쪽 배치(pagination)를 끝에 한 번만 한다(R1 감사: 쪽 소속 확정만 미룸). */
@@ -112,6 +114,8 @@ export interface EngineOptions {
   onLocal?: () => void;
   /** 기록 경고(불변식 위반으로 state 로 바꿈 등). */
   onWarn?: (message: string) => void;
+  /** 5단계 D4: 권한 문에서 막았다(문서는 그대로). 호스트가 안내한다. */
+  onDenied?: (message: string, method: string) => void;
   /** R11 빠른 경로를 쓴다(기본 true). 끄면 언제나 되감는다(`?collabFast=0`). */
   fast?: boolean;
   /**
@@ -120,6 +124,23 @@ export interface EngineOptions {
    */
   verifyFast?: boolean;
 }
+
+/** 5단계 D4: 권한 문이 막은 호출. 문서 코어에 닿기 전에 던진다. */
+export class PermissionDenied extends Error {
+  readonly method: string;
+  constructor(message: string, method: string) {
+    super(message);
+    this.name = 'PermissionDenied';
+    this.method = method;
+  }
+}
+
+/** 5단계 D4: 권한 문의 안내 문구(docs/collab-protocol.md §4.8). */
+export const DENIED_TEXT = {
+  view: '보기 권한이라 문서를 고칠 수 없습니다',
+  form: '양식 칸에만 입력할 수 있습니다',
+  comment: '메모만 달 수 있습니다',
+} as const;
 
 /** 빠른 경로 통계 (R11 측정·관문). */
 export interface FastStats {
@@ -167,6 +188,9 @@ export class CollabEngine {
   private readonly classifyFn: (name: string) => CatalogEntry;
   private readonly onLocal: () => void;
   private readonly onWarn: (message: string) => void;
+  private readonly onDenied: (message: string, method: string) => void;
+  /** 5단계 D4: 이 연결의 권한(`welcome.user.scope`). `null` = 제한 없음(edit, 인증을 끈 서버). */
+  private scope: { edit: boolean; form: boolean; comment: boolean } | null = null;
   private readonly fast: boolean;
   private readonly verifyFast: boolean;
   readonly fastStats: FastStats = { fast: 0, slow: 0, fallback: 0, blocks: {}, mismatches: [], fastMs: 0, slowMs: 0 };
@@ -175,6 +199,7 @@ export class CollabEngine {
     this.classifyFn = options.classify ?? ((n) => classify(n));
     this.onLocal = options.onLocal ?? (() => {});
     this.onWarn = options.onWarn ?? ((m) => console.warn(`[collab engine] ${m}`));
+    this.onDenied = options.onDenied ?? (() => {});
     this.fast = options.fast ?? true;
     this.verifyFast = options.verifyFast ?? false;
   }
@@ -199,6 +224,38 @@ export class CollabEngine {
 
   setRecording(on: boolean): void {
     this.recording = on;
+  }
+
+  /**
+   * 5단계 D4: 권한을 정한다(공백 구분 문자열 또는 목록, `null` = 제한 없음). `edit` 가 없으면 권한 문이 켜진다:
+   * 기록하는 호출(분류표 `op`·`state`·`watch`)을 문서 코어에 닿기 전에 판정하고, 허용되지 않으면 `PermissionDenied`.
+   * `view`: 모두 거절. `form`: `perm: 'form'` 과, 활성 누름틀 안에 완전히 드는 글자 연산. `comment`: `perm: 'memo'`.
+   */
+  setScope(scope: string | readonly string[] | null): void {
+    if (scope === null) {
+      this.scope = null;
+      return;
+    }
+    const list = typeof scope === 'string' ? scope.split(/\s+/).filter(Boolean) : [...scope];
+    const s = { edit: list.includes('edit'), form: list.includes('form'), comment: list.includes('comment') };
+    this.scope = s.edit ? null : s;
+  }
+
+  /** 권한 문 판정. 허용이면 `null`, 아니면 안내 문구. */
+  private denial(doc: EngineDoc, name: string, args: unknown[], info: CatalogEntry): string | null {
+    const s = this.scope;
+    if (!s) return null;
+    if (info.perm === 'form' && s.form) return null;
+    if (info.perm === 'memo' && s.comment) return null;
+    if (s.form && info.sync === 'op' && info.conc === 'text' && doc.collabFieldContains) {
+      const af = doc.collabGetActiveField();
+      if (af !== 'null') {
+        let encoded: unknown[] | null = null;
+        try { encoded = encodeArgs(args); } catch { encoded = null; }
+        if (encoded && doc.collabFieldContains(name, JSON.stringify(encoded), af)) return null;
+      }
+    }
+    return s.form ? DENIED_TEXT.form : s.comment ? DENIED_TEXT.comment : DENIED_TEXT.view;
   }
 
   /** 미확정·확정 대기·스냅샷을 모두 버린다. */
@@ -234,9 +291,18 @@ export class CollabEngine {
    */
   intercept(name: string, args: unknown[], invoke: () => unknown, target: unknown): unknown {
     const doc = this.doc;
-    if (!doc || target !== doc || !this.recording || this.replaying) return invoke();
+    if (!doc || target !== doc || this.replaying) return invoke();
     const info = this.classifyFn(name);
     if (info.sync === 'none' || info.sync === 'local') return invoke();
+    // 5단계 D4 권한 문: 기록 여부와 상관없이(재동기화 중에도) 공유 문서의 편집 호출을 코어에 닿기 전에 판정한다.
+    if (this.scope) {
+      const denied = this.denial(doc, name, args, info);
+      if (denied !== null) {
+        this.onDenied(denied, name);
+        throw new PermissionDenied(denied, name);
+      }
+    }
+    if (!this.recording) return invoke();
 
     const createdSnapshot = this.ensureSnapshot(doc);
     let digestBefore: string | null = null;

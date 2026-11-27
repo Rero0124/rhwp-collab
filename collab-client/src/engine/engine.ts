@@ -81,6 +81,13 @@ export interface ReceiveResult {
    * 옮긴 열(빠른 경로면 적용한 R′). 되돌리기 스택의 위치를 이것으로 옮긴다(캐럿과 같은 지도).
    */
   remap?: Entry[];
+  /**
+   * 4단계: 버린 내 기록의 되돌림 열(지금 문서 좌표, 앞에서부터) — `remap` 보다 먼저 적용하는 지도(내 기록이므로
+   * 막힘 판정에는 쓰지 않는다). 버린 것이 없으면 빈 열.
+   */
+  remapLocal?: Entry[];
+  /** 4단계: `remapLocal` 이 버린 기록을 모두 되돌리는가(state 처럼 되돌릴 수 없는 것을 버렸거나 재적용 실패면 false). */
+  remapComplete?: boolean;
   caret: TextCaret | null;
   error?: string;
 }
@@ -424,7 +431,7 @@ export class CollabEngine {
         for (const e of remote) this.applyEntry(doc, e);
         this.ack(0); // 확정 대기열이 있으면 정리(미확정이 없으므로 지금 문서 = 확정)
         const mapped = caret ? JSON.parse(doc.collabMapCaret(JSON.stringify(remote), this.catalogFor(remote), JSON.stringify(caret))) : null;
-        return { ok: true, rebased: false, dropped: 0, droppedLids: [], remap: remote, caret: mapped };
+        return { ok: true, rebased: false, dropped: 0, droppedLids: [], remap: remote, remapLocal: [], remapComplete: true, caret: mapped };
       }
       if (this.snapshot === null) throw new Error('미확정이 있는데 스냅샷이 없습니다');
       const t0 = performance.now();
@@ -434,7 +441,7 @@ export class CollabEngine {
         this.catalogFor([...pending, ...remote]), JSON.stringify(caret),
       )) as {
         pending: Entry[]; origin?: number[]; dropped: number[]; dropReasons: string[]; dropFrom: number | null; dropReason: string | null; caret: TextCaret | null;
-        remoteAfter?: Entry[]; fastRemote: Entry[] | null; fastBlock: string | null;
+        remoteAfter?: Entry[]; dropUndo?: Entry[]; dropUndoComplete?: boolean; fastRemote: Entry[] | null; fastBlock: string | null;
       };
       // 4단계: 보정된 미확정 각각의 로컬 번호(쪼개진 기록은 같은 번호)
       const oldLids = this.lids;
@@ -465,7 +472,7 @@ export class CollabEngine {
           }
           this.fastStats.fast += 1;
           this.fastStats.fastMs += performance.now() - t0;
-          return { ok: true, rebased: true, fast: true, dropped: 0, droppedEntries: [], droppedLids: [], remap: fastRemote, caret: res.caret };
+          return { ok: true, rebased: true, fast: true, dropped: 0, droppedEntries: [], droppedLids: [], remap: fastRemote, remapLocal: [], remapComplete: true, caret: res.caret };
         }
       }
       const why = res.fastBlock ?? (this.fast ? 'R′ 적용 실패' : '빠른 경로 꺼짐');
@@ -486,6 +493,7 @@ export class CollabEngine {
       let dropReason = res.dropReason ?? undefined;
       const kept: Entry[] = [];
       const keptLids: number[][] = [];
+      let reapplyFailed = false;
       for (let i = 0; i < res.pending.length; i += 1) {
         try {
           this.applyEntry(doc, res.pending[i]);
@@ -495,6 +503,7 @@ export class CollabEngine {
           // 재적용이 실패하면 그것과 그 뒤를 버린다(뒤는 그 위에서 만들어졌다). 앞은 이미 적용됐다.
           droppedEntries.push(...res.pending.slice(i));
           for (let j = i; j < res.pending.length; j += 1) for (const lid of lidsOf(j)) droppedLids.add(lid);
+          reapplyFailed = true;
           const failed = res.pending[i];
           const what = failed.kind === 'op' ? `${failed.m}(${JSON.stringify(failed.a)})` : 'state';
           dropReason = `보정한 연산 재적용 실패: ${what}: ${error instanceof Error ? error.message : String(error)}`;
@@ -510,7 +519,12 @@ export class CollabEngine {
         this.snapshot = null;
       }
       this.fastStats.slowMs += performance.now() - t0;
-      return { ok: true, rebased: true, dropped, droppedEntries, dropReason, droppedLids: [...droppedLids], remap: res.remoteAfter ?? remote, caret: res.caret };
+      return {
+        ok: true, rebased: true, dropped, droppedEntries, dropReason, droppedLids: [...droppedLids],
+        remap: res.remoteAfter ?? remote, remapLocal: res.dropUndo ?? [],
+        remapComplete: !reapplyFailed && (res.dropUndoComplete ?? (res.dropped ?? []).length === 0),
+        caret: res.caret,
+      };
     } catch (error) {
       return { ok: false, rebased: false, dropped: 0, caret, error: error instanceof Error ? error.message : String(error) };
     } finally {

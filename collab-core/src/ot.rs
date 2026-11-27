@@ -711,6 +711,13 @@ fn foot_of(rec: &Value, info: &Value, a: &[Value], section: Option<usize>) -> Op
 fn classify(rec: &Value, catalog: &Value) -> Rec {
     let state = rec.get("kind").and_then(Value::as_str) != Some("op");
     let m = rec.get("m").and_then(Value::as_str).unwrap_or("");
+    // 4단계: 지도 전용 기록 — 구조 연산 발자국의 되돌림(`undo_map_json`). 분류표를 보지 않는다.
+    if m == UNDO_FOOT {
+        let a = rec.get("a").and_then(Value::as_array).cloned().unwrap_or_default();
+        let pd = rec.get("meta").and_then(|x| x.get("pd")).and_then(Value::as_i64).unwrap_or(0);
+        let foot = num(&a, 0).zip(num(&a, 1)).map(|(sec, anchor)| Foot { sec, anchor, control: num(&a, 2), pd, para_arg: None });
+        return Rec { json: rec.clone(), conc: Conc::Structural, state: false, section: foot.as_ref().map(|f| f.sec), text: None, roles: vec![], foot };
+    }
     let info = catalog.get(m).cloned().unwrap_or(Value::Null);
     let a = rec.get("a").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut conc = match info.get("conc").and_then(Value::as_str) {
@@ -1326,6 +1333,9 @@ pub fn rebase(pending: &[Value], remote: &[Value], catalog: &Value, caret: &Valu
     let (fast_remote, fast_block_why) = if dropped.is_empty() { (fast_remote, fast_block_why) } else { (Value::Null, json!("충돌")) };
     let caret = map_caret(caret, &rs);
     json!({
+        // 4단계: 버린 미확정의 되돌림 열(지금 문서 좌표 F_n 기준, 앞에서부터) — `remoteAfter` 앞에 붙이면 지금 문서
+        // 좌표를 새 좌표로 옮기는 지도가 된다. 되돌릴 수 없는 것(state 등)을 버렸으면 `dropUndoComplete` 가 false.
+        "dropUndo": undo.iter().filter_map(undo_map_json).collect::<Vec<_>>(), "dropUndoComplete": !dead,
         "pending": out, "origin": origin,
         "dropped": dropped, "dropReasons": reasons,
         "dropFrom": dropped.first().copied().map(Value::from).unwrap_or(Value::Null), "dropReason": first_reason,
@@ -1334,6 +1344,21 @@ pub fn rebase(pending: &[Value], remote: &[Value], catalog: &Value, caret: &Valu
         "remoteAfter": rs.into_iter().map(|r| r.json).collect::<Vec<_>>(),
         "fastRemote": fast_remote, "fastBlock": fast_block_why,
     })
+}
+
+/// 지도 전용 기록 이름(구조 연산 발자국의 되돌림). 문서에 적용하지 않는다 — `map_positions` 만 읽는다.
+const UNDO_FOOT: &str = "__undoFoot";
+
+/// 되돌림 열의 기록 하나를 지도로 쓸 JSON 으로. 되돌림 기록은 내부 값이라 `json` 이 비어 있을 수 있다:
+/// 글자 연산은 기록 형태로 다시 쓰고, 구조 발자국은 지도 전용 기록(`UNDO_FOOT`)으로 쓴다.
+fn undo_map_json(r: &Rec) -> Option<Value> {
+    if let Some(t) = &r.text {
+        return Some(if r.json.is_null() { emit_text(t, &Value::Null) } else { r.json.clone() });
+    }
+    if let Some(f) = &r.foot {
+        return Some(json!({ "kind": "op", "m": UNDO_FOOT, "a": [f.sec, f.anchor, f.control], "meta": { "pd": f.pd } }));
+    }
+    (!r.json.is_null()).then(|| r.json.clone())
 }
 
 /// 미확정이 없을 때 원격 열의 지도로 캐럿만 옮긴다(§5 receiveRemote 1).

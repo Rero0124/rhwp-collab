@@ -224,3 +224,54 @@ test('미확정 중 되돌리기와 원격 수신: 보내기 전에 남의 앞 �
   converged(r);
   assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3']);
 });
+
+// ── 버려진 편집의 정밀 지도 (설계 세션 결정: rebase 되돌림 열을 지도 앞에) ─────────────────
+
+test('버려진 표 넣기(문단 수 +) 뒤: 같은 문단 명령만 함께 빠지고, 뒤 문단의 오래된 명령은 정확한 문단을 되돌린다', () => {
+  const r = room(6);
+  const c0 = insertText(1, 2, 'SAME');
+  const c1 = insertText(5, 2, 'OLD');
+  r.a.history.execute(c0);
+  r.a.history.execute(c1);
+  r.server.drain(r.all);
+  // A 가 문단 1 에 표를 넣는다(미확정, 아직 보내지 않음) — 구조 발자국, 그 뒤 문단 번호가 밀림
+  const table = { type: 'snapshot:createTable', execute(doc) { doc.createTable(0, 1, 0, 1, 1); }, undo() {} };
+  r.a.history.execute(table);
+  assert.ok(c1.position.paragraphIndex > 5, '표 넣기로 오래된 명령의 문단 번호가 밀렸다');
+  // 그사이 B 가 같은 문단에 입력하고 먼저 확정 → A 의 표 넣기는 발자국 충돌로 버려진다(남의 편집은 글자라 3.2-2 아님)
+  r.b.doc.insertText(0, 1, 0, 'B');
+  r.b.flush();
+  r.server.deliverOne(r.b);
+  while (r.server.deliverOne(r.a)) { /* 받기 */ }
+  assert.ok(r.a.dropped > 0, '표 넣기가 버려짐');
+  assert.deepEqual(r.a.history.undoStack, [c1], '버려진 명령과 같은 문단 명령(c0)만 빠지고 c1 은 남는다');
+  assert.equal(c1.position.paragraphIndex, 5, '되돌림 열로 원래 문단 번호로 돌아왔다');
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  const texts = paragraphs(r.a.doc);
+  assert.equal(texts[5], 'p5', '정확한 문단에서 내 글자가 사라짐');
+  assert.equal(texts[1], 'Bp1SAME', '같은 문단의 c0 글자는 문서에 남는다(스택에서만 빠짐)');
+});
+
+test('버려진 합침(문단 수 −) 뒤: 뒤 문단의 오래된 명령 위치가 원래 번호 + 남의 편집으로 옮겨진다', () => {
+  const r = room(7);
+  const c1 = insertText(5, 2, 'OLD');
+  r.a.history.execute(c1);
+  r.server.drain(r.all);
+  // A 가 문단 3 처음에서 Backspace(합침) — 미확정
+  const merge = { type: 'mergeParagraph', position: pos(3, 0), execute(doc) { doc.mergeParagraph(0, 3); }, undo() {} };
+  r.a.history.execute(merge);
+  assert.equal(c1.position.paragraphIndex, 4, '합침으로 당겨짐');
+  // B 가 합침이 닿는 문단 2 에 표를 넣고 먼저 확정 → A 의 합침은 버려진다
+  const before = r.b.doc.getParagraphCount(0);
+  r.b.doc.createTable(0, 2, 0, 1, 1);
+  const pd = r.b.doc.getParagraphCount(0) - before;
+  r.b.flush();
+  r.server.deliverOne(r.b);
+  while (r.server.deliverOne(r.a)) { /* 받기 */ }
+  assert.ok(r.a.dropped > 0, '합침이 버려짐');
+  assert.ok(r.a.history.undoStack.includes(c1), '다른 문단의 오래된 명령은 남는다');
+  assert.equal(c1.position.paragraphIndex, 5 + pd, `되돌림 열(합침 취소) + 남의 표(문단 ${pd}) — 지금 문서의 그 문단`);
+  assert.equal(paragraphs(r.a.doc)[5 + pd], 'p5OLD');
+  converged(r);
+});

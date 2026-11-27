@@ -18,6 +18,7 @@ function fixture({ registry, rust, overrides, drift, excluded = [] }) {
   const dir = mkdtempSync(join(tmpdir(), 'gen-catalog-'));
   mkdirSync(join(dir, 'src'));
   mkdirSync(join(dir, 'patches'));
+  mkdirSync(join(dir, 'studio'));
   const list = (xs) => xs.map((n) => `'${n}'`).join(', ');
   writeFileSync(join(dir, 'registry.ts'), `export const MUTATING_METHODS: readonly string[] = [${list(registry)}];\nexport const EXCLUDED_NON_DOCUMENT: readonly string[] = [${list(excluded)}];\n`);
   writeFileSync(join(dir, 'src/wasm_api.rs'), `impl HwpDocument {\n${rust}}\n\nimpl HwpViewer {\n${rustExport('setZoom', 'set_zoom', ['zoom'])}}\n`);
@@ -30,7 +31,9 @@ function fixture({ registry, rust, overrides, drift, excluded = [] }) {
   const run = (extra = []) => spawnSync(process.execPath, [gen,
     '--registry', join(dir, 'registry.ts'), '--rust-src', join(dir, 'src'),
     '--overrides', join(dir, 'overrides.ts'), '--drift', join(dir, 'drift.json'),
-    '--out', join(dir, 'catalog.ts'), '--lock', join(dir, 'upstream.lock'), '--patches', join(dir, 'patches'), ...extra,
+    '--out', join(dir, 'catalog.ts'), '--lock', join(dir, 'upstream.lock'), '--patches', join(dir, 'patches'),
+    // studio 호출처 훑기를 fixture 안으로 — 기본(레지스트리의 한 단계 위)은 여기서 시스템 임시 디렉터리 전체다
+    '--studio-src', join(dir, 'studio'), ...extra,
   ], { encoding: 'utf8' });
   const read = async () => import(`${join(dir, 'catalog.ts')}?t=${Date.now()}${Math.random()}`);
   return { dir, run, read };

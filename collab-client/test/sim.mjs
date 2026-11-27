@@ -180,11 +180,22 @@ function randomEdit(r, doc) {
       doc.deleteRange(0, sp, r.int(s.lens[sp] + 1), ep, r.int(s.lens[ep] + 1));
       return 'deleteRange';
     }
-    if (kind < 0.85) {
+    if (kind < 0.82) {
       if (len === 0) return null;
       const a = r.int(len), b = a + 1 + r.int(len - a);
       doc.applyCharFormat(0, p, a, b, JSON.stringify(r.pick([{ bold: true }, { italic: true }, { underline: true }, { bold: false }])));
       return 'applyCharFormat';
+    }
+    if (kind < 0.85) {
+      // 4단계: 글자 서식 되돌리기가 쓰는 연산(문단 발자국 구조) — 무작위 구간을 문서에 있는 글자 모양 id 둘로 다시 칠한다
+      if (len === 0) return null;
+      const a = r.int(len), b = a + 1 + r.int(len - a);
+      const q = r.int(s.paras);
+      const ids = [...new Set(JSON.parse(doc.getCharShapeRuns(0, q, 0, Math.max(1, s.lens[q]))).map((x) => x.charShapeId)), 0];
+      const m = a + 1 + r.int(b - a);
+      const runs = [{ startOffset: a, endOffset: m, charShapeId: r.pick(ids) }, { startOffset: m, endOffset: b, charShapeId: r.pick(ids) }].filter((x) => x.endOffset > x.startOffset);
+      doc.setCharShapeRuns(0, p, a, b, JSON.stringify(runs));
+      return 'setCharShapeRuns';
     }
     if (kind < 0.89) {
       doc.applyParaFormat(0, p, JSON.stringify({ alignment: r.pick(['left', 'center', 'right', 'justify']) }));

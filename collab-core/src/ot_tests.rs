@@ -665,3 +665,49 @@ fn rebase_reports_origin_and_remote_after_pending() {
     assert_eq!(out["origin"], json!([0]));
     assert_eq!(out["dropped"], json!([1]));
 }
+
+#[test]
+fn rebase_reports_the_undo_of_dropped_pending_as_a_map() {
+    // 내 Enter(문단 1 처음)가 같은 구역 구조 편집(발자국 없음)과 충돌해 버려진다 → 되돌림 열 = 그 문단 합침
+    let out = rebase(&[split(1, 0)], &[op("createTable", json!([0, 5, 0, 1, 1]))], &cat4(), &Value::Null);
+    assert_eq!(out["dropped"], json!([0]));
+    assert_eq!(out["dropUndoComplete"], json!(true));
+    let undo = out["dropUndo"].as_array().unwrap();
+    assert_eq!(undo.len(), 1);
+    assert_eq!((undo[0]["m"].as_str(), undo[0]["a"].clone()), (Some("mergeParagraph"), json!([0, 2])));
+    // 그 지도로 버리기 전 좌표의 뒤 문단 위치가 원래 번호로 돌아온다(문단 6 → 5)
+    let back = map_positions(undo, &cat4(), &[body(6, 1)]);
+    assert_eq!(back[0]["para"], json!(5));
+    // 구조 발자국(문단 수 +1)을 버리면 지도 전용 기록으로 그 뒤 문단을 당긴다
+    let mut c = cat4();
+    c["createTableA"] = json!({ "conc": "structural", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] });
+    let mine = json!({ "kind": "op", "m": "createTableA", "a": [0, 2, 0, 1, 1], "meta": { "pd": 1 } });
+    let theirs = json!({ "kind": "op", "m": "createTableA", "a": [0, 2, 0, 1, 1], "meta": { "pd": 1 } });
+    let out = rebase(&[mine], &[theirs], &c, &Value::Null);
+    assert_eq!(out["dropped"], json!([0]));
+    let undo = out["dropUndo"].as_array().unwrap();
+    assert_eq!(undo[0]["m"], json!(UNDO_FOOT));
+    assert_eq!(map_positions(undo, &c, &[body(6, 1)])[0]["para"], json!(5));
+    // 되돌릴 수 없는 것(state)을 버리면 불완전
+    let out = rebase(&[state()], &[op("createTable", json!([0, 5, 0, 1, 1]))], &cat4(), &Value::Null);
+    assert_eq!(out["dropUndoComplete"], json!(false));
+}
+
+#[test]
+fn set_char_shape_runs_with_paragraph_footprint_moves_and_conflicts_by_paragraph() {
+    // 4단계: setCharShapeRuns 는 문단 발자국(anchor) 구조 연산 — 다른 문단 편집에는 문단 번호만 옮기고, 같은 문단과는 충돌
+    let mut c = cat4();
+    c["setCharShapeRuns"] = json!({ "conc": "structural", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] });
+    let runs = |p: usize| json!({ "kind": "op", "m": "setCharShapeRuns", "a": [0, p, 0, 2, "[{\"startOffset\":0,\"endOffset\":2,\"charShapeId\":0}]"], "meta": { "pd": 0 } });
+    // 내 되돌리기(문단 3)가 미확정, 남이 문단 0 에서 Enter → 문단 번호만 4 로
+    let out = rebase(&[runs(3)], &[split(0, 1)], &c, &Value::Null);
+    assert_eq!(out["dropped"], json!([]));
+    assert_eq!(out["pending"][0]["a"][1], json!(4));
+    // 빠른 경로(R11)는 text·neutral 만 — 구조 연산은 발자국이 있어도 언제나 되감기(R11 관문 대상 밖)
+    assert!(out["fastRemote"].is_null());
+    assert_eq!(out["fastBlock"].as_str(), Some("빠른 경로 불가: 텍스트·neutral 외 기록"));
+    // 같은 문단을 남이 고치면 충돌(버림), 빠른 경로 아님
+    let out = rebase(&[runs(3)], &[ins(3, 0, "x")], &c, &Value::Null);
+    assert_eq!(out["dropped"], json!([0]));
+    assert!(out["fastRemote"].is_null());
+}

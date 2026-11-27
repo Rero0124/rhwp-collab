@@ -10,8 +10,9 @@
  * - 막힘(3.2): 발자국에 남의 기록이 닿음(같은 문단 편집·같은 구역 구조·문서 전체 결과), 표에 없거나 옮길 수 없는
  *   명령·스냅샷 명령·발자국을 특정할 수 없는 명령은 뒤에 남의 기록이 하나라도 있으면, 삭제 조각 복원은 조각 문단이
  *   옮겨졌으면.
- * - 버려진 편집(3.3): 그 기록을 만든 명령과 같은 문단에 발자국이 있는 명령을 뺀다. 버려진 기록이 문단 수를
- *   바꿨으면(나눔·합침·여러 문단 삭제·구조) 같은 구역의 명령도 뺀다 — 그 뒤 문단 번호가 어긋나므로.
+ * - 버려진 편집(3.3): 그 기록을 만든 명령과 같은 문단에 발자국이 있는 명령을 뺀다. 남은 명령은 버린 기록의
+ *   되돌림 열(`remapLocal`)로 먼저 옮긴 뒤 원격 지도로 옮긴다 — 버린 Enter·합침 뒤의 문단 번호도 맞는다. 되돌림
+ *   열이 불완전하면(state 등 되돌릴 수 없는 것을 버림·재적용 실패) 보수적으로 문단 수를 바꾼 기록의 구역 전체를 뺀다.
  *
  * studio 를 import 하지 않는다(플러그인 규약) — 히스토리 조작과 위치 표는 host 가 넘긴다.
  */
@@ -144,7 +145,12 @@ export class CollabUndo {
   onRemote(result: ReceiveResult): void {
     if (!this.controller) return;
     const dropped = new Set(result.droppedLids ?? []);
-    if (dropped.size > 0) this.dropFor(dropped, result.droppedEntries ?? []);
+    const complete = result.remapComplete !== false;
+    // 버린 명령 고르기는 지금(버리기 전) 좌표에서 — 발자국끼리 같은 좌표라야 비교된다
+    if (dropped.size > 0) this.dropFor(dropped, result.droppedEntries ?? [], complete);
+    // 버린 내 기록을 지도로 걷어 낸 뒤(막힘 판정 없음) 원격 지도
+    const local = result.remapLocal ?? [];
+    if (local.length > 0 && complete) this.mapLocal(local, new Set());
     const remap = result.remap ?? [];
     if (remap.length > 0) this.mapRemote(remap);
   }
@@ -309,8 +315,11 @@ export class CollabUndo {
     }
   }
 
-  /** 버려진 기록을 만든 명령과, 그와 같은 문단(문단 수를 바꿨으면 같은 구역)에 발자국이 있는 명령을 뺀다. */
-  private dropFor(dropped: ReadonlySet<number>, droppedEntries: readonly Entry[]): void {
+  /**
+   * 버려진 기록을 만든 명령과, 그와 같은 문단에 발자국이 있는 명령을 뺀다. 되돌림 열이 불완전하면(`complete`
+   * false) 문단 수를 바꾼 버려진 기록의 구역 명령도 뺀다(그 뒤 문단 번호를 바로잡을 지도가 없으므로).
+   */
+  private dropFor(dropped: ReadonlySet<number>, droppedEntries: readonly Entry[], complete: boolean): void {
     const victims = new Set<object>();
     let undoVictim = false;
     const commands = this.all();
@@ -321,9 +330,9 @@ export class CollabUndo {
       if ([...m.undoLids].some((l) => dropped.has(l))) { victims.add(cmd); undoVictim = true; }
     }
     const victimFeet = [...victims].flatMap((c) => this.meta.get(c)?.foot ?? []);
-    // 문단 수를 바꾼 버려진 기록의 구역(null = 문서 전체)
+    // 문단 수를 바꾼 버려진 기록의 구역(null = 문서 전체) — 되돌림 열이 불완전할 때만
     const shifted = new Set<number | null>();
-    for (const e of droppedEntries) {
+    for (const e of complete ? [] : droppedEntries) {
       if (e.kind === 'state') shifted.add(null);
       else if (!IN_PARAGRAPH.has(e.m)) shifted.add(typeof e.a[0] === 'number' ? e.a[0] : null);
     }

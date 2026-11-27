@@ -41,6 +41,9 @@ const paths = {
   patches: resolve(root, arg('patches', 'patches/rhwp')),
   collabCore: resolve(root, arg('collab-core', 'collab-core/src')),
   engineSrc: resolve(root, arg('engine-src', 'collab-client/src/engine')),
+  // studio 호출처(R14 reach)를 훑을 소스 뿌리. 기본은 레지스트리(src/core/…)의 한 단계 위(src/). 시험처럼 레지스트리가
+  // 임시 디렉터리 바로 아래 있으면 그 위가 시스템 임시 디렉터리 전체가 되므로 명시한다.
+  studioSrc: arg('studio-src', null),
 };
 const checkOnly = process.argv.includes('--check');
 
@@ -207,7 +210,7 @@ if (vanished.length) warn(`사라진 이름: ${vanished.length}개 (분류표에
 // studio: 메뉴·도구·단축키 경로(command·engine·ui·view·core 등)에서 부른다 / plugin: 플러그인·hwpctl·AI·자동화
 // 경로나 다리(wasm-bridge)에서만 / none: studio 가 부르지 않는다(레지스트리에만 있음).
 {
-  const studioSrc = resolve(dirname(paths.registry), '..');
+  const studioSrc = paths.studioSrc ? resolve(root, paths.studioSrc) : resolve(dirname(paths.registry), '..');
   const files = [];
   const walk = (d) => {
     for (const f of readdirSync(d, { withFileTypes: true })) {

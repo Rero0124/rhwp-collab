@@ -125,23 +125,22 @@ test('D6: comment 는 자기 메모만 고치고 지운다 — 남의 메모는 
   assert.deepEqual([...new Set(c.denied)], [DENIED_TEXT.ownMemo]);
   allows(c, () => c.doc.setMemoText(mine.id, '내 것을 고침'), '자기 메모 고치기');
   allows(c, () => c.doc.insertMemoReply(other.id, JSON.stringify({ author: '갑', text: '답글' })), '남의 메모에 답글');
-  // 메모 모양은 구역 단위 — 그 구역에 남의 메모가 있으면 막힘
-  const shape = JSON.parse(c.doc.getMemoShape(0));
-  denies(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, lineColor: '#ff0000' })), '남의 메모가 있는 구역의 모양');
-  denies(c, () => c.doc.setMemoShape(-1, JSON.stringify({ ...shape, lineColor: '#ff0000' })), '모든 구역의 모양');
   allows(c, () => c.doc.removeMemo(mine.id), '자기 메모 지우기');
 });
 
-test('D6: comment 의 메모 모양 — 구역의 메모가 모두 내 것이면 통과, 이름을 모르면 막힘, edit 는 제한 없음', () => {
+test('D6: 메모 모양은 edit 만(문서 설정) — comment 는 내 메모뿐이어도 막힘, 이름을 모르면 고치기도 막힘, edit 는 제한 없음', () => {
   const { c } = setup();
   c.engine.setMemoAuthor('갑');
   c.doc.insertMemo(0, 0, 0, 1, JSON.stringify({ text: '내 메모' }));
   const shape = JSON.parse(c.doc.getMemoShape(0));
   c.engine.setScope('comment');
-  allows(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, fillColor: '#eeeeff' })), '내 메모뿐인 구역');
+  denies(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, fillColor: '#eeeeff' })), '내 메모뿐인 구역의 모양');
+  denies(c, () => c.doc.setMemoShape(-1, JSON.stringify({ ...shape, fillColor: '#eeeeff' })), '모든 구역의 모양');
+  assert.deepEqual([...new Set(c.denied)], [DENIED_TEXT.comment]);
   c.engine.setMemoAuthor(null);
-  denies(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, fillColor: '#ffeeee' })), '이름을 모름');
+  denies(c, () => c.doc.setMemoText(memos(c)[0].id, '이름 모름'), '이름을 모름');
   c.engine.setScope('edit');
   c.engine.setMemoAuthor('병');
   allows(c, () => c.doc.setMemoText(memos(c)[0].id, 'edit 는 누구의 메모든'), 'edit');
+  allows(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, fillColor: '#ffeeee' })), 'edit 의 메모 모양');
 });

@@ -289,7 +289,8 @@ export const OVERRIDES: Readonly<Record<string, CatalogOverride>> = {
   setFileName: { params: ["name"], sync: "none", why: "파일 이름(DocumentCore.file_name — 문서 IR 아님)" },
   setFormValueInCellEx: { params: ["options_json"], perm: "form" },
   setHangul2024Compat: { params: ["enabled"], sync: "none", why: "렌더·조판 설정 또는 파생 상태 재구성(문서 IR 비변경)" },
-  setMemoShape: { params: ["section_idx", "json"], perm: "memo", conc: "neutral", roles: [], why: "구역의 메모 모양만 바꾼다" },
+  // 메모 모양은 다른 사람 메모의 겉모습까지 바꾸는 문서 설정 — perm 없음(edit 만, D6)
+  setMemoShape: { params: ["section_idx", "json"], conc: "neutral", roles: [], why: "구역의 메모 모양만 바꾼다" },
   setMemoText: { params: ["id", "text"], perm: "memo", conc: "neutral", roles: [], why: "메모 본문만 바꾼다(본문 문단 텍스트가 아님)" },
   setNoteEquationPropertiesEx: { params: ["options_json"] },
   setNumberingCharShape: { params: ["numbering_id", "level", "json"], conc: "neutral", roles: [], why: "번호 정의의 글자 모양만 바꾼다" },

@@ -825,7 +825,7 @@ fn confined_comment_accepts_memo_operations_only() {
     let (mut c, ..) = form_doc();
     let r = confined(&mut c, "comment", |c| { c.insert_memo_at(0, 0, 0, 2, "나", "첫 메모").unwrap(); });
     assert!(passes(&r), "메모 넣기: {r}");
-    // 메모가 있는 상태에서 답글·고치기·지우기·모양
+    // 메모가 있는 상태에서 답글·고치기·지우기(모양은 edit 몫 — 아래 거절)
     c.insert_memo_at(0, 0, 0, 2, "나", "첫 메모").unwrap();
     let id = c.document.sections[0].paragraphs[0].controls.iter().find_map(|x| match x {
         crate::model::control::Control::Field(f) if f.field_type == crate::model::control::FieldType::Memo => Some(f.field_id),
@@ -835,13 +835,18 @@ fn confined_comment_accepts_memo_operations_only() {
         ("답글", confined(&mut c, "comment", |c| { c.insert_memo_reply_json_native(id, r#"{"author":"너","text":"답"}"#).unwrap(); })),
         ("고치기", confined(&mut c, "comment", |c| { c.set_memo_text(id, "고친 메모").unwrap(); })),
         ("지우기", confined(&mut c, "comment", |c| { c.remove_memo(id).unwrap(); })),
-        ("모양", confined(&mut c, "comment", |c| {
-            c.set_memo_shape_json(Some(0), r##"{"width":12000,"lineType":1,"lineWidth":2,"lineColor":"#112233","fillColor":"#FFFFCC","activeColor":"#FFCC00"}"##).unwrap();
-        })),
     ] {
         assert!(passes(&r), "메모 {what}: {r}");
     }
     let no = |v: Value, what: &str| assert!(!passes(&v), "{what} 은 거절이어야: {v}");
+    // 메모 모양은 다른 사람 메모의 겉모습까지 바꾸는 문서 설정 — comment 로는 거절(DocInfo 고쳐 쓰기·구역 번호 바꾸기 모두)
+    let shape = |c: &mut CollabCore| {
+        c.set_memo_shape_json(Some(0), r##"{"width":12000,"lineType":1,"lineWidth":2,"lineColor":"#112233","fillColor":"#FFFFCC","activeColor":"#FFCC00"}"##).unwrap();
+    };
+    let v = confined(&mut c, "comment", shape);
+    assert_eq!(v["detail"], json!("메모 모양이 바뀜"), "comment 로 메모 모양: {v}");
+    no(confined(&mut c, "comment", |c| { c.document.sections[0].section_def.memo_shape_id = 7; }), "comment 로 구역의 메모 모양 번호");
+    no(confined(&mut c, "form comment", shape), "form comment 로 메모 모양");
     no(confined(&mut c, "comment", |c| { c.insert_text_native(0, 0, 0, "X").unwrap(); }), "comment 로 본문");
     let body_id = field_id_in(&c.document.sections[0].paragraphs[..1]);
     no(confined(&mut c, "comment", |c| { c.set_field_value_by_id(body_id, "x").unwrap(); }), "comment 로 누름틀 값");

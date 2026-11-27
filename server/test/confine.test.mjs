@@ -251,7 +251,7 @@ test('comment: 본문·누름틀·메모에 본문을 섞은 state 는 forbidden
   W.close(); C.close();
 });
 
-test('comment: 메모 넣기·답글·자기 메모 고치기(op)는 통과하고 다른 참여자와 정본이 같다', async () => {
+test('comment: 메모 넣기·답글·자기 메모 고치기(op)는 통과하고 다른 참여자와 정본이 같다, 메모 모양은 forbidden(confined)', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const C = await client(room, 'C', 'comment');
@@ -260,6 +260,9 @@ test('comment: 메모 넣기·답글·자기 메모 고치기(op)는 통과하�
     const id = JSON.parse(C.doc.getMemoList())[0].id;
     await accepted(room, C, W, [op('insertMemoReply', [id, JSON.stringify({ author: C.name, text: '답글' })], { ctx: { memoTime: MEMO_TIME } })], '답글(op)');
     await accepted(room, C, W, [op('setMemoText', [id, '고친 메모'])], '자기 메모 고치기(op)');
+    // 메모 모양은 다른 사람 메모의 겉모습까지 바꾸는 문서 설정 — edit 만(D6)
+    const shape = JSON.parse(C.doc.getMemoShape(0));
+    await rejected(room, C, W, [op('setMemoShape', [0, JSON.stringify({ ...shape, lineColor: '#ff0000' })])], 'confined', 'comment 로 메모 모양(op)');
   } finally { W.close(); C.close(); }
 });
 

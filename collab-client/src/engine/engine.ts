@@ -161,8 +161,8 @@ export const DENIED_TEXT = {
 
 /** D6: 메모를 만드는 함수 — `{author,text}` JSON 인자의 작성자를 세션 이름으로 바꿔 넣는다. */
 const MEMO_AUTHORED = new Set(['insertMemo', 'insertMemoByPath', 'insertMemoReply']);
-/** D6: comment 권한은 자기 메모만 고친다(답글은 누구의 메모에나). `setMemoShape` 은 구역 단위라 그 구역 메모가 모두 내 것일 때만. */
-const OWN_MEMO_ONLY = new Set(['setMemoText', 'removeMemo', 'setMemoShape']);
+/** D6: comment 권한은 자기 메모만 고치고 지운다(답글은 누구의 메모에나). 메모 모양(`setMemoShape`)은 문서 설정이라 edit 만. */
+const OWN_MEMO_ONLY = new Set(['setMemoText', 'removeMemo']);
 
 /** 업스트림 `sanitize_author` 와 같은 정리(앞뒤 공백, `/`·`\`·`;`·제어 문자 뺌) — 저장된 작성자와 비교할 때 쓴다. */
 export function sanitizeMemoAuthor(name: string): string {
@@ -283,7 +283,7 @@ export class CollabEngine {
     const s = this.scope;
     if (!s) return null;
     if (info.perm === 'form' && s.form) return null;
-    if (info.perm === 'memo' && s.comment) return OWN_MEMO_ONLY.has(name) ? this.ownMemoDenial(doc, name, args, info) : null;
+    if (info.perm === 'memo' && s.comment) return OWN_MEMO_ONLY.has(name) ? this.ownMemoDenial(doc, args, info) : null;
     if (s.form && info.sync === 'op' && info.conc === 'text' && doc.collabFieldContains) {
       const af = doc.collabGetActiveField();
       if (af !== 'null') {
@@ -295,23 +295,19 @@ export class CollabEngine {
     return s.form ? DENIED_TEXT.form : s.comment ? DENIED_TEXT.comment : DENIED_TEXT.view;
   }
 
-  /** D6: comment 권한의 메모 고치기·지우기·모양 — 대상 메모가 모두 내 것인가. 판정할 수 없으면 막는다. */
-  private ownMemoDenial(doc: EngineDoc, name: string, args: unknown[], info: CatalogEntry): string | null {
+  /**
+   * D6: comment 권한의 메모 고치기·지우기 — 대상 메모(id)의 작성자가 나인가. 판정할 수 없으면 막는다. 이름은 서버가
+   * 입장 때 rhwp 작성자 규칙으로 정리한 이름이다(`sanitizeMemoAuthor` 는 정리 전 이름이 와도 같게 비교하려는 대비).
+   */
+  private ownMemoDenial(doc: EngineDoc, args: unknown[], info: CatalogEntry): string | null {
     const me = this.memoAuthor === null ? null : sanitizeMemoAuthor(this.memoAuthor);
-    let memos: Array<{ id: number; author: string; sectionIndex?: number }>;
+    let memos: Array<{ id: number; author: string }>;
     try { memos = JSON.parse(doc.getMemoList?.() ?? 'null'); } catch { memos = null as never; }
     if (me === null || !Array.isArray(memos)) return DENIED_TEXT.ownMemo;
-    const params = info.params ?? [];
-    let targets: typeof memos;
-    if (name === 'setMemoShape') {
-      const sec = args[params.indexOf('section_idx')];
-      targets = memos.filter((m) => sec === -1 || m.sectionIndex === sec);
-    } else {
-      const id = args[params.indexOf('id')];
-      targets = memos.filter((m) => m.id === id);
-      if (targets.length === 0) return null; // 없는 메모 — core 가 거절한다(문서는 그대로)
-    }
-    return targets.every((m) => m.author === me) ? null : DENIED_TEXT.ownMemo;
+    const id = args[(info.params ?? []).indexOf('id')];
+    const target = memos.find((m) => m.id === id);
+    if (!target) return null; // 없는 메모 — core 가 거절한다(문서는 그대로)
+    return target.author === me ? null : DENIED_TEXT.ownMemo;
   }
 
   /** D6: 메모를 만드는 호출의 `{author}` 를 세션 이름으로(인자 배열을 고친다 — 원래 호출도 이 배열로 부른다). */

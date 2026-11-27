@@ -3,12 +3,12 @@
 import type { CatalogEntry } from './types.ts';
 
 /** 엔진 지문: 업스트림 커밋-패치 해시-보정·기록 코드 해시-분류표 해시. 방의 참여자는 모두 같아야 한다. */
-export const ENGINE_FINGERPRINT = "981ce66b4183-dce060218277-16149af85e06-15b2c228eca4";
+export const ENGINE_FINGERPRINT = "981ce66b4183-dce060218277-6227a17d6195-d0e76ac479bb";
 
 /** studio 합성 메서드(레지스트리에 있으나 export 가 아님). 내부에서 분류표의 export 를 부른다. */
 export const COMPOSED_METHODS: readonly string[] = ["setPageMargin","insertHyperlink","updateHyperlink","replaceHyperlinkText","removeHyperlink"];
 
-/** {"total":314,"op":191,"state":53,"local":1,"none":69,"watch":0,"text":23,"neutral":50,"structural":118,"ctx":28,"layout":11,"permForm":6,"permMemo":6,"unreviewed":0} */
+/** {"total":314,"op":191,"state":53,"local":1,"none":69,"watch":0,"text":23,"neutral":50,"structural":118,"ctx":28,"layout":11,"permForm":6,"permMemo":5,"unreviewed":0} */
 export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
   "addBookmark": {
     "sync": "op",
@@ -4124,7 +4124,6 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": 0,
     "roles": [],
-    "perm": "memo",
     "why": "구역의 메모 모양만 바꾼다",
     "reviewed": true,
     "reach": "none"

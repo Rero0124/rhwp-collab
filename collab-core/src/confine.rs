@@ -7,8 +7,9 @@
 //! 가려지지 않아 **거절**로 떨어진다(실패가 안전 쪽 — 구멍이 아니다).
 //!
 //! - `comment`: 메모 필드(컨트롤·범위·본문·번호)를 빼고(개체 위치를 먼저 잰 뒤 빼고 흐름 좌표를 다시 짠다 —
-//!   업스트림 `drop_memo_fields` 는 컨트롤을 뺀 뒤 옛 흐름 좌표로 위치를 재서, 같은 틈의 다른 개체가 자리를 옮긴다),
-//!   구역의 메모 모양 번호를 가린다. DocInfo 는 메모 모양 목록만 고쳐 쓰기·덧붙이기를 허용한다.
+//!   업스트림 `drop_memo_fields` 는 컨트롤을 뺀 뒤 옛 흐름 좌표로 위치를 재서, 같은 틈의 다른 개체가 자리를 옮긴다).
+//!   메모 모양(DocInfo 목록·구역의 메모 모양 번호)은 다른 사람 메모의 겉모습까지 바꾸는 문서 설정이라 `edit` 몫이다 —
+//!   그대로여야 한다(메모 넣기는 모양을 읽기만 한다).
 //! - `form`: 누름틀(ClickHere) 안 글자를 지우고(`delete_text_at` — 범위·글자 모양·흐름 좌표가 함께 맞는다),
 //!   누름틀의 "채워짐" 비트(15)와 양식 개체의 값(`value`·`text`)을 가린다. 누름틀의 개수·이름·명령·그 밖의
 //!   속성은 그대로여야 한다(구조 변경은 `edit`).
@@ -87,7 +88,7 @@ pub fn check(before: &Document, after: &Document, kinds: Kinds) -> Result<(), St
     if props_digest(props_a) != props_digest(&b.doc_properties) {
         return Err("문서 속성이 다름".into());
     }
-    check_doc_info(info_a, &b.doc_info, kinds)?;
+    check_doc_info(info_a, &b.doc_info)?;
     check_bins(bins_a, &b.bin_data_content)?;
     if sections_a.len() != b.sections.len() {
         return Err(format!("구역 수가 다름 ({} → {})", sections_a.len(), b.sections.len()));
@@ -168,7 +169,7 @@ fn prefix_eq<T: Serialize>(a: &[T], b: &[T]) -> bool {
     b.len() >= a.len() && a.iter().zip(b).all(|(x, y)| record_digest(x) == record_digest(y))
 }
 
-fn check_doc_info(a: &crate::model::document::DocInfo, b: &crate::model::document::DocInfo, kinds: Kinds) -> Result<(), String> {
+fn check_doc_info(a: &crate::model::document::DocInfo, b: &crate::model::document::DocInfo) -> Result<(), String> {
     let crate::model::document::DocInfo {
         bin_data_list,
         font_faces,
@@ -207,20 +208,17 @@ fn check_doc_info(a: &crate::model::document::DocInfo, b: &crate::model::documen
     if font_faces.len() != b.font_faces.len() || font_faces.iter().zip(&b.font_faces).any(|(x, y)| !prefix_eq(x, y)) {
         return Err("DocInfo font_faces 의 기존 항목이 바뀜(덧붙이기만 허용)".into());
     }
-    // 기타 레코드: 메모 모양(comment 면 고쳐 쓰기·덧붙이기 허용)을 뺀 나머지는 같아야 한다.
+    // 기타 레코드: 메모 모양을 뺀 나머지는 같아야 한다(메모 모양은 따로 보아 사유를 가른다).
     let not_memo_shape = |r: &&crate::model::document::RawRecord| r.tag_id != HWPTAG_MEMO_SHAPE;
     let rest_a: Vec<_> = extra_records.iter().filter(not_memo_shape).collect();
     let rest_b: Vec<_> = b.extra_records.iter().filter(not_memo_shape).collect();
     if rest_a.len() != rest_b.len() || rest_a.iter().zip(&rest_b).any(|(x, y)| record_digest(*x) != record_digest(*y)) {
         return Err("DocInfo 기타 레코드가 바뀜".into());
     }
+    // 메모 모양: 다른 사람 메모의 겉모습까지 바꾸는 문서 설정 — 어느 좁은 권한에서도 그대로여야 한다(`edit` 몫)
     let shapes_a: Vec<_> = extra_records.iter().filter(|r| r.tag_id == HWPTAG_MEMO_SHAPE).collect();
     let shapes_b: Vec<_> = b.extra_records.iter().filter(|r| r.tag_id == HWPTAG_MEMO_SHAPE).collect();
-    if kinds.comment {
-        if shapes_b.len() < shapes_a.len() {
-            return Err("메모 모양 항목이 줄어듦(고쳐 쓰기·덧붙이기만 허용)".into());
-        }
-    } else if shapes_a.len() != shapes_b.len()
+    if shapes_a.len() != shapes_b.len()
         || shapes_a.iter().zip(&shapes_b).any(|(x, y)| record_digest(*x) != record_digest(*y))
         || *memo_shape_count != b.memo_shape_count
         || memo_properties_xml != &b.memo_properties_xml
@@ -261,7 +259,6 @@ fn check_bins(a: &[BinDataContent], b: &[BinDataContent]) -> Result<(), String> 
 
 fn mask_section(s: &mut Section, kinds: Kinds) {
     if kinds.comment {
-        s.section_def.memo_shape_id = 0;
         // HWP5 마지막 구역 꼬리의 메모 본문 기록 묶음(모델에서는 메모 필드의 본문)
         if let Some(tail) = s.trailing_lists.as_mut() {
             let kept: Vec<_> = tail.record_groups().filter(|(memo, _)| !memo).flat_map(|(_, recs)| recs.to_vec()).collect();
@@ -342,9 +339,6 @@ fn mask_control(ctrl: &mut Control, kinds: Kinds) {
         Control::Endnote(n) => mask_paragraphs(&mut n.paragraphs, kinds),
         Control::HiddenComment(h) => mask_paragraphs(&mut h.paragraphs, kinds),
         Control::SectionDef(def) => {
-            if kinds.comment {
-                def.memo_shape_id = 0;
-            }
             for page in &mut def.master_pages {
                 mask_paragraphs(&mut page.paragraphs, kinds);
             }

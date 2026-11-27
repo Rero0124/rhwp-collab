@@ -882,3 +882,126 @@ fn field_contains_checks_the_active_click_here_range() {
     assert!(!c.field_contains_call("insertTextInCell", json!([0, tbl_para, ci, 1, 0, 0, "q"]).as_array().unwrap(), &caf).unwrap(), "다른 칸");
 }
 
+
+// ── D4: 결과 전송(state)의 판정 — 사본을 내보낸 바이트를 정본이 적재한다 ─────────────────────────
+
+/** 본문 "이름: [누름틀 abc] 끝"(9글자), `memo` 면 글자 0..2 에 메모가 이미 있다. 원본 바이트. */
+fn state_doc(memo: bool) -> Vec<u8> {
+    let mut c = CollabCore::new(blank());
+    c.insert_text_native(0, 0, 0, "이름:  끝").unwrap();
+    c.insert_click_here_field_at(0, 0, 4, "이름", "", "name", true).unwrap();
+    let id = field_id_in(&c.document.sections[0].paragraphs);
+    c.set_field_value_by_id(id, "abc").unwrap();
+    if memo {
+        c.insert_memo_at(0, 0, 0, 2, "나", "있던 메모").unwrap();
+    }
+    let packed = c.export_state().unwrap();
+    super::unpack_state(&packed).unwrap().into_owned()
+}
+
+/// 정상 클라이언트의 결과 전송: 사본(같은 원본을 연 다른 문서)에서 고치고 내보낸 바이트를 정본이 적재한 뒤 판정.
+fn state_confined(raw: &[u8], kind: &str, edit: impl FnOnce(&mut CollabCore)) -> Value {
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(raw).unwrap());
+    let snap = canon.snapshot_save();
+    let mut client = CollabCore::new(DocumentCore::from_bytes(raw).unwrap());
+    edit(&mut client);
+    canon.load_state(&client.export_state().unwrap()).unwrap();
+    canon.check_confined(snap, kind).unwrap()
+}
+
+fn set_script(c: &mut CollabCore, path: &str, bytes: &[u8]) {
+    let streams = &mut c.document.extra_streams;
+    match streams.iter_mut().find(|(p, _)| p == path) {
+        Some((_, b)) => *b = bytes.to_vec(),
+        None => streams.push((path.to_string(), bytes.to_vec())),
+    }
+}
+
+#[test]
+fn confined_state_transfer_of_memo_and_field_value_passes() {
+    // 회귀(5단계 서버 우회 시험): 저장 때 다시 쓰는 `/RhwpLineSegTags`(구역 바이트 다이제스트)가 메모·누름틀 값으로 바뀌어
+    // "부속 스트림이 다름"으로 정상 결과 전송을 거절했다
+    for memo in [false, true] {
+        let raw = state_doc(memo);
+        let at = if memo { 7 } else { 0 };
+        let ok = |v: Value, what: &str| assert!(passes(&v), "{what}(메모 있던 문서 {memo}): {v}");
+        ok(state_confined(&raw, "comment", |c| { c.insert_memo_at(0, 0, at, at + 2, "C", "메모").unwrap(); }), "comment 메모 넣기");
+        ok(state_confined(&raw, "form", |c| {
+            let id = field_id_in(&c.document.sections[0].paragraphs);
+            c.set_field_value_by_id(id, "홍길동").unwrap();
+        }), "form 누름틀 값");
+        ok(state_confined(&raw, "form comment", |c| {
+            let id = field_id_in(&c.document.sections[0].paragraphs);
+            c.set_field_value_by_id(id, "섞음").unwrap();
+            c.insert_memo_at(0, 0, 0, 1, "C", "섞음 메모").ok();
+        }), "form comment 누름틀 + 메모");
+        ok(state_confined(&raw, "form", |_| {}), "편집 없는 state(form)");
+        ok(state_confined(&raw, "comment", |_| {}), "편집 없는 state(comment)");
+    }
+}
+
+#[test]
+fn confined_state_rejects_forged_streams_in_a_memo_document() {
+    // 부속 스트림 비교는 파생 스트림 하나만 뺀다 — 스크립트 스트림을 state 바이트로 끼워 넣는 우회는 막는다
+    let raw = state_doc(true);
+    let script = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap())
+        .document
+        .extra_streams
+        .iter()
+        .find(|(p, _)| p.trim_start_matches('/') == "Scripts/DefaultJScript")
+        .map(|(p, _)| p.clone())
+        .expect("빈 문서에도 기본 스크립트 스트림이 있다");
+    let rejects = |v: Value, what: &str, stream: &str| {
+        assert_eq!(v["ok"], json!(false), "{what}: {v}");
+        assert_eq!(v["reason"], json!("confined"), "{what}");
+        assert!(v["detail"].as_str().unwrap_or("").contains(stream), "{what}: {v}");
+    };
+    rejects(state_confined(&raw, "comment", |c| {
+        c.insert_memo_at(0, 0, 7, 9, "C", "메모").unwrap();
+        set_script(c, &script, b"evil();");
+    }), "메모 + 기본 스크립트 바꾸기", "Scripts");
+    rejects(state_confined(&raw, "comment", |c| {
+        c.insert_memo_at(0, 0, 7, 9, "C", "메모").unwrap();
+        set_script(c, "/Scripts/Evil", b"evil();");
+    }), "메모 + 스크립트 스트림 더하기", "/Scripts/Evil");
+    rejects(state_confined(&raw, "form", |c| {
+        let id = field_id_in(&c.document.sections[0].paragraphs);
+        c.set_field_value_by_id(id, "값").unwrap();
+        set_script(c, &script, b"evil();");
+    }), "누름틀 값 + 기본 스크립트 바꾸기", "Scripts");
+}
+
+/// 실제 저장본(한/글)의 결과 전송: 정본은 원본을 읽은 문서, 사본은 같은 원본을 읽어 고친 뒤 rhwp 로 내보낸 바이트.
+/// 내보내기→다시 읽기가 항등이 아니어서(HWPX 목록 파일 재작성, 파일 머리, 문단 번호 다시 매기기 등) 판정이 스냅샷 쪽도
+/// 같은 정규화를 거쳐야 한다.
+fn real_state(f: &str, kind: &str, edit: impl FnOnce(&mut CollabCore)) -> Value {
+    state_confined(&sample(&format!("samples/{f}")), kind, edit)
+}
+
+#[test]
+fn confined_state_on_real_files_compares_both_sides_after_export_and_reparse() {
+    // 회귀(5단계 서버 우회 시험 뒤 실제 샘플 확인): 편집 없는 결과 전송도 "부속 스트림이 다름 (Contents/content.hpf)"
+    // (HWPX), "파일 머리가 다름"(HWP)으로 거절했다
+    for f in ["누름틀-2024.hwpx", "20250130-hongbo-no.hwp"] {
+        for kind in ["comment", "form", "form comment"] {
+            let v = real_state(f, kind, |_| {});
+            assert!(passes(&v), "{f} 편집 없는 state({kind}): {v}");
+        }
+    }
+    // 메모: 누름틀 안에 메모(다시 읽으면 메모 시작이 누름틀의 안쪽 슬롯으로 세어진다, HWPX 문단 번호가 밀린다),
+    // 줄 수가 바뀌는 HWP 저장본
+    for f in ["누름틀-2024.hwpx", "21_언어_기출_편집가능본.hwp"] {
+        let v = real_state(f, "comment", |c| { c.insert_memo_at(0, 0, 0, 1, "C", "m").unwrap(); });
+        assert!(passes(&v), "{f} 메모(state): {v}");
+        // 같은 문서 객체에서 바로 넣어도(빈 CTRL_DATA 칸이 생긴다)
+        let mut core = CollabCore::new(DocumentCore::from_bytes(&sample(&format!("samples/{f}"))).unwrap());
+        let v = confined(&mut core, "comment", |c| { c.insert_memo_at(0, 0, 0, 1, "C", "m").unwrap(); });
+        assert!(passes(&v), "{f} 메모(같은 객체): {v}");
+        // 메모에 본문 글자를 섞으면 그대로 거절
+        let v = real_state(f, "comment", |c| {
+            c.insert_memo_at(0, 0, 0, 1, "C", "m").unwrap();
+            c.insert_text_native(0, 0, 0, "덤").unwrap();
+        });
+        assert_eq!(v["ok"], json!(false), "{f} 메모 + 본문(state): {v}");
+    }
+}

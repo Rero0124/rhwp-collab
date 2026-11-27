@@ -167,28 +167,42 @@ index 1e2a6986..4caa8146 100644
      if (!this.currentRect) return;
 diff --git a/rhwp-studio/src/engine/collab-undo.ts b/rhwp-studio/src/engine/collab-undo.ts
 new file mode 100644
-index 00000000..7b572d71
+index 00000000..4f8a8fe5
 --- /dev/null
 +++ b/rhwp-studio/src/engine/collab-undo.ts
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,476 @@
 +/**
-+ * cc-rhwp(4단계 U1): 공동편집 중 되돌리기 — 명령이 기억한 위치의 표 (docs/collab-stage4.md §5).
++ * cc-rhwp(4단계 U1·U2): 공동편집 중 되돌리기 — 명령이 기억한 위치의 표 (docs/collab-stage4.md §5).
 + *
 + * 공동편집 플러그인은 남의 편집이 들어올 때마다 되돌리기 스택의 위치를 옮기고, 겹치면 그 단계를 막는다.
 + * 명령은 위치를 저마다 다른 필드에 들고 있으므로(공통 타입이 없다), 여기 표가 명령 종류마다 "어느 필드가
-+ * 어떤 위치인가"를 알려 준다. 표에 없는 종류(스냅샷 명령, 머리말·꼬리말·각주, 개체, 구역, 양식, 그리고
-+ * 업스트림이 나중에 더한 명령)는 `null` — 플러그인이 "뒤에 남의 편집이 하나라도 있으면 막음"(3.2-3)으로 다룬다.
++ * 어떤 위치인가"를 알려 준다. 표에 없는 종류(스냅샷 명령, 셀 테두리·배경, 그리고 업스트림이 나중에 더한 명령)는
++ * `null` — 플러그인이 "뒤에 남의 편집이 하나라도 있으면 막음"(3.2-3)으로 다룬다.
++ *
++ * U2 에서 넓힌 것: 중첩 셀 경로, 머리말·꼬리말(안쪽 좌표는 본문 편집과 무관 — 발자국이 구역 단위), 각주(각주를 품은
++ * 본문 문단), 개체(개체를 품은 본문 문단 또는 칸 문단), 구역 설정·z 순서(구역 원본 저널 — `store: 'section'`),
++ * 양식 값.
 + *
 + * 이 파일은 명령 클래스를 import 하지 않는다(필드 이름으로 읽고 쓴다). 업스트림이 필드 이름을 바꾸면
 + * `tests/plugin-collab-undo.test.ts` 의 대조 시험이 깨진다.
 + */
 +
-+/** 위치 하나(텍스트 좌표). 셀이면 한 단계 표의 (개체, 칸, 칸 문단) — `para` 는 표를 품은 본문 문단. */
++/** 셀 경로 한 단계(개체, 칸, 그 칸의 문단). */
++export interface CollabUndoCellStep { control: number; cell: number; cellPara: number }
++
++/**
++ * 위치 하나(텍스트 좌표). 셀이면 `para` 는 바깥 표를 품은 본문 문단이고 `cellPath` 가 바깥 → 안쪽 단계다(마지막
++ * 단계의 `cellPara` 가 위치의 칸 문단, 그 앞 단계의 `cellPara` 는 다음 단계 표를 품은 문단). 한 단계면 `cell` 로도
++ * 준다(U1 모양).
++ */
 +export interface CollabUndoPosition {
 +  section: number;
 +  para: number;
 +  offset: number;
-+  cell?: { control: number; cell: number; cellPara: number } | null;
++  cell?: CollabUndoCellStep | null;
++  cellPath?: CollabUndoCellStep[] | null;
++  /** 문단으로 특정할 수 없는 자리(`section`) / 그 구역의 어떤 기록이든 닿는 지킴(`sectionAll`) */
++  scope?: 'section' | 'sectionAll';
 +  /** 나눔 지점에서 뒤 문단으로 따라가는가(기본 after). 범위 끝은 before. */
 +  bias?: 'before' | 'after';
 +}
@@ -205,14 +219,19 @@ index 00000000..7b572d71
 +  readonly caret?: boolean;
 +}
 +
-+/** 되돌리기가 기대는 WASM 저장소. `fragment` 는 절대 문단 번호로 복원하는 삭제 조각, `snapshot` 은 문서 전체. */
-+export type CollabUndoStore = 'none' | 'fragment' | 'snapshot';
++/**
++ * 되돌리기가 기대는 WASM 저장소. `fragment` 는 절대 문단 번호로 복원하는 삭제 조각, `snapshot` 은 문서 전체,
++ * `section` 은 구역 원본 저널(`captureSectionRaw` ↔ `restoreSectionRaw` — 캡처와 복원 사이 그 구역 편집 금지).
++ */
++export type CollabUndoStore = 'none' | 'fragment' | 'snapshot' | 'section';
 +
 +export interface CollabUndoDescriptor {
 +  slots: CollabUndoSlot[];
 +  store: CollabUndoStore;
 +  /** `store === 'fragment'`: 조각이 기억한 문단 자리. 이것이 옮겨지면(앞쪽 문단 수 변화) 되돌릴 수 없다. */
 +  fragmentAnchor?: CollabUndoSlot;
++  /** `store === 'section'`: 되돌리기가 저널로 복원하는 구역들 */
++  sections?: number[];
 +}
 +
 +/** 히스토리가 공동편집 플러그인에 알리는 훅. */
@@ -259,27 +278,28 @@ index 00000000..7b572d71
 +  SplitParagraphInCellCommand: 'table',
 +  MergeParagraphInCellCommand: 'table',
 +  MergeNextParagraphInCellCommand: 'table',
-+  // U2 후보(머리말·꼬리말·각주, 개체, 구역, 양식) — 지금은 3.2-3
-+  InsertTextInHeaderFooterCommand: 'strict',
-+  InsertFieldInHeaderFooterCommand: 'strict',
-+  DeleteTextInHeaderFooterCommand: 'strict',
-+  SplitParagraphInHeaderFooterCommand: 'strict',
-+  MergeParagraphInHeaderFooterCommand: 'strict',
-+  InsertTextInFootnoteCommand: 'strict',
-+  DeleteTextInFootnoteCommand: 'strict',
-+  SplitParagraphInFootnoteCommand: 'strict',
-+  MergeParagraphInFootnoteCommand: 'strict',
-+  MoveTableCommand: 'strict',
-+  MovePictureCommand: 'strict',
-+  MoveShapeCommand: 'strict',
-+  ResizeObjectCommand: 'strict',
-+  MoveLineEndpointCommand: 'strict',
-+  SetObjectPropsCommand: 'strict',
-+  SetSectionPropsCommand: 'strict',
++  // U2: 머리말·꼬리말·각주, 개체, 구역, 양식
++  InsertTextInHeaderFooterCommand: 'table',
++  InsertFieldInHeaderFooterCommand: 'table',
++  DeleteTextInHeaderFooterCommand: 'table',
++  SplitParagraphInHeaderFooterCommand: 'table',
++  MergeParagraphInHeaderFooterCommand: 'table',
++  InsertTextInFootnoteCommand: 'table',
++  DeleteTextInFootnoteCommand: 'table',
++  SplitParagraphInFootnoteCommand: 'table',
++  MergeParagraphInFootnoteCommand: 'table',
++  MoveTableCommand: 'table',
++  MovePictureCommand: 'table',
++  MoveShapeCommand: 'table',
++  ResizeObjectCommand: 'table',
++  MoveLineEndpointCommand: 'table',
++  SetObjectPropsCommand: 'table',
++  SetSectionPropsCommand: 'table',
++  SetZOrderCommand: 'table',
++  SetSectionPropsAllCommand: 'table',
++  SetFormValueCommand: 'table',
++  // 되돌리기가 문서 목록 꼬리를 개수로 지운다(removeBorderFillTails) — 3.2-3 (U0 결정)
 +  SetCellBorderFillCommand: 'strict',
-+  SetZOrderCommand: 'strict',
-+  SetSectionPropsAllCommand: 'strict',
-+  SetFormValueCommand: 'strict',
 +  // 문서 전체 스냅샷으로 되돌린다 — 그사이 남의 편집까지 지우므로 언제나 3.2-3
 +  SnapshotCommand: 'strict',
 +  SubmodeSnapshotCommand: 'strict',
@@ -293,45 +313,85 @@ index 00000000..7b572d71
 +/** 캡션·글상자 가상 칸 번호(셀 경로로 쓰지만 표 칸이 아니다) */
 +const VIRTUAL_CELL = 65534;
 +
++/**
++ * 셀 경로 읽기. 단계 키는 `controlIndex` 계열(CellPathEntry)과 `controlIdx` 계열(CellPathSegment) 둘 다.
++ * 가상 칸(캡션·글상자)이 끼면 `null`.
++ */
++function readSteps(path: unknown): CollabUndoCellStep[] | null {
++  if (!Array.isArray(path) || path.length === 0) return null;
++  const out: CollabUndoCellStep[] = [];
++  for (const st of path as Rec[]) {
++    if (!st || typeof st !== 'object') return null;
++    const control = st.controlIndex ?? st.controlIdx;
++    const cell = st.cellIndex ?? st.cellIdx;
++    const cellPara = st.cellParaIndex ?? st.cellParaIdx;
++    if (!isNum(control) || !isNum(cell) || !isNum(cellPara) || cell === VIRTUAL_CELL) return null;
++    out.push({ control, cell, cellPara });
++  }
++  return out;
++}
++
++/** 셀 경로의 칸 문단만 새 값으로(키 철자는 그대로). */
++function writeSteps(path: Rec[], steps: readonly CollabUndoCellStep[]): Rec[] {
++  return path.map((st, i) => {
++    const cellPara = steps[i]?.cellPara;
++    if (!isNum(cellPara)) return st;
++    return 'cellParaIdx' in st && !('cellParaIndex' in st) ? { ...st, cellParaIdx: cellPara } : { ...st, cellParaIndex: cellPara };
++  });
++}
++
++/** 위치의 셀 단계(바깥 → 안쪽). */
++const stepsOf = (p: CollabUndoPosition): CollabUndoCellStep[] => p.cellPath ?? (p.cell ? [p.cell] : []);
++
++/** 셀 위치(경로 단계들)를 만든다 — 한 단계면 `cell` 도 채운다. */
++function cellPosition(section: number, para: number, offset: number, steps: CollabUndoCellStep[], bias?: 'before' | 'after'): CollabUndoPosition {
++  return { section, para, offset, bias, cell: steps.length === 1 ? steps[0] : null, cellPath: steps };
++}
++
 +/** `DocumentPosition` 하나(필드 `field` 에 든 객체)의 자리. 없으면 `null`(자리를 만들지 않는다). */
 +function docPos(owner: Rec, field: string, opts: { caret?: boolean; bias?: 'before' | 'after' } = {}): CollabUndoSlot | null {
 +  const pos = owner[field] as Rec | undefined;
 +  if (!pos || typeof pos !== 'object') return null;
++  const read = (): CollabUndoPosition | null => {
++    if (!isNum(pos.sectionIndex) || !isNum(pos.charOffset)) return null;
++    const bias = opts.bias;
++    if (pos.parentParaIndex === undefined) {
++      if (!isNum(pos.paragraphIndex) || pos.isTextBox) return null;
++      return { section: pos.sectionIndex, para: pos.paragraphIndex, offset: pos.charOffset, bias };
++    }
++    if (pos.isTextBox || !isNum(pos.parentParaIndex)) return null;
++    // 경로가 있으면 경로가 정본(평면 필드는 바깥 표 기준의 레거시), 없으면 평면 한 단계
++    const steps = Array.isArray(pos.cellPath) && pos.cellPath.length > 0
++      ? readSteps(pos.cellPath)
++      : readSteps([{ controlIndex: pos.controlIndex, cellIndex: pos.cellIndex, cellParaIndex: pos.cellParaIndex }]);
++    return steps ? cellPosition(pos.sectionIndex, pos.parentParaIndex, pos.charOffset, steps, bias) : null;
++  };
 +  return {
 +    key: pos,
 +    field: '',
 +    caret: opts.caret,
-+    get() {
-+      if (!isNum(pos.sectionIndex) || !isNum(pos.charOffset)) return null;
-+      const bias = opts.bias;
-+      if (pos.parentParaIndex === undefined) {
-+        if (!isNum(pos.paragraphIndex) || pos.isTextBox) return null;
-+        return { section: pos.sectionIndex, para: pos.paragraphIndex, offset: pos.charOffset, bias };
-+      }
-+      const path = pos.cellPath as CellEntry[] | undefined;
-+      if (path && path.length > 1) return null; // 중첩 셀: U1 밖
-+      const step: CellEntry = path?.length ? path[0] : {
-+        controlIndex: pos.controlIndex as number, cellIndex: pos.cellIndex as number, cellParaIndex: pos.cellParaIndex as number,
-+      };
-+      if (pos.isTextBox || !isNum(pos.parentParaIndex) || !isNum(step.controlIndex) || !isNum(step.cellIndex) || !isNum(step.cellParaIndex)
-+        || step.cellIndex === VIRTUAL_CELL) return null;
-+      return {
-+        section: pos.sectionIndex, para: pos.parentParaIndex, offset: pos.charOffset, bias,
-+        cell: { control: step.controlIndex, cell: step.cellIndex, cellPara: step.cellParaIndex },
-+      };
-+    },
++    get: read,
 +    set(p) {
++      const old = read();
 +      pos.charOffset = p.offset;
-+      if (!p.cell) {
++      const steps = stepsOf(p);
++      if (steps.length === 0) {
 +        pos.paragraphIndex = p.para;
 +        return;
 +      }
++      const oldSteps = old ? stepsOf(old) : [];
++      const innerOld = oldSteps[oldSteps.length - 1]?.cellPara;
++      const innerNew = steps[steps.length - 1].cellPara;
++      const outerOld = oldSteps[0]?.cellPara;
++      const outerNew = steps[0].cellPara;
 +      pos.parentParaIndex = p.para;
-+      // 셀 위치의 paragraphIndex 는 칸 문단 번호다(command.ts cellParagraphPosition)
-+      if (pos.paragraphIndex === pos.cellParaIndex || pos.paragraphIndex === undefined) pos.paragraphIndex = p.cell.cellPara;
-+      if (pos.cellParaIndex !== undefined) pos.cellParaIndex = p.cell.cellPara;
-+      const path = pos.cellPath as CellEntry[] | undefined;
-+      if (path?.length === 1) pos.cellPath = [{ ...path[0], cellParaIndex: p.cell.cellPara }];
++      // 셀 위치의 paragraphIndex 는 (가장 안쪽) 칸 문단 번호다(command.ts cellParagraphPosition)
++      if (pos.paragraphIndex === undefined || pos.paragraphIndex === innerOld) pos.paragraphIndex = innerNew;
++      // 평면 cellParaIndex 는 바깥 표 기준이지만 cellParagraphPosition 은 안쪽 값을 쓴다 — 지금 값이 가리키는 쪽을 따른다
++      if (pos.cellParaIndex !== undefined) {
++        pos.cellParaIndex = pos.cellParaIndex === innerOld ? innerNew : pos.cellParaIndex === outerOld ? outerNew : pos.cellParaIndex;
++      }
++      if (Array.isArray(pos.cellPath) && pos.cellPath.length === steps.length) pos.cellPath = writeSteps(pos.cellPath as Rec[], steps);
 +    },
 +  };
 +}
@@ -350,6 +410,42 @@ index 00000000..7b572d71
 +  };
 +}
 +
++/** 구역 번호는 다른 객체가 들고 있고 문단 번호만 `owner[paraField]` 에 있는 자리(z 순서의 이동 목록 등). */
++function paraIn(owner: Rec, paraField: string, section: unknown): CollabUndoSlot | null {
++  if (!isNum(section) || !isNum(owner[paraField])) return null;
++  return {
++    key: owner,
++    field: paraField,
++    get: () => (isNum(owner[paraField]) ? { section, para: owner[paraField] as number, offset: 0 } : null),
++    set(p) { owner[paraField] = p.para; },
++  };
++}
++
++/**
++ * 개체 자리: 개체를 품은 본문 문단 `owner[paraField]`, 셀 안이면 `owner[pathField]`(셀 경로, 마지막 단계의 칸 문단이
++ * 개체를 품은 문단). 개체 번호(`ci`)는 옮기지 않는다 — 같은 문단에 개체를 넣고 빼는 편집은 구조 편집이라 막힌다.
++ */
++function objectAt(owner: Rec, secField: string, paraField: string, pathField?: string): CollabUndoSlot | null {
++  const path = pathField ? owner[pathField] : undefined;
++  if (!Array.isArray(path) || path.length === 0) return secPara(owner, secField, paraField);
++  return {
++    key: owner,
++    field: paraField,
++    get() {
++      const sec = owner[secField];
++      const para = owner[paraField];
++      const steps = readSteps(owner[pathField!]);
++      return isNum(sec) && isNum(para) && steps ? cellPosition(sec, para, 0, steps) : null;
++    },
++    set(p) {
++      owner[paraField] = p.para;
++      const cur = owner[pathField!];
++      const steps = stepsOf(p);
++      if (Array.isArray(cur) && cur.length === steps.length) owner[pathField!] = writeSteps(cur as Rec[], steps);
++    },
++  };
++}
++
 +/** ApplyCharFormat 의 문단별 기록(`paraIndex` 또는 셀이면 `cellPathJson` 의 칸 문단). */
 +function charFormatEntries(cmd: Rec): CollabUndoSlot[] {
 +  const start = cmd.start as Rec | undefined;
@@ -363,21 +459,23 @@ index 00000000..7b572d71
 +      if (typeof entry.cellPathJson !== 'string') {
 +        return isNum(entry.paraIndex) ? { section: start.sectionIndex, para: entry.paraIndex, offset: 0 } : null;
 +      }
-+      let path: CellEntry[];
++      let path: unknown;
 +      try { path = JSON.parse(entry.cellPathJson); } catch { return null; }
-+      if (path.length !== 1 || !isNum(start.parentParaIndex) || path[0].cellIndex === VIRTUAL_CELL) return null;
++      const steps = readSteps(path);
++      if (!steps || !isNum(start.parentParaIndex)) return null;
 +      // 표를 품은 문단은 start 가 들고 있다(같은 지도로 따로 옮겨진다) — 여기선 칸 문단만
-+      return { section: start.sectionIndex, para: start.parentParaIndex, offset: 0, cell: { control: path[0].controlIndex, cell: path[0].cellIndex, cellPara: path[0].cellParaIndex } };
++      return cellPosition(start.sectionIndex, start.parentParaIndex, 0, steps);
 +    },
 +    set(p) {
 +      if (typeof entry.cellPathJson !== 'string') {
 +        entry.paraIndex = p.para;
 +        return;
 +      }
-+      const path = JSON.parse(entry.cellPathJson) as CellEntry[];
-+      path[0] = { ...path[0], cellParaIndex: p.cell?.cellPara ?? path[0].cellParaIndex };
-+      entry.cellPathJson = JSON.stringify(path);
-+      if (isNum(entry.paraIndex)) entry.paraIndex = p.cell?.cellPara ?? entry.paraIndex;
++      const path = JSON.parse(entry.cellPathJson) as Rec[];
++      const steps = stepsOf(p);
++      const innerOld = (path[path.length - 1] as Partial<CellEntry>).cellParaIndex;
++      entry.cellPathJson = JSON.stringify(writeSteps(path, steps));
++      if (isNum(entry.paraIndex) && entry.paraIndex === innerOld) entry.paraIndex = steps[steps.length - 1]?.cellPara ?? entry.paraIndex;
 +    },
 +  }));
 +}
@@ -392,28 +490,40 @@ index 00000000..7b572d71
 +      if (!isNum(t.sec)) return null;
 +      if (t.kind === 'body') return isNum(t.para) ? { section: t.sec, para: t.para, offset: 0 } : null;
 +      if (!isNum(t.parentPara)) return null;
-+      if (t.kind === 'cell') {
-+        return isNum(t.controlIdx) && isNum(t.cellIdx) && isNum(t.cellParaIdx) && t.cellIdx !== VIRTUAL_CELL
-+          ? { section: t.sec, para: t.parentPara, offset: 0, cell: { control: t.controlIdx, cell: t.cellIdx, cellPara: t.cellParaIdx } }
-+          : null;
-+      }
-+      const path = t.path as CellEntry[] | undefined;
-+      if (!path || path.length !== 1 || path[0].cellIndex === VIRTUAL_CELL) return null;
-+      return { section: t.sec, para: t.parentPara, offset: 0, cell: { control: path[0].controlIndex, cell: path[0].cellIndex, cellPara: path[0].cellParaIndex } };
++      const steps = t.kind === 'cell'
++        ? readSteps([{ controlIndex: t.controlIdx, cellIndex: t.cellIdx, cellParaIndex: t.cellParaIdx }])
++        : readSteps(t.path);
++      return steps ? cellPosition(t.sec, t.parentPara, 0, steps) : null;
 +    },
 +    set(p) {
 +      if (t.kind === 'body') {
 +        t.para = p.para;
 +        return;
 +      }
++      const steps = stepsOf(p);
 +      t.parentPara = p.para;
-+      if (t.kind === 'cell') t.cellParaIdx = p.cell?.cellPara ?? t.cellParaIdx;
-+      else {
-+        const path = t.path as CellEntry[];
-+        t.path = [{ ...path[0], cellParaIndex: p.cell?.cellPara ?? path[0].cellParaIndex }];
-+      }
++      if (t.kind === 'cell') t.cellParaIdx = steps[0]?.cellPara ?? t.cellParaIdx;
++      else if (Array.isArray(t.path) && t.path.length === steps.length) t.path = writeSteps(t.path as Rec[], steps);
 +    },
 +  }));
++}
++
++/** 양식 값 대상: 본문이면 (sec, para), 셀이면 `inCell` 의 (표 문단, 표 개체, 칸, 칸 문단). */
++function formTarget(t: Rec): CollabUndoSlot | null {
++  const inCell = t.inCell as Rec | undefined;
++  if (!inCell) return secPara(t, 'sec', 'para');
++  return {
++    key: inCell,
++    field: 'cell',
++    get() {
++      const steps = readSteps([{ controlIndex: inCell.tableCi, cellIndex: inCell.cellIdx, cellParaIndex: inCell.cellPara }]);
++      return isNum(t.sec) && isNum(inCell.tablePara) && steps ? cellPosition(t.sec, inCell.tablePara, 0, steps) : null;
++    },
++    set(p) {
++      inCell.tablePara = p.para;
++      inCell.cellPara = stepsOf(p)[0]?.cellPara ?? inCell.cellPara;
++    },
++  };
 +}
 +
 +const compact = (slots: Array<CollabUndoSlot | null>): CollabUndoSlot[] => slots.filter((s): s is CollabUndoSlot => s !== null);
@@ -424,12 +534,29 @@ index 00000000..7b572d71
 +  'splitParagraphInCell', 'mergeParagraphInCell', 'mergeNextParagraphInCell',
 +]);
 +
++/** 머리말·꼬리말 명령: 안쪽 좌표는 본문 편집과 무관하다 — 막힘은 구역 단위 발자국(같은 구역의 머리말 편집)이 정한다. */
++const HEADER_FOOTER = new Set([
++  'insertTextInHeaderFooter', 'insertFieldInHeaderFooter', 'deleteTextInHeaderFooter',
++  'splitParagraphInHeaderFooter', 'mergeParagraphInHeaderFooter',
++]);
++
++/** 각주 명령: 각주를 품은 본문 문단(`target.paraIdx`)을 옮긴다. 각주 안 좌표는 같은 구역의 각주 편집(구조)이 막는다. */
++const FOOTNOTE = new Set([
++  'insertTextInFootnote', 'deleteTextInFootnote', 'splitParagraphInFootnote', 'mergeParagraphInFootnote',
++]);
++
 +/** 명령의 위치 자리와 저장소 의존. 표에 없으면 `null`(3.2-3). */
 +export function describeCollabUndo(command: object): CollabUndoDescriptor | null {
 +  const cmd = command as Rec;
 +  const type = cmd.type;
 +  if (typeof type !== 'string') return null;
 +  if (POSITION_ONLY.has(type)) return { slots: compact([docPos(cmd, 'position')]), store: 'none' };
++  if (HEADER_FOOTER.has(type)) return { slots: [], store: 'none' };
++  if (FOOTNOTE.has(type)) {
++    const target = cmd.target as Rec | undefined;
++    const slot = target ? secPara(target, 'sectionIdx', 'paraIdx') : null;
++    return slot ? { slots: [slot], store: 'none' } : null;
++  }
 +  switch (type) {
 +    case 'insertText': {
 +      const position = docPos(cmd, 'position');
@@ -457,9 +584,59 @@ index 00000000..7b572d71
 +      }
 +      return describeFragmentDelete(cmd);
 +    }
++    // ── U2: 개체 ──
++    case 'moveTable': {
++      // 옮긴 뒤 표가 다른 문단으로 갈 수 있다(resultPpi) — 되돌리기는 그 자리, 다시 하기는 원래 자리를 쓴다
++      const from = secPara(cmd, 'sec', 'ppi');
++      const to = secPara(cmd, 'sec', 'resultPpi');
++      return from && to ? { slots: [from, to], store: 'none' } : null;
++    }
++    case 'movePicture':
++    case 'moveShape':
++      return single(objectAt(cmd, 'sec', 'ppi', 'cellPath'));
++    case 'resizeObject': {
++      const targets = (cmd.targets as Rec[] | undefined) ?? [];
++      const slots = targets.map((t) => objectAt(t, 'sec', 'ppi', 'cellPath'));
++      return slots.length > 0 && slots.every((s) => s) ? { slots: compact(slots), store: 'none' } : null;
++    }
++    case 'moveLineEndpoint':
++      return single(secPara(cmd, 'sec', 'ppi'));
++    case 'setObjectProps': {
++      const ref = cmd.ref as Rec | undefined;
++      if (!ref) return null;
++      // 머리말·꼬리말 안 그림: 본문 자리는 머리말 개체를 품은 문단(outerParaIdx). ref.ppi 는 머리말 안 문단이다.
++      const hf = ref.headerFooter as Rec | undefined;
++      return single(hf ? paraIn(hf, 'outerParaIdx', ref.sec) : objectAt(ref, 'sec', 'ppi', 'cellPath'));
++    }
++    // ── U2: 구역 원본 저널 ──
++    case 'changeZOrder': {
++      const moves = (cmd.moves as Rec[] | null | undefined) ?? [];
++      const slots = [secPara(cmd, 'sectionIdx', 'ppi'), ...moves.map((m) => paraIn(m, 'ppi', cmd.sectionIdx)), docPos(cmd, 'cursorPos', { caret: true })];
++      return isNum(cmd.sectionIdx) ? { slots: compact(slots), store: 'section', sections: [cmd.sectionIdx] } : null;
++    }
++    case 'setSectionProps': {
++      // SetSectionPropsCommand(sectionIdx)와 SetSectionPropsAllCommand(sections[].idx)가 같은 type 을 쓴다 — 모양으로 가른다
++      const sections = Array.isArray(cmd.sections) ? (cmd.sections as Rec[]).map((s) => s?.idx) : [cmd.sectionIdx];
++      return sections.length > 0 && sections.every(isNum)
++        ? { slots: compact([docPos(cmd, 'cursorPos', { caret: true })]), store: 'section', sections: sections as number[] }
++        : null;
++    }
++    // ── U2: 양식 ──
++    case 'setFormValue': {
++      const targets = (cmd.targets as Rec[] | undefined) ?? [];
++      const slots = targets.map(formTarget);
++      return slots.length > 0 && slots.every((s) => s)
++        ? { slots: compact([...slots, docPos(cmd, 'pos', { caret: true })]), store: 'none' }
++        : null;
++    }
 +    default:
 +      return null;
 +  }
++}
++
++/** 자리 하나짜리 명령 — 자리를 못 만들면 표 밖(3.2-3). */
++function single(slot: CollabUndoSlot | null): CollabUndoDescriptor | null {
++  return slot ? { slots: [slot], store: 'none' } : null;
 +}
 +
 +function describeFragmentDelete(cmd: Rec): CollabUndoDescriptor {
@@ -2010,11 +2187,11 @@ index 00000000..877ebd9b
 +});
 diff --git a/rhwp-studio/tests/plugin-collab-undo.test.ts b/rhwp-studio/tests/plugin-collab-undo.test.ts
 new file mode 100644
-index 00000000..5ef8f1d3
+index 00000000..3817769c
 --- /dev/null
 +++ b/rhwp-studio/tests/plugin-collab-undo.test.ts
-@@ -0,0 +1,285 @@
-+// cc-rhwp(4단계 U1): 공동편집 되돌리기 — 명령 위치 표(engine/collab-undo.ts)와 히스토리·호스트 배선.
+@@ -0,0 +1,431 @@
++// cc-rhwp(4단계 U1·U2): 공동편집 되돌리기 — 명령 위치 표(engine/collab-undo.ts)와 히스토리·호스트 배선.
 +//
 +// 명령 클래스(command.ts)와 CommandHistory 는 node 의 strip-only TS 로 실행할 수 없어(이 저장소의 undo 테스트
 +// 관례) 표는 필드 이름을 가진 평범한 객체로, 배선은 소스 가드로 검증한다. 표 대조 시험은 분류표 drift 검사와
@@ -2068,7 +2245,36 @@ index 00000000..5ef8f1d3
 +  DeleteSelectionCommand: ['fragment', 'snapshot', 'selection'],
 +  ApplyCharFormatCommand: ['start', 'end', 'entries'],
 +  ApplyParaFormatCommand: ['targets', 'cursorBefore'],
++  // U2 — 머리말·꼬리말은 위치 필드를 읽지 않는다(발자국이 구역 단위)
++  InsertTextInHeaderFooterCommand: ['target'],
++  InsertFieldInHeaderFooterCommand: ['target'],
++  DeleteTextInHeaderFooterCommand: ['target'],
++  SplitParagraphInHeaderFooterCommand: ['target'],
++  MergeParagraphInHeaderFooterCommand: ['target'],
++  InsertTextInFootnoteCommand: ['target'],
++  DeleteTextInFootnoteCommand: ['target'],
++  SplitParagraphInFootnoteCommand: ['target'],
++  MergeParagraphInFootnoteCommand: ['target'],
++  MoveTableCommand: ['sec', 'ppi', 'resultPpi'],
++  MovePictureCommand: ['sec', 'ppi', 'cellPath'],
++  MoveShapeCommand: ['sec', 'ppi', 'cellPath'],
++  ResizeObjectCommand: ['targets'],
++  MoveLineEndpointCommand: ['sec', 'ppi'],
++  SetObjectPropsCommand: ['ref'],
++  SetSectionPropsCommand: ['sectionIdx', 'cursorPos'],
++  SetZOrderCommand: ['sectionIdx', 'ppi', 'moves', 'cursorPos'],
++  SetSectionPropsAllCommand: ['sections', 'cursorPos'],
++  SetFormValueCommand: ['targets', 'pos'],
 +};
++
++/** 표가 읽는 보조 타입의 필드(타입 → 파일·필드). 명령이 들고 있는 대상·참조 객체의 모양이다. */
++const TYPE_FIELDS: Array<{ file: string; type: string; fields: string[] }> = [
++  { file: 'src/engine/command.ts', type: 'interface FootnoteEditTarget', fields: ['sectionIdx', 'paraIdx'] },
++  { file: 'src/engine/command.ts', type: 'type ObjectResizeTarget', fields: ['sec', 'ppi', 'cellPath'] },
++  { file: 'src/engine/command.ts', type: 'interface ZOrderMove', fields: ['ppi'] },
++  { file: 'src/engine/command.ts', type: 'interface FormValueTarget', fields: ['sec', 'para', 'inCell', 'tablePara', 'tableCi', 'cellIdx', 'cellPara'] },
++  { file: 'src/engine/object-props.ts', type: 'type ObjectPropsRef', fields: ['sec', 'ppi', 'cellPath', 'headerFooter', 'outerParaIdx'] },
++];
 +
 +test('표 대조: 표가 다루는 클래스는 표가 읽는 필드를 모두 선언하고, type 문자열이 표의 분기와 맞는다', () => {
 +  const tableClasses = Object.entries(COLLAB_UNDO_CLASSES).filter(([, v]) => v === 'table').map(([k]) => k).sort();
@@ -2079,7 +2285,24 @@ index 00000000..5ef8f1d3
 +    const type = body.match(/readonly type = '([^']+)'/)?.[1];
 +    assert.ok(type, `${cls} 의 type 이 없음`);
 +    // 표는 type 으로 분기한다 — 그 type 의 평범한 객체가 null 이 아니어야 한다
-+    assert.notEqual(describeCollabUndo({ type, position: body0(), start: body0(), end: body0(), fragment: null, snapshot: {}, sectionIdx: 0, startPara: 0, endPara: 0 }), null, `${cls}(${type}) 를 표가 모름`);
++    const sample = {
++      type, position: body0(), start: body0(), end: body0(), fragment: null, snapshot: {}, sectionIdx: 0, startPara: 0, endPara: 0,
++      target: { sectionIdx: 0, paraIdx: 1 }, sec: 0, ppi: 1, resultPpi: 1, targets: [{ sec: 0, ppi: 1, para: 1 }], ref: { sec: 0, ppi: 1 },
++      moves: [], sections: [{ idx: 0 }], cursorPos: body0(), pos: body0(),
++    };
++    assert.notEqual(describeCollabUndo(sample), null, `${cls}(${type}) 를 표가 모름`);
++  }
++  // SetSectionPropsAll 의 구역 목록 원소는 idx 를 가진다
++  assert.match(commandClasses.get('SetSectionPropsAllCommand')!, /sections:\s*Array<\{\s*idx:\s*number/);
++});
++
++test('표 대조: 명령이 들고 있는 대상·참조 타입이 표가 읽는 필드를 선언한다', () => {
++  for (const { file, type, fields } of TYPE_FIELDS) {
++    const src = source(file);
++    const at = src.indexOf(`export ${type}`);
++    assert.ok(at >= 0, `${file}: ${type} 이 없음`);
++    const body = balancedFrom(src.slice(at), type, '{');
++    for (const f of fields) assert.match(body, new RegExp(`\\b${f}\\??\\s*:`), `${type}.${f} 선언이 없음`);
 +  }
 +});
 +
@@ -2108,17 +2331,15 @@ index 00000000..5ef8f1d3
 +  assert.equal(describeCollabUndo({ type: 'deleteText', position: body0(), fragmentId: 3 })!.store, 'fragment');
 +});
 +
-+test('셀 위치: 표를 품은 문단·칸 문단을 함께 쓰고(paragraphIndex·cellPath 포함), 중첩 셀·캡션은 옮길 수 없음', () => {
++test('셀 위치: 표를 품은 문단·칸 문단을 함께 쓰고(paragraphIndex·cellPath 포함), 캡션은 옮길 수 없음', () => {
 +  const cmd = { type: 'splitParagraphInCell', position: cell1() };
 +  const d = describeCollabUndo(cmd)!;
-+  assert.deepEqual(d.slots[0].get(), { section: 0, para: 2, offset: 3, bias: undefined, cell: { control: 0, cell: 4, cellPara: 1 } });
++  assert.deepEqual(d.slots[0].get(), { section: 0, para: 2, offset: 3, bias: undefined, cell: { control: 0, cell: 4, cellPara: 1 }, cellPath: [{ control: 0, cell: 4, cellPara: 1 }] });
 +  d.slots[0].set({ section: 0, para: 6, offset: 3, cell: { control: 0, cell: 4, cellPara: 2 } });
 +  assert.equal(cmd.position.parentParaIndex, 6);
 +  assert.equal(cmd.position.cellParaIndex, 2);
 +  assert.equal(cmd.position.paragraphIndex, 2);
 +  assert.deepEqual(cmd.position.cellPath, [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 2 }]);
-+  const nested = { ...cell1(), cellPath: [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 1 }, { controlIndex: 0, cellIndex: 0, cellParaIndex: 0 }] };
-+  assert.equal(describeCollabUndo({ type: 'splitParagraphInCell', position: nested })!.slots[0].get(), null);
 +  const caption = { ...cell1(), cellIndex: 65534, cellPath: [{ controlIndex: 0, cellIndex: 65534, cellParaIndex: 0 }] };
 +  assert.equal(describeCollabUndo({ type: 'insertText', position: caption, fragmentIds: [] })!.slots[0].get(), null);
 +});
@@ -2167,10 +2388,112 @@ index 00000000..5ef8f1d3
 +  assert.deepEqual(targets[2].path, [{ controlIndex: 0, cellIndex: 2, cellParaIndex: 3 }]);
 +});
 +
-+test('표에 없는 명령(스냅샷·머리말·개체·구역 등)은 null — 플러그인이 3.2-3 으로 다룬다', () => {
-+  for (const type of ['snapshot:paste', 'snapshot:createTable', 'insertTextInHeaderFooter', 'moveTable', 'setSectionProps', 'setCellBorderFill', 'setFormValue', 'unknownFuture']) {
++test('표에 없는 명령(스냅샷·셀 테두리·새 명령)과 위치를 못 읽는 명령은 null — 플러그인이 3.2-3 으로 다룬다', () => {
++  for (const type of ['snapshot:paste', 'snapshot:createTable', 'setCellBorderFill', 'unknownFuture']) {
++    assert.equal(describeCollabUndo({ type, sec: 0, ppi: 1, sectionIdx: 0, cursorPos: body0() }), null, type);
++  }
++  // U2 명령도 위치 필드가 없으면(업스트림이 모양을 바꿈) 표 밖
++  for (const type of ['moveTable', 'moveShape', 'setSectionProps', 'setFormValue', 'insertTextInFootnote', 'setObjectProps', 'resizeObject']) {
 +    assert.equal(describeCollabUndo({ type }), null, type);
 +  }
++});
++
++// ── U2 표 동작 ───────────────────────────────────────────────────────
++
++test('중첩 셀 위치: 경로 전체를 읽고 쓰며, 평면 필드는 가리키던 쪽(안쪽·바깥쪽)을 따른다', () => {
++  const pos = {
++    sectionIndex: 0, paragraphIndex: 1, charOffset: 4, parentParaIndex: 2, controlIndex: 0, cellIndex: 4, cellParaIndex: 3,
++    cellPath: [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 3 }, { controlIndex: 1, cellIndex: 0, cellParaIndex: 1 }],
++  };
++  const cmd = { type: 'splitParagraphInCell', position: pos };
++  const d = describeCollabUndo(cmd)!;
++  assert.deepEqual(d.slots[0].get(), {
++    section: 0, para: 2, offset: 4, bias: undefined, cell: null,
++    cellPath: [{ control: 0, cell: 4, cellPara: 3 }, { control: 1, cell: 0, cellPara: 1 }],
++  });
++  // 바깥 칸 문단 3→5, 안쪽 칸 문단 1→2
++  d.slots[0].set({ section: 0, para: 2, offset: 4, cellPath: [{ control: 0, cell: 4, cellPara: 5 }, { control: 1, cell: 0, cellPara: 2 }] });
++  assert.deepEqual(pos.cellPath, [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 5 }, { controlIndex: 1, cellIndex: 0, cellParaIndex: 2 }]);
++  assert.equal(pos.paragraphIndex, 2, 'paragraphIndex 는 안쪽 칸 문단');
++  assert.equal(pos.cellParaIndex, 5, '평면 cellParaIndex 는 바깥 값을 가리키고 있었다');
++  // 글자 서식의 중첩 경로 기록
++  const c = { type: 'applyCharFormat', start: pos, end: pos, entries: [{ paraIndex: 2, cellPathJson: JSON.stringify(pos.cellPath) }] };
++  const cd = describeCollabUndo(c)!;
++  assert.equal(cd.slots[2].get()!.cellPath!.length, 2);
++  cd.slots[2].set({ section: 0, para: 2, offset: 0, cellPath: [{ control: 0, cell: 4, cellPara: 5 }, { control: 1, cell: 0, cellPara: 7 }] });
++  assert.equal(JSON.parse(c.entries[0].cellPathJson)[1].cellParaIndex, 7);
++  assert.equal(c.entries[0].paraIndex, 7);
++  // 중간 단계가 캡션(가상 칸)이면 옮길 수 없음
++  const viaCaption = { ...pos, cellPath: [{ controlIndex: 0, cellIndex: 65534, cellParaIndex: 0 }, { controlIndex: 1, cellIndex: 0, cellParaIndex: 1 }] };
++  assert.equal(describeCollabUndo({ type: 'splitParagraphInCell', position: viaCaption })!.slots[0].get(), null);
++});
++
++test('머리말·꼬리말: 위치 자리 없음(구역 단위 발자국이 막힘을 정함), 각주: 각주를 품은 본문 문단', () => {
++  const hf = describeCollabUndo({ type: 'insertTextInHeaderFooter', target: { sectionIdx: 0, isHeader: true, applyTo: 0 }, paraIdx: 0, charOffset: 2 })!;
++  assert.deepEqual([hf.slots.length, hf.store], [0, 'none']);
++  const target = { sectionIdx: 0, paraIdx: 4, controlIdx: 1, footnoteIndex: 0, pageNum: 0 };
++  const fnA = describeCollabUndo({ type: 'insertTextInFootnote', target, innerParaIdx: 0, charOffset: 1 })!;
++  const fnB = describeCollabUndo({ type: 'splitParagraphInFootnote', target, innerParaIdx: 0, charOffset: 1 })!;
++  assert.deepEqual(fnA.slots[0].get(), { section: 0, para: 4, offset: 0 });
++  // 같은 대상 객체를 공유하는 명령은 같은 자리(key, field) — 플러그인이 한 번만 옮긴다
++  assert.equal(fnA.slots[0].key, fnB.slots[0].key);
++  assert.equal(fnA.slots[0].field, fnB.slots[0].field);
++  fnA.slots[0].set({ section: 0, para: 6, offset: 0 });
++  assert.equal(target.paraIdx, 6);
++});
++
++test('개체: 이동·크기·속성 — 본문 문단 또는 셀 경로(키 철자 그대로), 머리말 그림은 바깥 문단만', () => {
++  const mt = { type: 'moveTable', sec: 0, ppi: 3, ci: 0, resultPpi: 4, resultCi: 0 };
++  const md = describeCollabUndo(mt)!;
++  md.slots.forEach((s) => s.set({ section: 0, para: s.get()!.para + 2, offset: 0 }));
++  assert.deepEqual([mt.ppi, mt.resultPpi], [5, 6]);
++  // 셀 안 그림 이동(CellPathSegment 철자)
++  const mp = { type: 'movePicture', sec: 0, ppi: 2, ci: 1, cellPath: [{ controlIdx: 0, cellIdx: 3, cellParaIdx: 1 }] };
++  const pd = describeCollabUndo(mp)!;
++  assert.deepEqual(pd.slots[0].get(), { section: 0, para: 2, offset: 0, bias: undefined, cell: { control: 0, cell: 3, cellPara: 1 }, cellPath: [{ control: 0, cell: 3, cellPara: 1 }] });
++  pd.slots[0].set({ section: 0, para: 3, offset: 0, cellPath: [{ control: 0, cell: 3, cellPara: 2 }] });
++  assert.deepEqual([mp.ppi, mp.cellPath], [3, [{ controlIdx: 0, cellIdx: 3, cellParaIdx: 2 }]]);
++  // 크기 조절: 대상마다
++  const rz = { type: 'resizeObject', targets: [{ sec: 0, ppi: 1, ci: 0, type: 'image' }, { sec: 0, ppi: 2, ci: 0, type: 'shape' }] };
++  assert.equal(describeCollabUndo(rz)!.slots.length, 2);
++  // 속성: 본문·머리말
++  const body = { type: 'setObjectProps', ref: { sec: 0, ppi: 5, ci: 0, type: 'image' } };
++  assert.deepEqual(describeCollabUndo(body)!.slots[0].get(), { section: 0, para: 5, offset: 0 });
++  const ref = { sec: 0, ppi: 0, ci: 0, type: 'image', headerFooter: { kind: 'header', outerParaIdx: 1, outerControlIdx: 2 } };
++  const hd = describeCollabUndo({ type: 'setObjectProps', ref })!;
++  assert.deepEqual(hd.slots[0].get(), { section: 0, para: 1, offset: 0 });
++  hd.slots[0].set({ section: 0, para: 3, offset: 0 });
++  assert.deepEqual([ref.headerFooter.outerParaIdx, ref.ppi], [3, 0], '머리말 안 문단(ref.ppi)은 그대로');
++  assert.equal(describeCollabUndo({ type: 'moveLineEndpoint', sec: 0, ppi: 7, ci: 0 })!.slots[0].get()!.para, 7);
++});
++
++test('구역 설정·z 순서: 구역 원본 저널(store section) — 되돌리기가 복원하는 구역과 z 이동 목록의 문단', () => {
++  const sp = describeCollabUndo({ type: 'setSectionProps', sectionIdx: 1, cursorPos: body0() })!;
++  assert.deepEqual([sp.store, sp.sections], ['section', [1]]);
++  assert.ok(sp.slots.every((s) => s.caret), '구역 설정은 캐럿 자리만');
++  // SetSectionPropsAllCommand 도 type 이 'setSectionProps' — 구역 목록으로 가른다
++  const all = describeCollabUndo({ type: 'setSectionProps', sections: [{ idx: 0 }, { idx: 1 }], cursorPos: body0() })!;
++  assert.deepEqual([all.store, all.sections], ['section', [0, 1]]);
++  const moves = [{ ppi: 2, ci: 0, before: 1, after: 3 }, { ppi: 4, ci: 1, before: 3, after: 1 }];
++  const z = { type: 'changeZOrder', sectionIdx: 0, ppi: 2, ci: 0, operation: 'front', moves, cursorPos: body0() };
++  const zd = describeCollabUndo(z)!;
++  assert.deepEqual([zd.store, zd.sections], ['section', [0]]);
++  const moveSlots = zd.slots.filter((s) => moves.includes(s.key as (typeof moves)[number]));
++  assert.equal(moveSlots.length, 2);
++  moveSlots.forEach((s) => s.set({ section: 0, para: s.get()!.para + 1, offset: 0 }));
++  assert.deepEqual(moves.map((m) => m.ppi), [3, 5]);
++});
++
++test('양식 값: 본문 (구역, 문단)·셀 (표 문단, 칸 문단)', () => {
++  const inCell = { tablePara: 3, tableCi: 0, cellIdx: 2, cellPara: 1 };
++  const cmd = { type: 'setFormValue', targets: [{ sec: 0, para: 2, ci: 1 }, { sec: 0, para: 1, ci: 0, inCell }], pos: body0() };
++  const d = describeCollabUndo(cmd)!;
++  assert.equal(d.slots.length, 3);
++  assert.deepEqual(d.slots[1].get(), { section: 0, para: 3, offset: 0, bias: undefined, cell: { control: 0, cell: 2, cellPara: 1 }, cellPath: [{ control: 0, cell: 2, cellPara: 1 }] });
++  d.slots[0].set({ section: 0, para: 4, offset: 0 });
++  d.slots[1].set({ section: 0, para: 5, offset: 0, cell: { control: 0, cell: 2, cellPara: 2 } });
++  assert.equal(cmd.targets[0].para, 4);
++  assert.deepEqual([inCell.tablePara, inCell.cellPara], [5, 2]);
 +});
 +
 +// ── 히스토리 배선 (소스 가드) ─────────────────────────────────────────

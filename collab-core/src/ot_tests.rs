@@ -640,13 +640,86 @@ fn footprint_of_a_command_is_the_paragraphs_it_left_changed() {
     // 셀
     assert_eq!(fp(&[cell_ins(2, 0, 1, 1, 0, "x")]), (vec![(2, Some(1))], false, false));
     assert_eq!(fp(&[op("applyCharFormatInCell", json!([0, 2, 0, 1, 0, 0, 1, "{}"]))]), (vec![(2, Some(0))], false, false));
-    // 결과 전송·구조(발자국 없음)·역할 없는 neutral → whole
+    // 결과 전송·구역을 모르는 neutral → whole, 발자국 없는 구조(구역은 앎) → 구역 단위 자리(U2)
     assert!(fp(&[state()]).1);
-    assert!(fp(&[op("createTable", json!([0, 7, 0, 2, 2]))]).1);
     assert!(fp(&[op("updateStyle", json!([1, "{}"]))]).1);
-    // 중첩 셀
-    let nested = json!({ "kind": "op", "m": "insertTextInCellByPath", "a": [0, 2, "[{\"controlIndex\":0,\"cellIndex\":1,\"cellParaIndex\":0},{\"controlIndex\":0,\"cellIndex\":0,\"cellParaIndex\":0}]", 0, "x"], "meta": { "len": 1 } });
-    assert!(fp(&[nested]).2);
+    let t = footprint(&[op("createTable", json!([0, 7, 0, 2, 2]))], &cat4());
+    assert_eq!((t["whole"].clone(), t["items"][0]["scope"].clone()), (json!(false), json!("section")));
+    // 중첩 셀(U2): 경로 자리
+    let nested = json!({ "kind": "op", "m": "insertTextInCellByPath", "a": [0, 2, "[{\"controlIndex\":0,\"cellIndex\":1,\"cellParaIndex\":0},{\"controlIndex\":0,\"cellIndex\":0,\"cellParaIndex\":3}]", 0, "x"], "meta": { "len": 1 } });
+    let n = footprint(&[nested], &cat4());
+    assert_eq!((n["whole"].clone(), n["nested"].clone()), (json!(false), json!(false)));
+    assert_eq!(n["items"][0]["para"], json!(2));
+    assert_eq!(n["items"][0]["cellPath"], json!([{ "control": 0, "cell": 1, "cellPara": 0 }, { "control": 0, "cell": 0, "cellPara": 3 }]));
+}
+
+// ── 4단계 U2: 중첩 셀 경로·구역 단위 자리 ───────────────────────────────────────
+
+fn npos(pp: usize, steps: &[(usize, usize, usize)], o: usize) -> Value {
+    json!({ "section": 0, "para": pp, "offset": o, "cellPath": steps.iter().map(|&(c, l, p)| json!({ "control": c, "cell": l, "cellPara": p })).collect::<Vec<_>>() })
+}
+fn path_ins(pp: usize, steps: &[(usize, usize, usize)], o: usize, t: &str) -> Value {
+    let path: Vec<Value> = steps.iter().map(|&(c, l, p)| json!({ "controlIndex": c, "cellIndex": l, "cellParaIndex": p })).collect();
+    json!({ "kind": "op", "m": "insertTextInCellByPath", "a": [0, pp, Value::Array(path).to_string(), o, t], "meta": { "len": t.chars().count() } })
+}
+fn path_split(pp: usize, steps: &[(usize, usize, usize)], o: usize) -> Value {
+    let path: Vec<Value> = steps.iter().map(|&(c, l, p)| json!({ "controlIndex": c, "cellIndex": l, "cellParaIndex": p })).collect();
+    json!({ "kind": "op", "m": "splitParagraphInCellByPath", "a": [0, pp, Value::Array(path).to_string(), o, Value::Null], "meta": {} })
+}
+fn cat_u2() -> Value {
+    let mut c = cat4();
+    c["splitParagraphInCellByPath"] = json!({ "conc": "text", "section": 0 });
+    c["setSectionDef"] = json!({ "conc": "neutral", "section": 0, "roles": [] });
+    c["insertTextInHeaderFooter"] = json!({ "conc": "structural", "section": 0, "roles": [] });
+    c
+}
+fn mpn(recs: &[Value], item: Value) -> Value {
+    map_positions(recs, &cat_u2(), &[item])[0].clone()
+}
+
+#[test]
+fn undo_positions_in_nested_cells() {
+    // 바깥 표(문단 2, 개체 0, 칸 1) 칸 문단 3 에 안쪽 표(개체 0, 칸 0), 그 칸 문단 1 의 글자 4
+    let me = npos(2, &[(0, 1, 3), (0, 0, 1)], 4);
+    // 같은 안쪽 칸·같은 칸 문단 입력 → touched, 다른 칸 문단 → 없음
+    assert_eq!(mpn(&[path_ins(2, &[(0, 1, 3), (0, 0, 1)], 0, "x")], me.clone())["hit"], json!("touched"));
+    assert_eq!(mpn(&[path_ins(2, &[(0, 1, 3), (0, 0, 0)], 0, "x")], me.clone())["hit"], Value::Null);
+    // 안쪽 칸의 앞 문단에서 Enter → 칸 문단 번호만 밀림
+    let out = mpn(&[path_split(2, &[(0, 1, 3), (0, 0, 0)], 0)], me.clone());
+    assert_eq!((out["cellPath"][1]["cellPara"].clone(), out["hit"].clone()), (json!(2), Value::Null));
+    // 바깥 칸에서 안쪽 표를 품은 문단(3)보다 앞 문단(1)을 나눔 → 바깥 단계의 칸 문단이 4 로
+    let out = mpn(&[path_split(2, &[(0, 1, 1)], 0)], me.clone());
+    assert_eq!((out["cellPath"][0]["cellPara"].clone(), out["hit"].clone()), (json!(4), Value::Null));
+    // 바깥 칸에서 안쪽 표를 품은 문단 자체를 나눔 → touched
+    assert_eq!(mpn(&[path_split(2, &[(0, 1, 3)], 0)], me.clone())["hit"], json!("touched"));
+    // 바깥 칸의 다른 문단 입력·다른 칸 → 없음
+    assert_eq!(mpn(&[path_ins(2, &[(0, 1, 0)], 0, "x")], me.clone())["hit"], Value::Null);
+    assert_eq!(mpn(&[path_ins(2, &[(0, 2, 3)], 0, "x")], me.clone())["hit"], Value::Null);
+    // 본문 앞 문단 Enter → 바깥 표 문단만 밀림
+    let out = mpn(&[split(0, 0)], me.clone());
+    assert_eq!((out["para"].clone(), out["hit"].clone()), (json!(3), Value::Null));
+    // 안쪽 칸 문단 안의 더 깊은 표 편집 → touched
+    assert_eq!(mpn(&[path_ins(2, &[(0, 1, 3), (0, 0, 1), (0, 0, 0)], 0, "x")], me.clone())["hit"], json!("touched"));
+}
+
+#[test]
+fn section_scope_items_are_hit_only_by_section_level_edits() {
+    let hf = json!({ "section": 0, "scope": "section" });
+    // 같은 구역 본문 글자 → 없음(머리말 되돌리기는 본문 입력에 막히지 않는다)
+    assert_eq!(mpn(&[ins(3, 0, "x"), split(1, 0)], hf.clone())["hit"], Value::Null);
+    // 같은 구역 구조(머리말 편집 포함) → structural
+    assert_eq!(mpn(&[op("insertTextInHeaderFooter", json!([0, true, 0, 0, 0, "x"]))], hf.clone())["hit"], json!("structural"));
+    // 문단을 특정할 수 없는 서식(구역 정의) → touched, 문단 서식 → 없음
+    assert_eq!(mpn(&[op("setSectionDef", json!([0, "{}"]))], hf.clone())["hit"], json!("touched"));
+    assert_eq!(mpn(&[op("applyParaFormat", json!([0, 2, "{}"]))], hf.clone())["hit"], Value::Null);
+    // 다른 구역 → 없음, state → whole
+    assert_eq!(mpn(&[op("insertTextInHeaderFooter", json!([1, true, 0, 0, 0, "x"]))], hf.clone())["hit"], Value::Null);
+    assert_eq!(mpn(&[state()], hf.clone())["hit"], json!("whole"));
+    // 발자국: 머리말 글자 = 구역 단위, 구역 정의 = 구역 단위
+    let f = footprint(&[op("insertTextInHeaderFooter", json!([0, true, 0, 0, 0, "x"]))], &cat_u2());
+    assert_eq!((f["whole"].clone(), f["items"][0]["scope"].clone()), (json!(false), json!("section")));
+    let f = footprint(&[op("setSectionDef", json!([0, "{}"]))], &cat_u2());
+    assert_eq!(f["items"][0]["scope"], json!("section"));
 }
 
 #[test]
@@ -710,4 +783,42 @@ fn set_char_shape_runs_with_paragraph_footprint_moves_and_conflicts_by_paragraph
     let out = rebase(&[runs(3)], &[ins(3, 0, "x")], &c, &Value::Null);
     assert_eq!(out["dropped"], json!([0]));
     assert!(out["fastRemote"].is_null());
+}
+
+#[test]
+fn section_all_guard_is_hit_by_any_record_in_that_section() {
+    // 구역 원본 저널(구역 설정·z 순서 되돌리기)의 지킴: 그 구역의 어떤 기록이든 막는다 — 글자 입력도
+    let g = json!({ "section": 0, "scope": "sectionAll" });
+    assert_eq!(mpn(&[ins(3, 0, "x")], g.clone())["hit"], json!("section"));
+    assert_eq!(mpn(&[op("applyParaFormat", json!([0, 2, "{}"]))], g.clone())["hit"], json!("section"));
+    assert_eq!(mpn(&[path_ins(2, &[(0, 0, 0)], 0, "x")], g.clone())["hit"], json!("section"));
+    // 다른 구역 → 없음, 구역을 모르는 기록·state → 막음
+    let other = json!({ "kind": "op", "m": "insertText", "a": [1, 0, 0, "x"], "meta": { "len": 1 } });
+    assert_eq!(mpn(&[other], g.clone())["hit"], Value::Null);
+    assert_eq!(mpn(&[op("updateStyle", json!([1, "{}"]))], g.clone())["hit"], json!("section"));
+    assert_eq!(mpn(&[state()], g.clone())["hit"], json!("whole"));
+    // 모양은 그대로 돌아온다
+    assert_eq!(mpn(&[], g)["scope"], json!("sectionAll"));
+}
+
+#[test]
+fn cell_object_properties_footprint_is_the_cell_paragraph() {
+    // 셀 안 그림 속성(경로 형식, 키 철자 두 가지) → 그 그림을 품은 칸 문단 자리
+    let mut c = cat_u2();
+    c["setCellPicturePropertiesByPath"] = json!({ "conc": "neutral", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] });
+    for path in [
+        r#"[{"controlIndex":0,"cellIndex":1,"cellParaIndex":2}]"#,
+        r#"[{"controlIdx":0,"cellIdx":1,"cellParaIdx":2}]"#,
+    ] {
+        let rec = json!({ "kind": "op", "m": "setCellPicturePropertiesByPath", "a": [0, 4, path, 1, "{}"], "meta": {} });
+        let f = footprint(std::slice::from_ref(&rec), &c);
+        assert_eq!(f["items"][0]["cellPath"], json!([{ "control": 0, "cell": 1, "cellPara": 2 }]), "{path}");
+        assert_eq!(f["items"][0]["para"], json!(4));
+        // 남이 같은 칸 문단에 입력(그림을 지울 수도 있다) → touched, 다른 칸 문단 → 없음
+        let me = f["items"][0].clone();
+        let hit = map_positions(&[path_ins(4, &[(0, 1, 2)], 0, "x")], &c, std::slice::from_ref(&me))[0]["hit"].clone();
+        assert_eq!(hit, json!("touched"));
+        let miss = map_positions(&[path_ins(4, &[(0, 1, 0)], 0, "x")], &c, &[me])[0]["hit"].clone();
+        assert_eq!(miss, Value::Null);
+    }
 }

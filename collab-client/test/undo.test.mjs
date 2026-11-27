@@ -275,3 +275,198 @@ test('버려진 합침(문단 수 −) 뒤: 뒤 문단의 오래된 명령 위�
   assert.equal(paragraphs(r.a.doc)[5 + pd], 'p5OLD');
   converged(r);
 });
+
+// ── 4단계 U2: 중첩 셀·머리말·각주·개체·구역 ─────────────────────────────
+
+const steps = (list) => list.map(([c, l, p]) => ({ controlIndex: c, cellIndex: l, cellParaIndex: p }));
+/** 셀 안 위치(DocumentPosition 모양, 중첩이면 cellPath 깊이 2 이상) */
+const cellPos = (pp, list, off) => {
+  const path = steps(list);
+  return { sectionIndex: 0, paragraphIndex: path.at(-1).cellParaIndex, charOffset: off, parentParaIndex: pp, controlIndex: path[0].controlIndex, cellIndex: path[0].cellIndex, cellParaIndex: path.at(-1).cellParaIndex, cellPath: path };
+};
+const insertInCell = (position, text) => ({
+  type: 'insertText', position, text, fragmentIds: [],
+  execute(doc) { const p = this.position; doc.insertTextInCellByPath(0, p.parentParaIndex, JSON.stringify(p.cellPath), p.charOffset, this.text); },
+  undo(doc) { const p = this.position; doc.deleteTextInCellByPath(0, p.parentParaIndex, JSON.stringify(p.cellPath), p.charOffset, [...this.text].length); },
+});
+const cellText = (doc, pp, list) => doc.getTextInCellByPath(0, pp, JSON.stringify(steps(list)), 0, 100);
+
+/** 문단 0 "p0", 문단 1 에 표(1×2), 그 칸 0 의 문단 0 "x"·문단 1 에 안쪽 표(1×2). 모두 받은 뒤 시작한다. */
+function nestedRoom() {
+  const r = room(1);
+  const d = r.a.doc;
+  d.createTable(0, 0, 2, 1, 2);
+  d.insertTextInCell(0, 1, 0, 0, 0, 0, 'x');
+  d.splitParagraphInCell(0, 1, 0, 0, 0, 1);
+  d.createTableInCellByPath(0, 1, JSON.stringify(steps([[0, 0, 1]])), 0, JSON.stringify({ rows: 1, cols: 2 }));
+  d.insertTextInCellByPath(0, 1, JSON.stringify(steps([[0, 0, 1], [0, 1, 0]])), 0, 'q');
+  r.server.drain(r.all);
+  r.a.history.hook.settled();
+  r.a.history.controller().clear();
+  r.b.history.controller().clear();
+  return r;
+}
+
+test('U2 중첩 셀: 바깥 칸의 앞 문단에서 남이 Enter → 바깥 단계 칸 문단만 옮겨 내 글자를 지운다', () => {
+  const r = nestedRoom();
+  r.a.history.execute(insertInCell(cellPos(1, [[0, 0, 1], [0, 0, 0]], 0), 'AAA'));
+  r.server.drain(r.all);
+  // B: 바깥 칸 0 의 문단 0("x") 끝에서 Enter → 안쪽 표를 품은 문단이 1 → 2
+  r.b.doc.splitParagraphInCell(0, 1, 0, 0, 0, 1);
+  r.server.drain(r.all);
+  assert.equal(cellText(r.a.doc, 1, [[0, 0, 2], [0, 0, 0]]), 'AAA', '옮겨진 자리에 내 글자');
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.equal(cellText(r.a.doc, 1, [[0, 0, 2], [0, 0, 0]]), '');
+  assert.equal(cellText(r.a.doc, 1, [[0, 0, 2], [0, 1, 0]]), 'q', '남의 칸 글자는 그대로');
+  assert.deepEqual(r.a.history.undoStack, []);
+});
+
+test('U2 중첩 셀: 같은 안쪽 칸 문단을 남이 고치면 막힘, 다른 안쪽 칸이면 되돌려짐', () => {
+  const r = nestedRoom();
+  r.a.history.execute(insertInCell(cellPos(1, [[0, 0, 1], [0, 0, 0]], 0), 'A'));
+  r.server.drain(r.all);
+  r.b.doc.insertTextInCellByPath(0, 1, JSON.stringify(steps([[0, 0, 1], [0, 0, 0]])), 1, 'B');
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  converged(r);
+  const s = nestedRoom();
+  s.a.history.execute(insertInCell(cellPos(1, [[0, 0, 1], [0, 0, 0]], 0), 'A'));
+  s.server.drain(s.all);
+  s.b.doc.insertTextInCellByPath(0, 1, JSON.stringify(steps([[0, 0, 1], [0, 1, 0]])), 0, 'B');
+  s.server.drain(s.all);
+  assert.equal(s.a.history.undo(), 'ok');
+  converged(s);
+  assert.deepEqual([cellText(s.a.doc, 1, [[0, 0, 1], [0, 0, 0]]), cellText(s.a.doc, 1, [[0, 0, 1], [0, 1, 0]])], ['', 'Bq']);
+});
+
+/** 머리말 글자 입력(studio InsertTextInHeaderFooterCommand 모양) */
+const hfInsert = (paraIdx, charOffset, text) => ({
+  type: 'insertTextInHeaderFooter', target: { sectionIdx: 0, isHeader: true, applyTo: 0, previewPage: 0 }, paraIdx, charOffset, text,
+  execute(doc) { doc.insertTextInHeaderFooter(0, true, 0, this.paraIdx, this.charOffset, this.text); },
+  undo(doc) { doc.deleteTextInHeaderFooter(0, true, 0, this.paraIdx, this.charOffset, [...this.text].length); },
+});
+const headerText = (doc) => JSON.parse(doc.getHeaderFooter(0, true, 0)).text;
+
+test('U2 머리말: 남의 본문 편집(Enter 포함)은 막지 않고, 남의 머리말 편집은 막는다', () => {
+  const r = room();
+  r.a.doc.createHeaderFooter(0, true, 0);
+  r.server.drain(r.all);
+  r.a.history.hook.settled();
+  r.a.history.execute(hfInsert(0, 0, 'AH'));
+  r.server.drain(r.all);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.b.history.execute(insertText(3, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.equal(headerText(r.a.doc), '');
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'Bp2', 'p3']);
+  // 남이 머리말을 고친 뒤 → 막힘
+  r.a.history.execute(hfInsert(0, 0, 'A'));
+  r.server.drain(r.all);
+  r.b.doc.insertTextInHeaderFooter(0, true, 0, 0, 1, 'b');
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  converged(r);
+  assert.equal(headerText(r.a.doc), 'Ab');
+});
+
+/** 각주 글자 입력(studio InsertTextInFootnoteCommand 모양) — 대상은 각주를 품은 본문 문단 */
+const fnInsert = (target, innerParaIdx, charOffset, text) => ({
+  type: 'insertTextInFootnote', target, innerParaIdx, charOffset, text,
+  execute(doc) { doc.insertTextInFootnote(0, this.target.paraIdx, this.target.controlIdx, this.innerParaIdx, this.charOffset, this.text); },
+  undo(doc) { doc.deleteTextInFootnote(0, this.target.paraIdx, this.target.controlIdx, this.innerParaIdx, this.charOffset, [...this.text].length); },
+});
+
+test('U2 각주: 앞 문단에서 남이 Enter → 각주를 품은 문단을 옮겨 되돌린다, 같은 문단을 고치면 막힘', () => {
+  const r = room();
+  const fn = JSON.parse(r.a.doc.insertFootnote(0, 2, 2));
+  r.server.drain(r.all);
+  r.a.history.hook.settled();
+  const target = { sectionIdx: 0, paraIdx: fn.paraIdx, controlIdx: fn.controlIdx, footnoteIndex: 0, pageNum: 0 };
+  const fnText = (doc) => JSON.parse(doc.getFootnoteInfo(0, 3, fn.controlIdx)).texts.join('');
+  r.a.history.execute(fnInsert(target, 0, 0, 'AF'));
+  r.server.drain(r.all);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.server.drain(r.all);
+  assert.equal(target.paraIdx, 3, '각주 문단이 옮겨짐');
+  assert.match(fnText(r.b.doc), /^AF/);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  for (const c of r.all) assert.doesNotMatch(fnText(c.doc), /AF/, `${c.id}: 내 각주 글자만 빠짐`);
+  assert.deepEqual(paragraphs(r.a.doc).slice(0, 2), ['p', '0'], 'B 의 Enter 는 남음');
+  // 같은 문단을 남이 고치면 막힘
+  r.a.history.execute(fnInsert(target, 0, 0, 'Z'));
+  r.server.drain(r.all);
+  r.b.history.execute(insertText(3, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  converged(r);
+});
+
+/** 표 이동(studio MoveTableCommand 모양) */
+const moveTable = (ppi, ci, dH, dV) => ({
+  type: 'moveTable', sec: 0, ppi, ci, deltaH: dH, deltaV: dV, resultPpi: ppi, resultCi: ci,
+  execute(doc) { const r = JSON.parse(doc.moveTableOffset(0, this.ppi, this.ci, this.deltaH, this.deltaV)); this.resultPpi = r.ppi; this.resultCi = r.ci; },
+  undo(doc) { const r = JSON.parse(doc.moveTableOffset(0, this.resultPpi, this.resultCi, -this.deltaH, -this.deltaV)); this.ppi = r.ppi; this.ci = r.ci; },
+});
+
+const tableOffset = (doc, ppi) => {
+  const t = JSON.parse(doc.getTableProperties(0, ppi, 0));
+  return [t.horzOffset, t.vertOffset];
+};
+
+test('U2 개체: 표 이동 뒤 남이 앞 문단에서 Enter → 옮겨진 표를 되돌린다(내 이동만 빠짐)', () => {
+  const r = room(2);
+  r.a.doc.createTable(0, 1, 2, 1, 1);
+  r.server.drain(r.all);
+  r.a.history.hook.settled();
+  const count = r.a.doc.getParagraphCount(0);
+  r.a.history.execute(moveTable(2, 0, 300, 400));
+  r.server.drain(r.all);
+  assert.deepEqual(tableOffset(r.b.doc, 2), [300, 400]);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  // 표는 문단 3 으로 옮겨졌고 오프셋은 원래대로, B 의 Enter 는 남음
+  for (const c of r.all) assert.deepEqual(tableOffset(c.doc, 3), [0, 0], `${c.id}: 내 이동만 빠짐`);
+  assert.equal(r.a.doc.getParagraphCount(0), count + 1);
+  // 표를 품은 문단을 남이 고치면 막힘
+  r.a.history.execute(moveTable(3, 0, 100, 0));
+  r.server.drain(r.all);
+  r.b.history.execute(insertText(3, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  converged(r);
+});
+
+/** 구역 설정(studio SetSectionPropsCommand 모양 — 구역 원본 저널) */
+const sectionProps = (doc, change) => {
+  const before = JSON.parse(doc.getSectionDef(0));
+  return {
+    type: 'setSectionProps', sectionIdx: 0, before, after: { ...before, ...change }, cursorPos: pos(0, 0), captureId: null,
+    execute(d) { this.captureId = d.captureSectionRaw(0); d.setSectionDef(0, JSON.stringify(this.after)); },
+    undo(d) { d.setSectionDef(0, JSON.stringify(this.before)); d.restoreSectionRaw(this.captureId); this.captureId = null; },
+  };
+};
+
+test('U2 구역 설정: 같은 구역에 남의 기록이 하나라도 오면 막힘(저널 계약), 없으면 되돌려짐', () => {
+  // 저널 복원(restoreSectionRaw)은 구역 원본 바이트를 되살린다 — 사이에 남의 편집이 끼면 저장 때 그 편집이 사라진다
+  const r = room();
+  const before = r.a.doc.getSectionDef(0);
+  r.a.history.execute(sectionProps(r.a.doc, { columnSpacing: 2000 }));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  for (const c of r.all) assert.equal(c.doc.getSectionDef(0), before, `${c.id}: 구역 정의가 원래대로`);
+  // 다른 문단의 글자 입력이어도 같은 구역이면 막는다
+  r.a.history.execute(sectionProps(r.a.doc, { columnSpacing: 3000 }));
+  r.server.drain(r.all);
+  r.b.history.execute(insertText(3, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  converged(r);
+  assert.equal(JSON.parse(r.a.doc.getSectionDef(0)).columnSpacing, 3000);
+});

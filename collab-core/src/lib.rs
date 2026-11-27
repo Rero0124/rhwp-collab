@@ -78,6 +78,8 @@ mod tests;
 struct Snapshot {
     document: Document,
     text_reflowed_table_paths: HashSet<RenderPath>,
+    /// 뜰 때의 `CollabCore::state_loads` — 그 뒤 결과 적재가 있었는지(D4 판정의 정규화)
+    state_loads: u64,
 }
 
 /// 실제 `DocumentCore` 를 감싸 공동편집 보조 기능을 더하는 래퍼.
@@ -89,6 +91,8 @@ pub struct CollabCore {
     clipboard_stash: Vec<(Option<crate::document_core::ClipboardData>, u32)>,
     /// S3-0: BinData 항목 내용 해시 캐시 (`digest` 는 `&self` 라 내부 가변).
     bin_digest: std::sync::Mutex<BinDigestCache>,
+    /// 결과 적재(`load_state`) 횟수. 스냅샷 뒤에 적재가 있었으면 D4 판정이 스냅샷 쪽도 내보내기→다시 읽기로 맞춘다.
+    state_loads: u64,
 }
 
 /// S3-0 BinData 내용 해시 캐시 (docs/collab-stage3.md S3-0).
@@ -205,7 +209,7 @@ fn bad_args(method: &str, detail: impl std::fmt::Display) -> HwpError {
 
 impl CollabCore {
     pub fn new(inner: DocumentCore) -> Self {
-        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default() }
+        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default(), state_loads: 0 }
     }
 
     // ── 자체 스냅샷 (§5) ────────────────────────────────────────────────
@@ -221,6 +225,7 @@ impl CollabCore {
             Snapshot {
                 document: self.inner.document.clone(),
                 text_reflowed_table_paths: self.inner.text_reflowed_table_paths_for_snapshot(),
+                state_loads: self.state_loads,
             },
         ));
         id
@@ -269,6 +274,7 @@ impl CollabCore {
         self.install(parsed.document, &paths);
         self.inner.source_format = format;
         self.inner.active_field = None;
+        self.state_loads += 1;
         Ok(())
     }
 
@@ -657,17 +663,60 @@ impl CollabCore {
     /// `extra_streams`·`hwpx_aux_entries`(라운드트립 보존용 원본 조각)는 편집으로 바뀌지 않아 넣지 않는다.
     /// 5단계 D4: 스냅샷(`snapshot_id`) 뒤의 변경이 `kind`(`form`·`comment`·`form comment`)가 허용하는 부분뿐인가.
     /// `{"ok":true}` 또는 `{"ok":false,"reason":"confined","detail":".."}`.
-    pub fn check_confined(&self, snapshot_id: u32, kind: &str) -> Result<Value, HwpError> {
+    ///
+    /// 스냅샷 뒤에 결과 적재(`state`)가 있었으면 지금 문서는 다른 객체가 내보낸 바이트를 다시 읽은 문서다. 내보내기 →
+    /// 다시 읽기는 항등이 아니다: HWPX 목록 파일(`Contents/content.hpf`) 재작성, 파일 머리, 그리고 HWP 저장이 고치지 않은
+    /// 구역은 원본 바이트를 그대로 쓰고 고친 구역은 모델에서 다시 쓰므로 그림 크기·문단 머리 꼬리·채우기 같은 직렬화 표현이
+    /// 원본과 갈린다(실제 한/글 저장본에서 정상 메모가 거절됐다). 그래서 스냅샷 쪽을 보낸 쪽 내보내기와 같게 한 번 내보내
+    /// 다시 읽고 비교한다(`reparsed_like_current`). 양쪽 모두 내보내기→다시 읽기 한 번이다 — 지금 문서를 한 번 더 거치면
+    /// 큰 HWPX 문서에서 다시 갈린다(왕복이 멱등이 아님).
+    pub fn check_confined(&mut self, snapshot_id: u32, kind: &str) -> Result<Value, HwpError> {
         let kinds = confine::Kinds::parse(kind).map_err(HwpError::RenderError)?;
-        let (_, snap) = self
+        let loaded = self
             .snapshots
             .iter()
             .find(|(id, _)| *id == snapshot_id)
+            .map(|(_, s)| s.state_loads != self.state_loads)
             .ok_or_else(|| HwpError::RenderError(format!("collab 스냅샷 {snapshot_id} 없음")))?;
-        Ok(match confine::check(&snap.document, &self.inner.document, kinds) {
+        let verdict = if loaded {
+            let before = self.reparsed_like_current(snapshot_id)?;
+            confine::check(&before, &self.inner.document, kinds)
+        } else {
+            let (_, snap) = self.snapshots.iter().find(|(id, _)| *id == snapshot_id).expect("위에서 찾은 스냅샷");
+            confine::check(&snap.document, &self.inner.document, kinds)
+        };
+        Ok(match verdict {
             Ok(()) => json!({ "ok": true }),
             Err(detail) => json!({ "ok": false, "reason": "confined", "detail": detail }),
         })
+    }
+
+    /// 스냅샷 문서를 지금 형식 계열로 내보내 다시 읽은 문서 — 보낸 쪽 내보내기를 흉내 낸다. 지금 문서의 구역 바이트(적재한
+    /// 바이트 그대로)가 스냅샷의 원본 바이트와 같은 구역·DocInfo 는 보낸 쪽도 원본 바이트를 다시 쓴 것이므로 원본 바이트를
+    /// 그대로 쓰고, 다른 것은 모델에서 쓴다. 지금 문서는 (원본 바이트 캐시까지) 그대로 돌려 놓는다.
+    fn reparsed_like_current(&mut self, snapshot_id: u32) -> Result<Document, HwpError> {
+        let sent: Vec<Option<Vec<u8>>> = self.inner.document.sections.iter().map(|s| s.raw_stream.clone()).collect();
+        let sent_info = self.inner.document.doc_info.raw_stream.clone();
+        let current = self.snapshot_save();
+        let raw = self.snapshot_restore(snapshot_id).and_then(|()| {
+            let doc = &mut self.inner.document;
+            for (i, section) in doc.sections.iter_mut().enumerate() {
+                if sent.get(i).map(Option::as_ref) != Some(section.raw_stream.as_ref()) {
+                    section.raw_stream = None;
+                }
+            }
+            if doc.doc_info.raw_stream != sent_info {
+                doc.doc_info.raw_stream = None;
+            }
+            match self.inner.source_format {
+                crate::parser::FileFormat::Hwpx => self.inner.export_hwpx_native(),
+                _ => self.inner.export_hwp_native(),
+            }
+        });
+        let back = self.snapshot_restore(current);
+        self.snapshot_discard(current);
+        back?;
+        Ok(DocumentCore::from_bytes(&raw?)?.document)
     }
 
     /// 5단계 D4 클라이언트 문: 글자 연산 호출(`method`·`args`, 호출 전)이 활성 누름틀(`active_field`) 안에 완전히 드는가.

@@ -116,9 +116,10 @@ impl HwpDocument {
     }
 
     /// 5단계 D4(서버 정본): 스냅샷 뒤의 변경이 좁은 권한(`form`·`comment`·`form comment`)이 허용하는 부분뿐인가.
-    /// `{"ok":true}` | `{"ok":false,"reason":"confined","detail":".."}`.
+    /// `{"ok":true}` | `{"ok":false,"reason":"confined","detail":".."}`. 스냅샷 뒤에 결과 적재가 있었으면 스냅샷 쪽을
+    /// 내보내기→다시 읽기로 맞춘다(지금 문서는 그대로 — 안에서 스냅샷 하나를 잠시 뜨고 지운다).
     #[wasm_bindgen(js_name = collabCheckConfined)]
-    pub fn collab_check_confined(&self, snapshot_id: u32, kind: &str) -> Result<String, JsValue> {
+    pub fn collab_check_confined(&mut self, snapshot_id: u32, kind: &str) -> Result<String, JsValue> {
         self.check_confined(snapshot_id, kind).map(|v| v.to_string()).map_err(js_err)
     }
 

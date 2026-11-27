@@ -103,8 +103,18 @@ export interface LocalLogItem {
 /** 4단계: 위치 하나(텍스트 좌표) — `collabMapPositions` 의 입력·출력. */
 export interface UndoPosition extends TextCaret {
   bias?: 'before' | 'after';
+  /**
+   * U2: 셀 경로(중첩 포함, 바깥 → 안쪽). `[k].cellPara` 는 k 단계 칸의 문단 — 마지막이 위치의 칸 문단, 그 앞은 다음 단계
+   * 표를 품은 문단. 한 단계면 `cell` 과 같다(출력은 둘 다 채운다).
+   */
+  cellPath?: Array<{ control: number; cell: number; cellPara: number }> | null;
+  /**
+   * U2: 문단으로 특정할 수 없는 자리. `section` 은 구역 안 어딘가(머리말·꼬리말 안, 구역 정의 등 — 같은 구역의 구조
+   * 편집·구역 서식이 닿음), `sectionAll` 은 그 구역의 어떤 기록이든 닿는 지킴(구역 원본 저널에 기대는 되돌리기).
+   */
+  scope?: 'section' | 'sectionAll';
   /** 출력: 남의 기록이 닿았으면 첫 사유 */
-  hit?: 'touched' | 'gone' | 'structural' | 'whole' | null;
+  hit?: 'touched' | 'gone' | 'structural' | 'whole' | 'section' | null;
 }
 
 export interface EngineOptions {
@@ -659,6 +669,7 @@ export class CollabEngine {
   }
 
   /** 4단계: 명령이 만든 기록 열의 발자국(기록이 끝난 문서 좌표). */
+  /** 발자국. `nested` 는 U1 호환(언제나 false — U2 부터 중첩 셀을 `cellPath` 로 다룬다). */
   footprint(entries: readonly Entry[]): { items: UndoPosition[]; whole: boolean; nested: boolean } | null {
     const doc = this.doc;
     if (!doc?.collabFootprint) return null;

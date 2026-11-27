@@ -1,7 +1,7 @@
 // 4단계 U1 브라우저 확인 (docs/collab-stage4.md): 공동편집 중 되돌리기 — 내 편집만, 남이 같은 자리를 고쳤으면 막힘.
 // 같은 headless Chrome 의 두 탭(A, B)이 지연 서버(300ms)에서 편집하고 A 가 studio 의 되돌리기 명령(edit:undo)을
 // 누른다. 단계마다 두 탭의 digest 일치·desync·재동기화 0 과, 되돌린 결과(내 편집만 빠짐) 또는 막힘(알림·문서
-// 그대로)을 본다. U3 의 전체 시나리오 중 기본형(①~④, ⑪·⑫)만.
+// 그대로)을 본다. U3 의 전체 시나리오 중 기본형(①~④, ⑪·⑫)과 U2 머리말(⑬·⑭ — studio 의 실제 머리말 명령).
 //
 // 준비: COLLAB_DELAY_MS=300 PORT=8788 node server/server.mjs + (cd upstream/rhwp/rhwp-studio && npx vite) (7700)
 // 실행: node collab-client/e2e/u1-undo.mjs
@@ -44,6 +44,10 @@ const paragraphs = (page) => page.evaluate(() => {
   return out;
 });
 const notices = (page) => page.evaluate(() => [...document.querySelectorAll('[data-collab="undo"]')].map((e) => e.textContent));
+const headerText = (page) => page.evaluate(() => {
+  const h = JSON.parse(window.__wasm.getHeaderFooter(0, true, 0));
+  return h.exists ? h.text : null;
+});
 const bold = (page, para, off) => page.evaluate((p, o) => window.__wasm.getCharPropertiesAt(0, p, o).bold === true, para, off);
 
 let lastSeq = -1;
@@ -187,6 +191,46 @@ try {
   s = await same(pages, { advance: false });
   const after12 = await paragraphs(A);
   record('⑫ 앞 문단 Enter 뒤 선택 삭제 되돌리기 막힘', s.ok && JSON.stringify(after12) === JSON.stringify(before12) && n12.includes(BLOCKED), `알림 ${JSON.stringify(n12)} 문단 ${JSON.stringify(after12)}`);
+
+  // ⑬ U2 머리말: A 머리말에 한 글자, B 본문 입력·Enter → A 되돌리기 허용(머리말 발자국은 구역 단위라 본문 글자에 막히지 않음)
+  await exec(A, 'page:header-create');
+  await same(pages);
+  const hBefore = await headerText(A);
+  await A.keyboard.type('H', { delay: 20 });
+  await same(pages);
+  await exec(A, 'page:headerfooter-close');
+  const hTyped = await headerText(B);
+  await typeAtEnd(B, 1, ' B13');
+  await B.keyboard.press('Enter');
+  await same(pages);
+  await A.bringToFront();
+  await exec(A, 'edit:undo');
+  s = await same(pages);
+  const h13 = await Promise.all(pages.map(headerText));
+  texts = await paragraphs(B);
+  record('⑬ U2 머리말 되돌리기(남은 본문 편집·Enter 뒤)', s.ok && hTyped === `${hBefore ?? ''}H` && h13.every((h) => h === hBefore) && texts.some((t) => t.endsWith(' B13')), `머리말 ${JSON.stringify(hBefore)} → ${JSON.stringify(hTyped)} → ${JSON.stringify(h13)}`);
+  await exec(A, 'page:headerfooter-close');
+  await same(pages, { advance: false });
+
+  // ⑭ U2 머리말: A 머리말에 한 글자 뒤 B 가 같은 머리말을 고침 → A 되돌리기 막힘·알림·문서 그대로
+  await exec(A, 'page:header-create');
+  await A.keyboard.type('Z', { delay: 20 });
+  await same(pages);
+  await exec(A, 'page:headerfooter-close');
+  await B.bringToFront();
+  await exec(B, 'page:header-create');
+  await B.keyboard.type('b', { delay: 20 });
+  await same(pages);
+  await exec(B, 'page:headerfooter-close');
+  const h14 = await headerText(A);
+  const n14Before = (await notices(A)).length;
+  await A.bringToFront();
+  await exec(A, 'edit:undo');
+  await sleep(300);
+  const n14 = await notices(A);
+  s = await same(pages, { advance: false });
+  record('⑭ U2 남이 같은 머리말을 고친 뒤 되돌리기 막힘', s.ok && (await headerText(A)) === h14 && h14.includes('Z') && h14.includes('b') && n14.length > n14Before && n14.at(-1) === BLOCKED, `머리말 ${JSON.stringify(h14)} 알림 ${JSON.stringify(n14.slice(n14Before))}`);
+  await exec(A, 'page:headerfooter-close');
 
   const final = await Promise.all(pages.map(status));
   record('끝까지 어긋남·재동기화 없음', final.every((st) => !st.desynced && !st.left && st.resyncCount === 0), final.map((st) => `${st.name}: resync ${st.resyncCount}`).join(', '));

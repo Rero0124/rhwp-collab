@@ -7,7 +7,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import { WebSocket } from 'ws';
 import { startServer } from '../server.mjs';
@@ -122,6 +122,49 @@ function stateAfter(c, edit) {
 }
 const op = (m, a, extra = {}) => ({ kind: 'op', m, a, ...extra });
 
+/**
+ * 복합 파일(CFB) 안 스트림 하나의 바이트 위치들 — 길이가 같은 제자리 고치기용(원시 클라이언트가 보낼 수 있는 바이트를
+ * 만든다). FAT·작은 FAT 사슬을 따라간다.
+ */
+function cfbStreamOffsets(buf, name) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const u32 = (o) => dv.getUint32(o, true);
+  const sectorSize = 1 << dv.getUint16(0x1e, true);
+  const miniSize = 1 << dv.getUint16(0x20, true);
+  const at = (sid) => (sid + 1) * sectorSize;
+  const fatSectors = [];
+  for (let i = 0; i < 109; i += 1) { const sid = u32(0x4c + i * 4); if (sid >= 0xfffffffa) break; fatSectors.push(sid); }
+  const next = (table, sid) => u32(at(table[Math.floor((sid * 4) / sectorSize)]) + ((sid * 4) % sectorSize));
+  const chain = (start, table = fatSectors) => { const out = []; for (let sid = start; sid < 0xfffffffa; sid = next(table, sid)) out.push(sid); return out; };
+  const entries = chain(u32(0x30)).flatMap((sid) => Array.from({ length: sectorSize / 128 }, (_, k) => at(sid) + k * 128));
+  const nameOf = (o) => Buffer.from(buf.subarray(o, o + Math.max(0, dv.getUint16(o + 0x40, true) - 2))).toString('utf16le');
+  const entry = entries.find((o) => buf[o + 0x42] === 2 && nameOf(o) === name);
+  assert.ok(entry !== undefined, `스트림 ${name} 없음`);
+  const [start, size] = [u32(entry + 0x74), u32(entry + 0x78)];
+  if (size >= u32(0x38)) {
+    const sectors = chain(start);
+    return Array.from({ length: size }, (_, i) => at(sectors[Math.floor(i / sectorSize)]) + (i % sectorSize));
+  }
+  const miniStream = chain(u32(entries[0] + 0x74));
+  const minis = chain(start, chain(u32(0x3c)));
+  return Array.from({ length: size }, (_, i) => {
+    const pos = minis[Math.floor(i / miniSize)] * miniSize + (i % miniSize);
+    return at(miniStream[Math.floor(pos / sectorSize)]) + (pos % sectorSize);
+  });
+}
+
+/** 사본에서 고친 뒤 내보낸 바이트의 스트림 하나를 같은 길이로 바꿔 끼운 state 기록 */
+function forgedState(c, edit, stream, text) {
+  const d = new wasm.HwpDocument(gunzipSync(Buffer.from(c.doc.collabExportState())));
+  edit(d);
+  const bytes = Buffer.from(gunzipSync(Buffer.from(d.collabExportState())));
+  d.free();
+  const offsets = cfbStreamOffsets(bytes, stream);
+  const fill = Buffer.from(text.padEnd(offsets.length, ' ')).subarray(0, offsets.length);
+  offsets.forEach((o, i) => { bytes[o] = fill[i]; });
+  return { kind: 'state', data: b64(gzipSync(bytes)) };
+}
+
 /** 정본의 지금 seq·digest(정본 워커에 직접 묻는다) */
 async function canonical(room) {
   const r = server.rooms.get(room);
@@ -192,10 +235,8 @@ test('form: 우회(함수 이름·state 바이트 위조, 기존 글자 모양 �
   W.close(); F.close();
 });
 
-// 알려진 문제(2026-11-27): 메모 함수는 분류표에서 모두 state 라, 정상 클라이언트는 메모를 결과 전송(state)으로 보낸다.
-// 그런데 사본에서 insertMemo → 내보내기 → 정본이 collabLoadState 한 결과를 collabCheckConfined 가 "부속 스트림이 다름"으로
-// 거절한다(같은 문서 객체에서 insertMemo 를 바로 부르면 통과, 편집 없는 state 도 통과). 판정 보조 쪽 문제라 고쳐질 때까지 todo.
-const MEMO_STATE_TODO = 'collabCheckConfined 가 state 로 온 정상 메모를 "부속 스트림이 다름"으로 거절함 — 판정 보조를 고친 뒤 통과해야 한다';
+// 메모 함수는 분류표에서 모두 state 라, 정상 클라이언트는 메모를 결과 전송(state)으로 보낸다. 2026-11-27 고침: 저장 때마다
+// 다시 쓰는 파생 스트림(/RhwpLineSegTags, 구역 바이트 다이제스트)과 메모만 있던 꼬리를 판정이 내용으로 비교해 거절했다.
 
 test('comment: 본문·누름틀·메모에 본문을 섞은 state 는 forbidden(confined)', async () => {
   const { room } = await makeRoom();
@@ -207,12 +248,26 @@ test('comment: 본문·누름틀·메모에 본문을 섞은 state 는 forbidden
   W.close(); C.close();
 });
 
-test('comment: 메모 넣기(state)는 통과하고 다른 참여자와 정본이 같다', { todo: MEMO_STATE_TODO }, async () => {
+test('comment: 메모 넣기(state)는 통과하고 다른 참여자와 정본이 같다', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const C = await client(room, 'C', 'comment');
   try {
     await accepted(room, C, W, [stateAfter(C, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'C', text: '첫 메모' })))], '메모 넣기(state)');
+  } finally { W.close(); C.close(); }
+});
+
+test('comment: 메모가 든 문서에서 state 로 스크립트 스트림을 바꾸면 forbidden(confined)', async () => {
+  const { room } = await makeRoom();
+  const W = await client(room, 'W');
+  const C = await client(room, 'C', 'comment');
+  try {
+    await accepted(room, C, W, [stateAfter(C, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'C', text: '첫 메모' })))], '메모 넣기(state)');
+    // 정상 메모 하나 + 기본 스크립트 스트림을 바꾼 바이트(부속 스트림 비교는 파생 스트림 하나만 뺀다)
+    const memo = (d) => d.insertMemo(0, 0, 7, 9, JSON.stringify({ author: 'C', text: '둘째 메모' }));
+    await rejected(room, C, W, [forgedState(C, memo, 'DefaultJScript', 'evil();')], 'confined', 'state 로 메모 + 스크립트 바꾸기');
+    // 거절 뒤에도 같은 메모는 그대로 통과
+    await accepted(room, C, W, [stateAfter(C, memo)], '거절 뒤 메모(state)');
   } finally { W.close(); C.close(); }
 });
 
@@ -250,7 +305,7 @@ test('form comment 권한이어도 본문 입력이 끼면, form 만이면 메�
   W.close(); FC.close(); F.close();
 });
 
-test('form comment: 누름틀 입력 + 메모가 섞인 한 묶음은 통과', { todo: MEMO_STATE_TODO }, async () => {
+test('form comment: 누름틀 입력 + 메모가 섞인 한 묶음은 통과', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const FC = await client(room, 'FC', 'form comment');

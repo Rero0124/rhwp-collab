@@ -75,8 +75,11 @@ pub fn check(before: &Document, after: &Document, kinds: Kinds) -> Result<(), St
     if format!("{header_a:?}") != format!("{:?}", b.header) {
         return Err("파일 머리가 다름".into());
     }
-    if streams_a != &b.extra_streams || aux_a != &b.hwpx_aux_entries || *hwp3_a != b.is_hwp3_variant || *hwpx_a != b.is_hwpx_variant {
-        return Err("부속 스트림이 다름".into());
+    if let Some(name) = stream_difference(streams_a, &b.extra_streams).or_else(|| stream_difference(aux_a, &b.hwpx_aux_entries)) {
+        return Err(format!("부속 스트림이 다름 ({name})"));
+    }
+    if *hwp3_a != b.is_hwp3_variant || *hwpx_a != b.is_hwpx_variant {
+        return Err("파일 형식 표지가 다름".into());
     }
     if !kinds.comment && memo_parents_a != &b.memo_parents {
         return Err("메모 답글 관계가 다름".into());
@@ -115,6 +118,35 @@ fn where_differs(i: usize, a: &Section, b: &Section) -> String {
         }
     }
     format!("구역 {i} 의 꼬리 기록이 다름")
+}
+
+/// 비교에서 빼는 부속 스트림 — 직렬화기가 저장할 때마다 다시 쓰는 파생값이고 문서 내용이 아니다.
+///
+/// `/RhwpLineSegTags`(업스트림 `model/line_seg_tags.rs`): rhwp 가 쓴 구역 레코드 바이트의 SHA-256 목록. HWP 저장
+/// (`serializer/cfb_writer.rs`)이 매번 기존 것을 지우고 그때 쓴 구역 바이트로 다시 만든다. 결과 전송(state)은 사본을
+/// 내보낸 바이트라 구역 바이트가 조금이라도 바뀌면(메모 넣기, 누름틀 값) 이 목록도 바뀐다 — 같은 문서 객체에서 고친
+/// 정본은 아직 저장 전이라 옛 목록을 들고 있다. 읽는 쪽은 저장 줄 정보(`line_segs`) 비트 31 의 해석과 줄 캐시 소유
+/// 판정뿐이고, 줄 정보는 이 판정이 이미 비교에서 뺀다(가리기). 다른 스트림(스크립트·연결 문서 등)은 그대로 비교한다.
+const DERIVED_STREAMS: &[&str] = &[crate::model::line_seg_tags::HWP_STREAM];
+
+/// 두 스트림 목록이 파생 스트림을 빼고 다르면 처음 다른 스트림 이름(경로 순). 순서는 보지 않는다 — 다시 읽으면 복합
+/// 파일 디렉터리 순서(이름 길이 먼저)로 온다. 같은 경로가 두 번 있으면 그 경로를 다르다고 본다.
+fn stream_difference<'a>(a: &'a [(String, Vec<u8>)], b: &'a [(String, Vec<u8>)]) -> Option<&'a str> {
+    use std::collections::BTreeMap;
+    let content = |s: &'a [(String, Vec<u8>)]| -> Result<BTreeMap<&'a str, &'a [u8]>, &'a str> {
+        let mut out = BTreeMap::new();
+        for (path, bytes) in s.iter().filter(|(path, _)| !DERIVED_STREAMS.contains(&path.as_str())) {
+            if out.insert(path.as_str(), bytes.as_slice()).is_some() {
+                return Err(path.as_str());
+            }
+        }
+        Ok(out)
+    };
+    let (ca, cb) = match (content(a), content(b)) {
+        (Err(dup), _) | (_, Err(dup)) => return Some(dup),
+        (Ok(x), Ok(y)) => (x, y),
+    };
+    ca.keys().chain(cb.keys()).copied().collect::<std::collections::BTreeSet<_>>().into_iter().find(|k| ca.get(k) != cb.get(k))
 }
 
 fn props_digest(p: &crate::model::document::DocProperties) -> [u8; 32] {
@@ -235,6 +267,11 @@ fn mask_section(s: &mut Section, kinds: Kinds) {
             let kept: Vec<_> = tail.record_groups().filter(|(memo, _)| !memo).flat_map(|(_, recs)| recs.to_vec()).collect();
             tail.records = kept;
         }
+        // 메모만 있던 꼬리를 비우면 꼬리가 없는 것과 같다 — 메모 없던 문서에 결과 전송으로 첫 메모가 오면 다시 읽은
+        // 쪽에만 꼬리가 생긴다(같은 객체에서 고친 쪽은 저장 전이라 꼬리가 없다)
+        if s.trailing_lists.as_ref().is_some_and(|t| t.records.is_empty()) {
+            s.trailing_lists = None;
+        }
     }
     for page in &mut s.section_def.master_pages {
         mask_paragraphs(&mut page.paragraphs, kinds);
@@ -262,6 +299,21 @@ fn mask_paragraphs(paras: &mut Vec<Paragraph>, kinds: Kinds) {
         p.layout_float_band = false;
         p.char_count = 0;
         p.control_mask = 0;
+        // 개체별 CTRL_DATA: 모두 비었으면 목록이 없는 것과 같다(HWPX 출처는 빈 목록, 개체를 넣고 빼면 빈 칸으로 채워진다)
+        if p.ctrl_data_records.iter().all(Option::is_none) {
+            p.ctrl_data_records.clear();
+        }
+        // 문단 머리 꼬리: [0..6] 은 글자 모양·영역 태그·줄 수 자리(저장기가 실제 배열로 다시 쓰고 이 자리는 쓰지 않는다)
+        for b in p.raw_header_extra.iter_mut().take(6) {
+            *b = 0;
+        }
+        // [6..10] 은 문단 instanceId — HWPX 저장이 문단마다 번호를 다시 매기므로 메모 문단이 생기면 뒤 문단 번호가 밀린다.
+        // 메모 권한에서만 가린다(그 뒤의 변경 추적 꼬리는 그대로 비교)
+        if kinds.comment {
+            for b in p.raw_header_extra.iter_mut().skip(6).take(4) {
+                *b = 0;
+            }
+        }
         for ctrl in &mut p.controls {
             mask_control(ctrl, kinds);
         }
@@ -340,8 +392,10 @@ fn drop_memos(p: &mut Paragraph) {
     let old_records = std::mem::take(&mut p.ctrl_data_records);
     let mut index_map = vec![None; old_controls.len()];
     let mut kept_positions = Vec::new();
+    let mut memo_slots = Vec::new();
     for (i, c) in old_controls.into_iter().enumerate() {
         if is_memo(&c) {
+            memo_slots.push(i);
             continue;
         }
         index_map[i] = Some(p.controls.len());
@@ -352,6 +406,10 @@ fn drop_memos(p: &mut Paragraph) {
     p.field_ranges = std::mem::take(&mut p.field_ranges)
         .into_iter()
         .filter_map(|mut r| {
+            // 누름틀 안(시작 개체 뒤 `inner_slot_count` 개 슬롯)에 있던 메모 개체만큼 줄인다 — 다시 읽은 쪽은 메모 시작을
+            // 안쪽 슬롯으로 세고, 같은 객체에서 넣은 쪽은 세지 않는다. 남은 개체가 필드 안·밖에 있는지는 그대로 비교된다.
+            let inside = memo_slots.iter().filter(|&&i| r.control_idx < i && i <= r.control_idx + r.inner_slot_count).count();
+            r.inner_slot_count -= inside;
             r.control_idx = index_map.get(r.control_idx).copied().flatten()?;
             Some(r)
         })

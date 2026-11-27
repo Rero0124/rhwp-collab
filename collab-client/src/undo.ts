@@ -1,5 +1,5 @@
 /**
- * 4단계 U1: 공동편집 중 되돌리기 (docs/collab-stage4.md). studio 히스토리 훅(`CollabHistoryHook`)을 구현한다.
+ * 4단계 U1·U2: 공동편집 중 되돌리기 (docs/collab-stage4.md). studio 히스토리 훅(`CollabHistoryHook`)을 구현한다.
  *
  * - 명령 ↔ 기록 연결: 히스토리 경계(기록·되돌리기·다시 하기)마다 엔진의 로컬 기록(`drainLocalLog`)을 그 명령에
  *   붙인다(항목 단위 — 300ms 병합 때문에 명령과 묶음은 1:1 이 아니다). record 경로(IME 조합 끝 등)는 직전 경계
@@ -13,6 +13,9 @@
  * - 버려진 편집(3.3): 그 기록을 만든 명령과 같은 문단에 발자국이 있는 명령을 뺀다. 남은 명령은 버린 기록의
  *   되돌림 열(`remapLocal`)로 먼저 옮긴 뒤 원격 지도로 옮긴다 — 버린 Enter·합침 뒤의 문단 번호도 맞는다. 되돌림
  *   열이 불완전하면(state 등 되돌릴 수 없는 것을 버림·재적용 실패) 보수적으로 문단 수를 바꾼 기록의 구역 전체를 뺀다.
+ * - U2: 위치는 중첩 셀 경로(`cellPath`)와 구역 단위 자리(`scope`)도 가진다. 구역 원본 저널에 기대는 되돌리기
+ *   (`store: 'section'` — 구역 설정·z 순서)는 그 구역들에 지킴(`sectionAll`)을 발자국에 더한다: 실행 뒤 그 구역에 남의
+ *   기록이 하나라도 오면 막는다(저널 계약: 캡처와 복원 사이 그 구역 편집 금지).
  *
  * studio 를 import 하지 않는다(플러그인 규약) — 히스토리 조작과 위치 표는 host 가 넘긴다.
  */
@@ -28,8 +31,10 @@ interface Slot {
 }
 interface Descriptor {
   slots: Slot[];
-  store: 'none' | 'fragment' | 'snapshot';
+  store: 'none' | 'fragment' | 'snapshot' | 'section';
   fragmentAnchor?: Slot;
+  /** `store === 'section'`: 되돌리기가 원본 저널로 복원하는 구역들 */
+  sections?: number[];
 }
 export interface UndoController {
   stacks(): { undo: readonly object[]; redo: readonly object[] };
@@ -61,10 +66,28 @@ interface Meta {
   fragment: { para: number; cellPara: number | null } | null;
 }
 
-const samePara = (a: UndoPosition, b: UndoPosition): boolean =>
-  a.section === b.section && a.para === b.para
-  && (a.cell?.control ?? -1) === (b.cell?.control ?? -1) && (a.cell?.cell ?? -1) === (b.cell?.cell ?? -1)
-  && (a.cell?.cellPara ?? -1) === (b.cell?.cellPara ?? -1);
+type Step = { control: number; cell: number; cellPara: number };
+/** 셀 경로(바깥 → 안쪽). 한 단계 셀은 `cell` 로만 올 수도 있다(U1 모양). */
+const pathOf = (p: UndoPosition): Step[] => p.cellPath ?? (p.cell ? [p.cell] : []);
+const innerCellPara = (p: UndoPosition): number | null => {
+  const path = pathOf(p);
+  return path.length > 0 ? path[path.length - 1].cellPara : null;
+};
+const samePath = (a: Step[], b: Step[]): boolean =>
+  a.length === b.length && a.every((s, i) => s.control === b[i].control && s.cell === b[i].cell && s.cellPara === b[i].cellPara);
+
+/**
+ * 같은 문단인가(버려진 편집과 겹치는 명령 고르기). 구역 단위 자리끼리는 같은 구역이면 같다고 본다 — 머리말·꼬리말 안
+ * 좌표는 지도로 옮기지 않으므로 버려진 머리말 편집 뒤의 머리말 명령은 함께 뺀다. 지킴(`sectionAll`)은 발자국이 아니다.
+ */
+const samePara = (a: UndoPosition, b: UndoPosition): boolean => {
+  if (a.section !== b.section) return false;
+  if (a.scope || b.scope) return a.scope === 'section' && b.scope === 'section';
+  return a.para === b.para && samePath(pathOf(a), pathOf(b));
+};
+const sameSpot = (a: UndoPosition, b: UndoPosition): boolean =>
+  a.section === b.section && (a.scope ?? null) === (b.scope ?? null)
+  && (a.scope ? true : a.para === b.para && samePath(pathOf(a), pathOf(b)));
 
 /** 버려진 기록이 문단 수를 바꾸지 않는 문단 안 편집인가(아니면 그 구역의 뒤 문단 번호가 어긋난다). */
 const IN_PARAGRAPH = new Set([
@@ -108,7 +131,7 @@ export class CollabUndo {
       const m: Meta = {
         lids: new Set([...(prev?.lids ?? []), ...items.map((i) => i.lid)]),
         undoLids: new Set(),
-        foot: dedupe([...(prev?.foot ?? []), ...fp.items]),
+        foot: dedupe([...(prev?.foot ?? []), ...fp.items, ...this.guardsOf(command)]),
         whole: (prev?.whole ?? false) || fp.whole,
         nested: (prev?.nested ?? false) || fp.nested,
         remoteSeen: prev?.remoteSeen ?? false,
@@ -195,7 +218,14 @@ export class CollabUndo {
     const d = this.controller?.describe(command);
     if (d?.store !== 'fragment' || !d.fragmentAnchor) return null;
     const p = d.fragmentAnchor.get();
-    return p ? { para: p.para, cellPara: p.cell?.cellPara ?? null } : null;
+    return p ? { para: p.para, cellPara: innerCellPara(p) } : null;
+  }
+
+  /** 구역 원본 저널에 기대는 되돌리기의 지킴(그 구역의 어떤 남의 기록이든 막음). */
+  private guardsOf(command: object): UndoPosition[] {
+    const d = this.controller?.describe(command);
+    if (d?.store !== 'section') return [];
+    return (d.sections ?? []).map((section) => ({ section, para: 0, offset: 0, scope: 'sectionAll' as const }));
   }
 
   private afterJump(command: object, dir: 'undo' | 'redo'): void {
@@ -206,7 +236,8 @@ export class CollabUndo {
     if (!m) return;
     // 새 구간: 이제부터 들어오는 남의 기록이 다음 다시 하기/되돌리기를 막는다
     const fp = this.footprintOf(entries);
-    m.foot = fp.items;
+    // 다시 하기 뒤에는 다음 되돌리기를 위해 지킴을 다시 건다(되돌리기 뒤의 다시 하기는 새로 캡처한다)
+    m.foot = dir === 'redo' ? dedupe([...fp.items, ...this.guardsOf(command)]) : fp.items;
     m.whole = fp.whole;
     m.nested = fp.nested;
     m.remoteSeen = false;
@@ -232,7 +263,7 @@ export class CollabUndo {
     if (m.hit) return message;
     if (dir === 'undo' && d.store === 'fragment') {
       const now = d.fragmentAnchor?.get();
-      if (!now || !m.fragment || now.para !== m.fragment.para || (now.cell?.cellPara ?? null) !== m.fragment.cellPara) {
+      if (!now || !m.fragment || now.para !== m.fragment.para || innerCellPara(now) !== m.fragment.cellPara) {
         return m.remoteSeen ? message : null;
       }
     }
@@ -357,6 +388,6 @@ const strip = (p: UndoPosition): UndoPosition => {
 
 const dedupe = (items: UndoPosition[]): UndoPosition[] => {
   const out: UndoPosition[] = [];
-  for (const it of items) if (!out.some((o) => samePara(o, it))) out.push(it);
+  for (const it of items) if (!out.some((o) => sameSpot(o, it))) out.push(it);
   return out;
 };

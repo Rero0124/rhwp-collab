@@ -451,13 +451,14 @@ pub fn cell_target(m: &str, a: &[Value]) -> Option<(Space, usize)> {
         if steps.is_empty() {
             return None;
         }
-        let g = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).map(|x| x as usize);
+        // 키는 `controlIndex` 계열과 `controlIdx` 계열 둘 다(업스트림 `parse_cell_path_json` 과 같음)
+        let g = |v: &Value, k: &str, alt: &str| v.get(k).or_else(|| v.get(alt)).and_then(Value::as_u64).map(|x| x as usize);
         let mut hosts = vec![num(a, 1)?];
         let mut chain = Vec::new();
         let mut last = 0;
         for (k, st) in steps.iter().enumerate() {
-            chain.push((g(st, "controlIndex")?, g(st, "cellIndex")?));
-            let cp = g(st, "cellParaIndex").unwrap_or(0);
+            chain.push((g(st, "controlIndex", "controlIdx")?, g(st, "cellIndex", "cellIdx")?));
+            let cp = g(st, "cellParaIndex", "cellParaIdx").unwrap_or(0);
             if k + 1 < steps.len() {
                 hosts.push(cp);
             } else {
@@ -1367,16 +1368,31 @@ pub fn map_caret_through(remote: &[Value], catalog: &Value, caret: &Value) -> Va
     map_caret(caret, &rs)
 }
 
-// ── 되돌리기 보조 (4단계 U1, docs/collab-stage4.md §3·§5) ─────────────────────────────────────────
+// ── 되돌리기 보조 (4단계 U1·U2, docs/collab-stage4.md §3·§5) ─────────────────────────────────────
 
-/// 되돌리기 스택이 기억하는 위치 하나(텍스트 좌표). 셀이면 한 단계 표의 (개체, 칸, 칸 문단) — `para` 는 표를 품은
-/// 본문 문단. 중첩 셀은 다루지 않는다(호스트가 3.2-3 으로 막는다).
+/// 위치의 범위. `Section` 은 구역 안 어딘가(문단으로 특정할 수 없음), `SectionAll` 은 "그 구역의 어떤 기록이든"
+/// — 구역 원본 저널(`captureSectionRaw` ↔ `restoreSectionRaw`)에 기대는 되돌리기의 지킴(캡처와 복원 사이 그 구역 편집
+/// 금지가 저널 계약이다). 글자 연산은 `Section` 에 닿지 않지만 `SectionAll` 에는 닿는다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scope {
+    Para,
+    Section,
+    SectionAll,
+}
+
+/// 되돌리기 스택이 기억하는 위치 하나(텍스트 좌표).
+/// - 본문: `para`·`off`.
+/// - 셀(중첩 포함, U2): `path[k]` = k 단계 (개체, 칸, 칸 문단), `para` 는 바깥 표를 품은 본문 문단. 위치는 가장 안쪽
+///   칸의 (칸 문단 = `path[last].2`, `off`). 바깥 단계의 칸 문단(`path[k].2`, k < last)은 다음 단계 표를 품은 문단이다.
+/// - 구역 단위(`scope`, U2): 본문 문단으로 특정할 수 없는 자리(머리말·꼬리말 안, 구역 정의 등). 글자 연산은 닿지 않고
+///   같은 구역의 구조 편집·결과 전송·문단을 특정할 수 없는 서식이 닿는다.
 #[derive(Clone, Debug, PartialEq)]
 struct Item {
     sec: usize,
     para: usize,
     off: usize,
-    cell: Option<(usize, usize, usize)>,
+    path: Vec<(usize, usize, usize)>,
+    scope: Scope,
     bias: Bias,
     /// 남의 기록이 이 자리에 닿았는가 — 첫 사유만 남긴다(`touched` 같은 문단 편집, `gone` 문단이 지워짐,
     /// `structural` 같은 구역의 구조 편집, `whole` 문서 전체 결과).
@@ -1386,21 +1402,45 @@ struct Item {
 impl Item {
     fn parse(v: &Value) -> Option<Item> {
         let g = |o: &Value, k: &str| o.get(k).and_then(Value::as_u64).map(|x| x as usize);
-        let cell = match v.get("cell") {
-            Some(c) if !c.is_null() => Some((g(c, "control")?, g(c, "cell")?, g(c, "cellPara")?)),
-            _ => None,
+        let step = |c: &Value| Some((g(c, "control")?, g(c, "cell")?, g(c, "cellPara")?));
+        let path: Vec<(usize, usize, usize)> = match (v.get("cellPath"), v.get("cell")) {
+            (Some(Value::Array(steps)), _) if !steps.is_empty() => steps.iter().map(step).collect::<Option<Vec<_>>>()?,
+            (_, Some(c)) if !c.is_null() => vec![step(c)?],
+            _ => vec![],
+        };
+        let scope = match v.get("scope").and_then(Value::as_str) {
+            Some("section") => Scope::Section,
+            Some("sectionAll") => Scope::SectionAll,
+            _ => Scope::Para,
         };
         let bias = if v.get("bias").and_then(Value::as_str) == Some("before") { Bias::Before } else { Bias::After };
-        Some(Item { sec: g(v, "section")?, para: g(v, "para")?, off: g(v, "offset").unwrap_or(0), cell, bias, hit: None })
+        Some(Item {
+            sec: g(v, "section")?,
+            para: if scope == Scope::Para { g(v, "para")? } else { g(v, "para").unwrap_or(0) },
+            off: g(v, "offset").unwrap_or(0),
+            path,
+            scope,
+            bias,
+            hit: None,
+        })
     }
 
     fn json(&self) -> Value {
-        json!({
+        let step = |&(ci, cell, cp): &(usize, usize, usize)| json!({ "control": ci, "cell": cell, "cellPara": cp });
+        let mut v = json!({
             "section": self.sec, "para": self.para, "offset": self.off,
-            "cell": self.cell.map(|(ci, cell, cp)| json!({ "control": ci, "cell": cell, "cellPara": cp })),
+            // 한 단계 셀은 `cell` 로도(U1 호환), 모든 깊이는 `cellPath`
+            "cell": if self.path.len() == 1 { step(&self.path[0]) } else { Value::Null },
+            "cellPath": if self.path.is_empty() { Value::Null } else { Value::Array(self.path.iter().map(step).collect()) },
             "bias": if self.bias == Bias::Before { "before" } else { "after" },
             "hit": self.hit,
-        })
+        });
+        match self.scope {
+            Scope::Para => {}
+            Scope::Section => v["scope"] = json!("section"),
+            Scope::SectionAll => v["scope"] = json!("sectionAll"),
+        }
+        v
     }
 
     fn mark(&mut self, why: &'static str) {
@@ -1409,13 +1449,18 @@ impl Item {
         }
     }
 
-    /// 이 위치(셀이면 그 칸 문단)가 `t` 의 같은 공간에서 고쳐지는가 — 글자 편집도 포함.
-    fn same_space_para(&self, t: &TOp) -> Option<usize> {
-        match (t.space(), self.cell) {
-            (Space::Body { sec }, None) if *sec == self.sec => Some(self.para),
-            (Space::Cell { sec, hosts, chain }, Some((ci, cell, cp))) if *sec == self.sec && chain.len() == 1 && hosts[0] == self.para && chain[0] == (ci, cell) => Some(cp),
-            _ => None,
+    /// 셀 공간(`hosts`, `chain`)과 이 위치의 단계가 앞쪽부터 맞는 단계 수. 어긋나면 `None`.
+    fn agree(&self, hosts: &[usize], chain: &[(usize, usize)]) -> Option<usize> {
+        if self.path.is_empty() || hosts.first() != Some(&self.para) {
+            return None;
         }
+        let common = chain.len().min(self.path.len());
+        for k in 0..common {
+            if chain[k] != (self.path[k].0, self.path[k].1) || (k >= 1 && hosts.get(k) != Some(&self.path[k - 1].2)) {
+                return None;
+            }
+        }
+        Some(common)
     }
 }
 
@@ -1428,19 +1473,83 @@ fn text_touches_para(t: &TOp, q: usize) -> bool {
     }
 }
 
-/// 셀 안 기록(글자 모양·문단 모양 등 neutral 포함)의 칸 공간과 칸 문단 — 평면(`sec,pp,ci,cell,cp,…`)·경로
-/// (`sec,pp,path_json,…`) 형식. 이름에 `InCell` 이 없으면 `None`.
+/// 셀 안 기록(글자 모양·문단 모양·개체 속성 등 neutral 포함)의 칸 공간과 칸 문단 — 평면(`sec,pp,ci,cell,cp,…`)·경로
+/// (`sec,pp,path_json,…`) 형식. 이름에 `InCell` 이 없고 셀 안 개체 속성도 아니면 `None`.
 fn cell_space_of(m: &str, a: &[Value]) -> Option<(Space, usize)> {
     if let Some(t) = cell_target(m, a) {
         return Some(t);
     }
+    let by_path = a.get(2).and_then(Value::as_str).is_some();
+    // 셀 안 개체 속성(`setCell{Shape,Picture}PropertiesByPath`): 개체를 품은 칸 문단
+    if m.ends_with("PropertiesByPath") && by_path {
+        return cell_target("insertTextInCellByPath", a);
+    }
     if !m.contains("InCell") {
         return None;
     }
-    if a.get(2).and_then(Value::as_str).is_some() {
+    if by_path {
         cell_target("insertTextInCellByPath", a)
     } else {
         cell_target("insertTextInCell", a)
+    }
+}
+
+/// 같은 공간의 문단 `q`·글자 `off` 를 글자 연산 `t` 뒤로 옮기며 닿았는지 표시한다. 새 (문단, 글자).
+fn map_in_space(it: &mut Item, q: usize, t: &TOp) -> Pos {
+    match map_para(q, t) {
+        ParaFate::Gone(_) => it.mark("gone"),
+        ParaFate::Touched(_) => it.mark("touched"),
+        ParaFate::Kept(_) if text_touches_para(t, q) => it.mark("touched"),
+        ParaFate::Kept(_) => {}
+    }
+    map_pos(Pos::new(q, it.off), t, it.bias).pos
+}
+
+/// 문단 번호(내용과 무관한 자리)를 글자 연산 뒤로 옮긴다 — 구조적으로 바뀌면 표시.
+fn map_host(it: &mut Item, q: usize, t: &TOp) -> usize {
+    match map_para(q, t) {
+        ParaFate::Kept(x) => x,
+        ParaFate::Touched(x) => {
+            it.mark("touched");
+            x
+        }
+        ParaFate::Gone(x) => {
+            it.mark("gone");
+            x
+        }
+    }
+}
+
+fn map_item_text(it: &mut Item, t: &TOp) {
+    match t.space() {
+        Space::Body { .. } if it.path.is_empty() => {
+            let m = map_in_space(it, it.para, t);
+            it.para = m.para;
+            it.off = m.off;
+        }
+        // 본문 편집이 표를 품은 문단을 옮기거나 구조적으로 바꿈(그 문단 안 글자 입력은 칸과 무관)
+        Space::Body { .. } => it.para = map_host(it, it.para, t),
+        Space::Cell { .. } if it.path.is_empty() => {}
+        Space::Cell { hosts, chain, .. } => {
+            if it.agree(hosts, chain).is_none() {
+                return;
+            }
+            let (m, n) = (chain.len(), it.path.len());
+            if m == n {
+                // 같은 칸(가장 안쪽)
+                let q = it.path[n - 1].2;
+                let p = map_in_space(it, q, t);
+                it.path[n - 1].2 = p.para;
+                it.off = p.off;
+            } else if m < n {
+                // 바깥 칸의 편집: 그 칸에서 다음 단계 표를 품은 문단(path[m-1].2)을 옮긴다
+                let q = it.path[m - 1].2;
+                it.path[m - 1].2 = map_host(it, q, t);
+            } else if hosts.get(n) == Some(&it.path[n - 1].2) {
+                // 내 칸 문단 안의 중첩 표를 고침
+                it.mark("touched");
+            }
+        }
     }
 }
 
@@ -1450,44 +1559,16 @@ fn map_item(it: &mut Item, r: &Rec) {
         it.mark("whole");
         return;
     }
+    if it.scope == Scope::SectionAll {
+        let sec = r.text.as_ref().map(|t| Some(t.space().sec())).unwrap_or(r.section);
+        if same_scope(sec, Some(it.sec)) {
+            it.mark("section");
+        }
+        return;
+    }
     if let Some(t) = &r.text {
-        if t.space().sec() != it.sec {
-            return;
-        }
-        if let Some(q) = it.same_space_para(t) {
-            // 같은 공간(본문↔본문, 같은 칸↔같은 칸): 문단 운명과 글자 위치
-            match map_para(q, t) {
-                ParaFate::Gone(_) => it.mark("gone"),
-                ParaFate::Touched(_) => it.mark("touched"),
-                ParaFate::Kept(_) if text_touches_para(t, q) => it.mark("touched"),
-                ParaFate::Kept(_) => {}
-            }
-            let m = map_pos(Pos::new(q, it.off), t, it.bias);
-            match &mut it.cell {
-                None => it.para = m.pos.para,
-                Some((_, _, cp)) => *cp = m.pos.para,
-            }
-            it.off = m.pos.off;
-            return;
-        }
-        match (t.space(), it.cell) {
-            // 본문 편집이 표를 품은 문단을 옮기거나 구조적으로 바꿈(그 문단 안 글자 입력은 칸과 무관)
-            (Space::Body { .. }, Some(_)) => match map_para(it.para, t) {
-                ParaFate::Kept(q) => it.para = q,
-                ParaFate::Touched(q) => {
-                    it.mark("touched");
-                    it.para = q;
-                }
-                ParaFate::Gone(q) => {
-                    it.mark("gone");
-                    it.para = q;
-                }
-            },
-            // 내 칸 문단 안의 중첩 표를 고침
-            (Space::Cell { hosts, chain, .. }, Some((ci, cell, cp))) if chain.len() > 1 && hosts[0] == it.para && chain[0] == (ci, cell) && hosts.get(1) == Some(&cp) => {
-                it.mark("touched");
-            }
-            _ => {}
+        if t.space().sec() == it.sec && it.scope == Scope::Para {
+            map_item_text(it, t);
         }
         return;
     }
@@ -1497,7 +1578,7 @@ fn map_item(it: &mut Item, r: &Rec) {
     match r.conc {
         Conc::Structural => {
             it.mark("structural");
-            if let Some(f) = &r.foot {
+            if let Some(f) = r.foot.as_ref().filter(|_| it.scope == Scope::Para) {
                 if let Some(q) = f.shift(it.para) {
                     it.para = q;
                 }
@@ -1506,22 +1587,29 @@ fn map_item(it: &mut Item, r: &Rec) {
         Conc::Neutral => {
             let args = r.json["a"].as_array().cloned().unwrap_or_default();
             let m = r.json["m"].as_str().unwrap_or("");
-            if let Some((space, cp)) = cell_space_of(m, &args) {
-                // 셀 안 서식: 같은 칸 문단만
-                let same = match (&space, it.cell) {
-                    (Space::Cell { hosts, chain, .. }, Some((ci, cell, mine))) if chain.len() == 1 => hosts[0] == it.para && chain[0] == (ci, cell) && cp == mine,
-                    (Space::Cell { hosts, chain, .. }, Some((ci, cell, mine))) => hosts[0] == it.para && chain[0] == (ci, cell) && hosts.get(1) == Some(&mine),
-                    _ => false,
-                };
-                if same {
+            if it.scope == Scope::Section {
+                // 구역 단위 자리: 문단을 특정할 수 없는 서식(구역 정의·쪽 설정 등)만 닿는다
+                if cell_space_of(m, &args).is_none() && touches(r).iter().any(|t| matches!(t, Touch::Whole)) {
                     it.mark("touched");
+                }
+                return;
+            }
+            if let Some((space, cp)) = cell_space_of(m, &args) {
+                // 셀 안 서식: 같은 칸 문단, 또는 내 칸 문단 안의 중첩 표
+                if let Space::Cell { hosts, chain, .. } = &space {
+                    if it.agree(hosts, chain).is_some() {
+                        let (mm, n) = (chain.len(), it.path.len());
+                        if (mm == n && cp == it.path[n - 1].2) || (mm > n && hosts.get(n) == Some(&it.path[n - 1].2)) {
+                            it.mark("touched");
+                        }
+                    }
                 }
                 return;
             }
             for t in touches(r) {
                 match t {
                     Touch::Whole => it.mark("touched"),
-                    Touch::Paras { lo, hi, .. } if it.cell.is_none() && lo <= it.para && it.para <= hi => it.mark("touched"),
+                    Touch::Paras { lo, hi, .. } if it.path.is_empty() && lo <= it.para && it.para <= hi => it.mark("touched"),
                     _ => {}
                 }
             }
@@ -1550,12 +1638,15 @@ pub fn map_positions(recs: &[Value], catalog: &Value, items: &[Value]) -> Value 
     )
 }
 
-/// 명령이 만든 기록 열(순서대로)의 발자국 — 기록이 끝난 문서 좌표에서 고친 문단들. `whole` 이면 문단으로
-/// 특정할 수 없음(state·발자국 없는 구조·역할 없는 neutral), `nested` 면 중첩 셀을 고침.
+/// 명령이 만든 기록 열(순서대로)의 발자국 — 기록이 끝난 문서 좌표에서 고친 자리들. 문단으로 특정할 수 없지만 구역은
+/// 아는 기록(발자국 없는 구조, 역할 없는 neutral — 머리말·꼬리말 안 편집, 구역 정의 등)은 구역 단위 자리(U2),
+/// 구역도 모르면(`state`, 문서 전체 neutral) `whole`. `nested` 는 U1 호환으로 남는다(언제나 false — U2 에서 중첩 셀을
+/// 경로로 다룬다).
 pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
     let mut items: Vec<Item> = Vec::new();
-    let (mut whole, mut nested) = (false, false);
-    let para_item = |sec: usize, para: usize| Item { sec, para, off: 0, cell: None, bias: Bias::After, hit: None };
+    let mut whole = false;
+    let para_item = |sec: usize, para: usize| Item { sec, para, off: 0, path: vec![], scope: Scope::Para, bias: Bias::After, hit: None };
+    let section_item = |sec: usize| Item { scope: Scope::Section, ..para_item(sec, 0) };
     for e in entries {
         let r = classify(e, catalog);
         // 앞 기록의 발자국을 이 기록 뒤로 옮긴다(지워진 문단은 뺀다)
@@ -1563,13 +1654,19 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
             .into_iter()
             .filter_map(|mut it| {
                 map_item(&mut it, &r);
-                (it.hit != Some("gone")).then(|| Item { hit: None, ..it })
+                (it.hit != Some("gone")).then_some(Item { hit: None, ..it })
             })
             .collect();
-        let mut add = |sec: usize, space: &Space, paras: &[usize]| match space {
+        let add = |items: &mut Vec<Item>, sec: usize, space: &Space, paras: &[usize]| match space {
             Space::Body { .. } => items.extend(paras.iter().map(|&p| para_item(sec, p))),
-            Space::Cell { hosts, chain, .. } if chain.len() == 1 => items.extend(paras.iter().map(|&p| Item { cell: Some((chain[0].0, chain[0].1, p)), ..para_item(sec, hosts[0]) })),
-            Space::Cell { .. } => nested = true,
+            Space::Cell { hosts, chain, .. } => items.extend(paras.iter().map(|&p| {
+                let path = chain
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &(ci, cell))| (ci, cell, if k + 1 < chain.len() { hosts[k + 1] } else { p }))
+                    .collect();
+                Item { path, ..para_item(sec, hosts[0]) }
+            })),
         };
         if r.state {
             whole = true;
@@ -1582,7 +1679,7 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
                 TOp::Split { at, .. } => vec![at.para, at.para + 1],
                 TOp::Merge { para, .. } => vec![para - 1],
             };
-            add(t.space().sec(), t.space(), &paras);
+            add(&mut items, t.space().sec(), t.space(), &paras);
             continue;
         }
         let args = r.json["a"].as_array().cloned().unwrap_or_default();
@@ -1590,7 +1687,7 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
         match (r.conc, r.section) {
             (Conc::Neutral, Some(sec)) => {
                 if let Some((space, cp)) = cell_space_of(m, &args) {
-                    add(sec, &space, &[cp]);
+                    add(&mut items, sec, &space, &[cp]);
                     continue;
                 }
                 let mut found = false;
@@ -1600,18 +1697,20 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
                             found = true;
                             items.extend((lo..=hi).map(|p| para_item(sec, p)));
                         }
-                        _ => whole = true,
+                        _ => items.push(section_item(sec)),
                     }
                 }
                 if !found {
-                    whole = true;
+                    items.push(section_item(sec));
                 }
             }
-            (Conc::Structural, Some(_)) if r.foot.is_some() => {
-                let f = r.foot.as_ref().unwrap();
-                let hi = f.anchor + f.pd.max(0) as usize;
-                items.extend((f.anchor..=hi).map(|p| para_item(f.sec, p)));
-            }
+            (Conc::Structural, Some(sec)) => match &r.foot {
+                Some(f) => {
+                    let hi = f.anchor + f.pd.max(0) as usize;
+                    items.extend((f.anchor..=hi).map(|p| para_item(f.sec, p)));
+                }
+                None => items.push(section_item(sec)),
+            },
             _ => whole = true,
         }
     }
@@ -1622,7 +1721,7 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
             out.push(v);
         }
     }
-    json!({ "items": out, "whole": whole, "nested": nested })
+    json!({ "items": out, "whole": whole, "nested": false })
 }
 
 #[cfg(test)]

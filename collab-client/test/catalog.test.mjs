@@ -78,8 +78,12 @@ test('실제 분류: state 는 로컬 상태 의존 기능, text 는 7종, neutr
   assert.equal(CATALOG.registerHftOutlineFont.sync, 'none');
   assert.equal(CATALOG.setActiveField.sync, 'none', '업스트림 제외 목록은 none');
   assert.equal(CATALOG.setCaretPosition.sync, 'none');
-  // 메모 넣기는 지금 시각을 쓴다(memo_time::now) — R1b 가 같은 빌드끼리도 결과가 달라 내렸다
-  assert.equal(CATALOG.insertMemo.sync, 'state');
+  // 메모 넣기는 지금 시각을 쓴다(memo_time::now) — 기록 쪽이 정한 시각을 ctx.memoTime 으로 담아 op 로 올렸다(D4 후속)
+  for (const n of ['insertMemo', 'insertMemoByPath', 'insertMemoReply']) {
+    assert.equal(CATALOG[n].sync, 'op', n);
+    assert.deepEqual(CATALOG[n].ctx, ['memoTime'], `${n}: ctx.memoTime`);
+  }
+  for (const n of ['removeMemo', 'setMemoText', 'setMemoShape', 'setFormValueInCell', 'setFormValueInCellEx', 'applyFormActionUpdates']) assert.equal(CATALOG[n].sync, 'op', n);
   assert.ok(!Object.values(CATALOG).some((e) => e.sync === 'watch'), '감사하지 않은 레지스트리 밖 이름 없음');
   for (const n of ['insertText', 'insertTextLogical', 'replaceBodyTextLocal', 'insertTextInCell', 'pasteHtml', 'evaluateTableFormula']) {
     assert.deepEqual(CATALOG[n].ctx, ['activeField'], `${n}: ctx.activeField`);

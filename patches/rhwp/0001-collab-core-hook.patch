@@ -13,6 +13,21 @@ index 3ba518dd..b0a7e446 100644
  pub use document_core::DocumentCore;
  #[cfg(feature = "pdf-import")]
  pub use document_core::PdfImportSession;
+diff --git a/src/model/memo_time.rs b/src/model/memo_time.rs
+index e8e68c7e..09eafe29 100644
+--- a/src/model/memo_time.rs
++++ b/src/model/memo_time.rs
+@@ -5,6 +5,10 @@ const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+ const TICKS_PER_SECOND: i64 = 10_000_000;
+ 
+ pub(crate) fn now() -> u64 {
++    // cc-rhwp 다운스트림 패치(0001): 공동편집이 호출 하나 동안 고정한 시각(ctx.memoTime)이 있으면 그 값. 없으면 원래대로.
++    if let Some(ticks) = crate::collab::pinned_memo_time() {
++        return ticks;
++    }
+     let time = Utc::now();
+     (UNIX_EPOCH_TICKS
+         + time.timestamp() * TICKS_PER_SECOND
 diff --git a/src/wasm_api.rs b/src/wasm_api.rs
 index 80882ecd..32b75208 100644
 --- a/src/wasm_api.rs

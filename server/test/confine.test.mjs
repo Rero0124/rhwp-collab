@@ -230,13 +230,16 @@ test('form: 우회(함수 이름·state 바이트 위조, 기존 글자 모양 �
   await rejected(room, F, W, [stateAfter(F, (d) => d.applyCharFormat(0, 0, 0, 2, JSON.stringify({ italic: true })))], 'confined', 'state 로 본문 글자 모양');
   // form 으로 메모
   await rejected(room, F, W, [stateAfter(F, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'F', text: '메모' })))], 'confined', 'form 으로 메모 넣기');
+  await rejected(room, F, W, [memoOp(F, [0, 0, 0, 2], '메모')], 'confined', 'form 으로 메모 넣기(op)');
   // 거절 뒤에도 통과 사례는 그대로 된다
   await accepted(room, F, W, [op('setFieldValueByName', ['name', '거절 뒤'])], '거절 뒤 누름틀 값');
   W.close(); F.close();
 });
 
-// 메모 함수는 분류표에서 모두 state 라, 정상 클라이언트는 메모를 결과 전송(state)으로 보낸다. 2026-11-27 고침: 저장 때마다
-// 다시 쓰는 파생 스트림(/RhwpLineSegTags, 구역 바이트 다이제스트)과 메모만 있던 꼬리를 판정이 내용으로 비교해 거절했다.
+// 메모 함수는 op 다(2026-11-27 승격 — 메모를 만드는 호출은 기록 쪽이 정한 작성 시각을 ctx.memoTime 으로 담는다).
+// 정상 클라이언트는 작성자를 세션 이름으로 넣는다(D6). 아래 state 거절 사례는 결과 전송 판정(정규화 포함)을 본다.
+const MEMO_TIME = '134000000000000000';
+const memoOp = (c, a, text) => op('insertMemo', [...a, JSON.stringify({ author: c.name, text })], { ctx: { memoTime: MEMO_TIME } });
 
 test('comment: 본문·누름틀·메모에 본문을 섞은 state 는 forbidden(confined)', async () => {
   const { room } = await makeRoom();
@@ -248,12 +251,15 @@ test('comment: 본문·누름틀·메모에 본문을 섞은 state 는 forbidden
   W.close(); C.close();
 });
 
-test('comment: 메모 넣기(state)는 통과하고 다른 참여자와 정본이 같다', async () => {
+test('comment: 메모 넣기·답글·자기 메모 고치기(op)는 통과하고 다른 참여자와 정본이 같다', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const C = await client(room, 'C', 'comment');
   try {
-    await accepted(room, C, W, [stateAfter(C, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'C', text: '첫 메모' })))], '메모 넣기(state)');
+    await accepted(room, C, W, [memoOp(C, [0, 0, 0, 2], '첫 메모')], '메모 넣기(op)');
+    const id = JSON.parse(C.doc.getMemoList())[0].id;
+    await accepted(room, C, W, [op('insertMemoReply', [id, JSON.stringify({ author: C.name, text: '답글' })], { ctx: { memoTime: MEMO_TIME } })], '답글(op)');
+    await accepted(room, C, W, [op('setMemoText', [id, '고친 메모'])], '자기 메모 고치기(op)');
   } finally { W.close(); C.close(); }
 });
 
@@ -262,7 +268,7 @@ test('comment: 메모가 든 문서에서 state 로 스크립트 스트림을 �
   const W = await client(room, 'W');
   const C = await client(room, 'C', 'comment');
   try {
-    await accepted(room, C, W, [stateAfter(C, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'C', text: '첫 메모' })))], '메모 넣기(state)');
+    await accepted(room, C, W, [memoOp(C, [0, 0, 0, 2], '첫 메모')], '메모 넣기(op)');
     // 정상 메모 하나 + 기본 스크립트 스트림을 바꾼 바이트(부속 스트림 비교는 파생 스트림 하나만 뺀다)
     const memo = (d) => d.insertMemo(0, 0, 7, 9, JSON.stringify({ author: 'C', text: '둘째 메모' }));
     await rejected(room, C, W, [forgedState(C, memo, 'DefaultJScript', 'evil();')], 'confined', 'state 로 메모 + 스크립트 바꾸기');
@@ -287,11 +293,8 @@ test('view: 모든 편집이 forbidden(scope) — 정본에 닿지 않는다', a
   W.close(); V.close();
 });
 
-/** 정상 클라이언트의 섞인 묶음: 누름틀 값(op) 다음 메모(state — 그 시점까지의 결과 전체) */
-const mixed = (c) => [op('setFieldValueByName', ['name', '섞음']), stateAfter(c, (d) => {
-  d.setFieldValueByName('name', '섞음');
-  d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: c.name, text: '섞음 메모' }));
-})];
+/** 정상 클라이언트의 섞인 묶음: 누름틀 값 다음 메모(둘 다 op) */
+const mixed = (c) => [op('setFieldValueByName', ['name', '섞음']), memoOp(c, [0, 0, 0, 2], '섞음 메모')];
 
 test('form comment 권한이어도 본문 입력이 끼면, form 만이면 메모가 끼면 forbidden(confined)', async () => {
   const { room } = await makeRoom();

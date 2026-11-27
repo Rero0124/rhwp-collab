@@ -83,3 +83,65 @@ test('edit(또는 권한 정보 없음 = 인증을 끈 서버)이면 문이 없�
   allows(c, () => c.doc.splitParagraph(0, 0, 1), 'null');
   assert.deepEqual(c.denied, []);
 });
+
+// ── D6 메모 작성자 (docs/collab-stage5.md D6) ──────────────────────────────
+
+const memos = (c) => JSON.parse(c.doc.getMemoList());
+/** 문단 0 "이름:  끝" + 누름틀, 그 위에 남(을)의 메모 하나와 내(갑)의 메모 하나. 권한 없이 만든 뒤 시작한다. */
+function memoRoom() {
+  const { c, server } = setup();
+  c.engine.setMemoAuthor('을');
+  c.doc.insertMemo(0, 0, 0, 1, JSON.stringify({ author: '을', text: '남의 메모' }));
+  c.engine.setMemoAuthor('갑');
+  c.doc.insertMemo(0, 0, 2, 3, JSON.stringify({ author: '갑', text: '내 메모' }));
+  server.drain([c]);
+  const [other, mine] = ['을', '갑'].map((a) => memos(c).find((m) => m.author === a));
+  assert.ok(other && mine, '메모 둘');
+  return { c, server, other, mine };
+}
+
+test('D6: 메모를 만드는 호출의 작성자는 세션 이름으로 바뀌어 core 에 넘어가고 기록된다(인증을 끄면 그대로)', () => {
+  const { c } = setup();
+  c.engine.setMemoAuthor('세션 이름');
+  c.doc.insertMemo(0, 0, 0, 2, JSON.stringify({ author: '꾸민 이름', text: '메모' }));
+  const last = c.engine.lastLocal;
+  assert.equal(memos(c)[0].author, '세션 이름', 'core 에 넘어간 작성자');
+  const json = last.kind === 'op' ? last.a.at(-1) : null;
+  if (json !== null) assert.equal(JSON.parse(json).author, '세션 이름', '기록된 인자');
+  c.doc.insertMemoReply(memos(c)[0].id, JSON.stringify({ author: '또 꾸민 이름', text: '답글' }));
+  assert.equal(memos(c).find((m) => m.parentId !== null)?.author, '세션 이름', '답글 작성자');
+  // 인증을 끈 서버(이름 없음)
+  c.engine.setMemoAuthor(null);
+  c.doc.insertMemo(0, 0, 4, 5, JSON.stringify({ author: '넘긴 이름', text: '그대로' }));
+  assert.ok(memos(c).some((m) => m.author === '넘긴 이름'), '넘긴 작성자 그대로');
+});
+
+test('D6: comment 는 자기 메모만 고치고 지운다 — 남의 메모는 막고 안내, 답글은 누구의 메모에나', () => {
+  const { c, other, mine } = memoRoom();
+  c.engine.setScope('comment');
+  c.engine.setMemoAuthor('갑');
+  denies(c, () => c.doc.setMemoText(other.id, '남의 것을 고침'), '남의 메모 고치기');
+  denies(c, () => c.doc.removeMemo(other.id), '남의 메모 지우기');
+  assert.deepEqual([...new Set(c.denied)], [DENIED_TEXT.ownMemo]);
+  allows(c, () => c.doc.setMemoText(mine.id, '내 것을 고침'), '자기 메모 고치기');
+  allows(c, () => c.doc.insertMemoReply(other.id, JSON.stringify({ author: '갑', text: '답글' })), '남의 메모에 답글');
+  // 메모 모양은 구역 단위 — 그 구역에 남의 메모가 있으면 막힘
+  const shape = JSON.parse(c.doc.getMemoShape(0));
+  denies(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, lineColor: '#ff0000' })), '남의 메모가 있는 구역의 모양');
+  denies(c, () => c.doc.setMemoShape(-1, JSON.stringify({ ...shape, lineColor: '#ff0000' })), '모든 구역의 모양');
+  allows(c, () => c.doc.removeMemo(mine.id), '자기 메모 지우기');
+});
+
+test('D6: comment 의 메모 모양 — 구역의 메모가 모두 내 것이면 통과, 이름을 모르면 막힘, edit 는 제한 없음', () => {
+  const { c } = setup();
+  c.engine.setMemoAuthor('갑');
+  c.doc.insertMemo(0, 0, 0, 1, JSON.stringify({ text: '내 메모' }));
+  const shape = JSON.parse(c.doc.getMemoShape(0));
+  c.engine.setScope('comment');
+  allows(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, fillColor: '#eeeeff' })), '내 메모뿐인 구역');
+  c.engine.setMemoAuthor(null);
+  denies(c, () => c.doc.setMemoShape(0, JSON.stringify({ ...shape, fillColor: '#ffeeee' })), '이름을 모름');
+  c.engine.setScope('edit');
+  c.engine.setMemoAuthor('병');
+  allows(c, () => c.doc.setMemoText(memos(c)[0].id, 'edit 는 누구의 메모든'), 'edit');
+});

@@ -3,12 +3,12 @@
 import type { CatalogEntry } from './types.ts';
 
 /** 엔진 지문: 업스트림 커밋-패치 해시-보정·기록 코드 해시-분류표 해시. 방의 참여자는 모두 같아야 한다. */
-export const ENGINE_FINGERPRINT = "981ce66b4183-10d56f552026-69e0324c5ad3-792b6226269d";
+export const ENGINE_FINGERPRINT = "981ce66b4183-dce060218277-16149af85e06-15b2c228eca4";
 
 /** studio 합성 메서드(레지스트리에 있으나 export 가 아님). 내부에서 분류표의 export 를 부른다. */
 export const COMPOSED_METHODS: readonly string[] = ["setPageMargin","insertHyperlink","updateHyperlink","replaceHyperlinkText","removeHyperlink"];
 
-/** {"total":314,"op":182,"state":62,"local":1,"none":69,"watch":0,"text":23,"neutral":47,"structural":112,"ctx":25,"layout":11,"permForm":6,"permMemo":6,"unreviewed":0} */
+/** {"total":314,"op":191,"state":53,"local":1,"none":69,"watch":0,"text":23,"neutral":50,"structural":118,"ctx":28,"layout":11,"permForm":6,"permMemo":6,"unreviewed":0} */
 export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
   "addBookmark": {
     "sync": "op",
@@ -162,7 +162,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": null,
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 1개 < 5, 성공 225/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 1개 < 5, 성공 230/300)",
     "reach": "none"
   },
   "applyCharFormatInHeaderFooter": {
@@ -212,7 +212,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "reach": "none"
   },
   "applyFormActionUpdates": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "updates_json"
@@ -220,7 +220,6 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "section": null,
     "perm": "form",
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
     "reach": "studio"
   },
   "applyHfTemplate": {
@@ -417,7 +416,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": null,
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 3개 < 5, 성공 300/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 300/300)",
     "reach": "none"
   },
   "beginBatch": {
@@ -950,7 +949,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": 0,
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 15/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 9/300)",
     "reach": "none"
   },
   "deleteComposeControl": {
@@ -1933,7 +1932,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "reach": "plugin"
   },
   "insertMemo": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "section_idx",
@@ -1943,13 +1942,15 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
       "json"
     ],
     "section": 0,
+    "ctx": [
+      "memoTime"
+    ],
     "perm": "memo",
     "reviewed": true,
-    "why": "동작 동일성 검사: 이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 biz_plan.hwp [0,28,10,10,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
     "reach": "none"
   },
   "insertMemoByPath": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "section_idx",
@@ -1960,22 +1961,26 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
       "json"
     ],
     "section": 0,
+    "ctx": [
+      "memoTime"
+    ],
     "perm": "memo",
     "reviewed": true,
-    "why": "동작 동일성 검사: 이전 엔진과 동작이 다름: 결과 문서가 다름 — 사례 exam_social-p1.hwp [0,2,\"[{\\\"controlIndex\\\":0,\\\"cellIndex\\\":0,\\\"cellParaIndex\\\":0}]\",0,1,\"{\\\"lineColor\\\":\\\"#ff0000\\\"}\"]",
     "reach": "none"
   },
   "insertMemoReply": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "parent_id",
       "json"
     ],
     "section": null,
+    "ctx": [
+      "memoTime"
+    ],
     "perm": "memo",
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
     "reach": "none"
   },
   "insertNewNumber": {
@@ -2872,7 +2877,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "ctx": [
       "activeField"
     ],
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 225/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 230/300)",
     "reviewed": true,
     "reach": "none"
   },
@@ -3140,7 +3145,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "reach": "plugin"
   },
   "removeMemo": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "id"
@@ -3148,7 +3153,6 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "section": null,
     "perm": "memo",
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
     "reach": "none"
   },
   "removeTableCellFormulas": {
@@ -3170,7 +3174,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "ctx": [
       "activeField"
     ],
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 225/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 230/300)",
     "reviewed": true,
     "reach": "none"
   },
@@ -4044,7 +4048,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "reach": "studio"
   },
   "setFormValueInCell": {
-    "sync": "state",
+    "sync": "op",
     "conc": "neutral",
     "params": [
       "sec",
@@ -4063,12 +4067,12 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
       }
     ],
     "perm": "form",
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 300/300)",
+    "why": "셀 안 양식 개체 값만 바꾼다",
     "reviewed": true,
     "reach": "studio"
   },
   "setFormValueInCellEx": {
-    "sync": "state",
+    "sync": "op",
     "conc": "structural",
     "params": [
       "options_json"
@@ -4076,7 +4080,6 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "section": null,
     "perm": "form",
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 300/300)",
     "reach": "none"
   },
   "setHangul2024Compat": {
@@ -4113,7 +4116,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "reach": "studio"
   },
   "setMemoShape": {
-    "sync": "state",
+    "sync": "op",
     "conc": "neutral",
     "params": [
       "section_idx",
@@ -4122,12 +4125,12 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "section": 0,
     "roles": [],
     "perm": "memo",
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
+    "why": "구역의 메모 모양만 바꾼다",
     "reviewed": true,
     "reach": "none"
   },
   "setMemoText": {
-    "sync": "state",
+    "sync": "op",
     "conc": "neutral",
     "params": [
       "id",
@@ -4136,7 +4139,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     "section": null,
     "roles": [],
     "perm": "memo",
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 0개 < 5, 성공 0/300)",
+    "why": "메모 본문만 바꾼다(본문 문단 텍스트가 아님)",
     "reviewed": true,
     "reach": "none"
   },
@@ -4465,7 +4468,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
     ],
     "section": null,
     "reviewed": true,
-    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 4개 < 5, 성공 300/300)",
+    "why": "동작 동일성 검사: 사례 부족 (문서를 바꾼 성공 호출 3개 < 5, 성공 300/300)",
     "reach": "none"
   },
   "splitParaAtCursor": {

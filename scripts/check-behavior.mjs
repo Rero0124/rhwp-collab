@@ -10,7 +10,7 @@
 //    새 엔진(--new, 기본 upstream/rhwp/pkg)에서 같은 문서·같은 호출을 한 뒤, 양쪽 결과를 새 엔진으로 다시
 //    읽어 digest 를 비교한다. 성공/실패와 문단 수도 같아야 한다.
 // 2. 재생 가능성: 새 엔진에서 문서 두 개 중 한쪽의 비문서 상태를 흐트러뜨리고(내부·전치 클립보드, 스냅샷
-//    저장소, active_field, 조판 미룸) 같은 호출을 해 결과가 같은지 본다. `ctx` 로 담는 숨은 입력과 `layout`
+//    저장소, active_field, 조판 미룸) 같은 호출을 해 결과가 같은지 본다. `ctx` 로 담는 숨은 입력(메모 시각 포함)과 `layout`
 //    기능의 조판 flush 는 재생 방식대로 맞춘 뒤 비교한다.
 //
 // 사례가 5개(문서를 바꾼 성공 호출) 미만이거나, 차분이 다르거나, 재생 가능성이 깨지면 `catalog-drift.json`
@@ -105,15 +105,45 @@ function richBytes(m) {
     () => d.insertEquation(0, 0, 2, 'a+b', 1000, 0),
     () => d.addBookmark(0, 1, 3, 'bm1'),
     () => d.createShapeControl(JSON.stringify({ sectionIdx: 0, paraIdx: 1, charOffset: 4, width: 3000, height: 2000 })),
+    // 메모·답글(메모 id 로 고치는 기능의 사례 — 문서를 한 번 만들 때 넣으므로 작성 시각은 모든 사례에 같다)
+    () => d.insertMemo(0, 1, 0, 2, JSON.stringify({ author: '갑', text: '있던 메모' })),
+    () => d.insertMemoReply(JSON.parse(d.getMemoList())[0].id, JSON.stringify({ author: '을', text: '있던 답글' })),
+    () => d.insertMemo(0, 0, 0, 1, JSON.stringify({ author: '병', text: '둘째 메모' })),
+    () => d.insertMemo(0, 0, 2, 3, JSON.stringify({ author: '정', text: '셋째 메모' })),
+    () => d.insertMemo(0, 0, 4, 5, JSON.stringify({ author: '무', text: '넷째 메모' })),
+    () => d.insertMemo(0, 1, 3, 4, JSON.stringify({ author: '기', text: '다섯째 메모' })),
   ];
   for (const s of steps) { try { s(); } catch { /* 이 개체는 없이 */ } }
   const b = d.exportHwp();
   d.free();
   return b;
 }
+/** 칸 안 양식 개체(샘플에 없고 만드는 export 도 없다): form-01 의 양식 하나를 복사해 끝 문단 표(1×2) 칸 0 문단 0 에 붙인다. */
+function formInCellBytes(m) {
+  const path = join(SAMPLES, 'form-01.hwp');
+  if (!existsSync(path)) return null;
+  const d = new m.HwpDocument(readFileSync(path));
+  try {
+    const n = d.getParagraphCount(0);
+    const forms = JSON.parse(d.getControls()).filter((c) => c.list === 0 && c.ctrlId.trim() === 'form');
+    const typeOf = (c) => { try { return JSON.parse(d.getFormObjectInfo(0, c.para, c.controlIndex)).formType; } catch { return ''; } };
+    const form = forms.find((c) => ['CheckBox', 'Edit'].includes(typeOf(c))) ?? forms[0];
+    if (!form) return null;
+    const t = JSON.parse(d.createTable(0, n - 1, 0, 1, 2));
+    d.copyControl(0, form.para, '', form.controlIndex);
+    d.pasteInternalInCell(0, t.paraIdx, t.controlIdx, 0, 0, 0);
+    return d.exportHwp();
+  } catch {
+    return null;
+  } finally {
+    d.free();
+  }
+}
+const formInCell = formInCellBytes(NEW);
 const docs = [
   { name: 'blank', bytes: blankBytes(NEW) },
   { name: 'rich(합성)', bytes: richBytes(NEW) },
+  ...(formInCell ? [{ name: 'form-in-cell(합성)', bytes: formInCell }] : []),
   ...['biz_plan.hwp', '143E433F503322BD33.hwp', 'exam_social-p1.hwp', 'footnote-01.hwp', 'form-01.hwp',
     // R14 후속: 업스트림 샘플(희소 경로에 추가 — 우리 저장소에 복사하지 않고 참조만)
     'chart/가로막대형/묶은가로막대형.hwp', 'issue6179/right_tab_footer_logo.hwpx', 'basic/BlogForm_BookReview.hwp', 'basic/BlogForm_MovieReview.hwp', 'basic/BlogForm_Recipe.hwp']
@@ -254,11 +284,17 @@ function exOptions(name, s) {
 const encode = (a) => a.map((v) => (v instanceof Uint8Array ? { $b64: Buffer.from(v).toString('base64') } : v));
 const decode = (a) => a.map((v) => (v && typeof v === 'object' && '$b64' in v ? Uint8Array.from(Buffer.from(v.$b64, 'base64')) : v));
 let lastError = '';
+/** ctx.memoTime 으로 시각을 담는 기능(메모 만들기)은 재생 방식대로 같은 시각을 이 호출 하나 동안 고정한다. */
+const MEMO_TIME = '134000000000000000';
+const pinsMemoTime = (name) => (CATALOG[name]?.ctx ?? []).includes('memoTime');
 function call(d, name, args) {
+  const prev = pinsMemoTime(name) && typeof d.collabSetMemoTime === 'function' ? d.collabSetMemoTime(MEMO_TIME) : null;
   try { d[name](...decode(args)); return true; } catch (e) {
     lastError = String(e?.message ?? e).slice(0, 140);
     if (TRAP.test(lastError) || e instanceof WebAssembly.RuntimeError) trapped = true;
     return false;
+  } finally {
+    if (prev !== null) { try { d.collabSetMemoTime(prev); } catch { /* 멈춘 인스턴스 */ } }
   }
 }
 /** 사례 = { doc, prep: [[메서드, 인자]...], args }. 준비 단계는 두 엔진에서 똑같이 먼저 부른다. */

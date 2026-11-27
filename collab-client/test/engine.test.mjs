@@ -70,9 +70,13 @@ test('기록: none·local 은 기록하지 않고, 붙여넣기는 ctx.clipboard
   assert.deepEqual(got.map((e) => [e.kind, e.m]), [['op', 'insertText'], ['op', 'pasteInternal']]);
   assert.equal(typeof got[1].ctx.clipboard.paras, 'string', '클립보드 문단을 담는다');
   assert.equal(typeof got[1].meta.pd, 'number', '구조 연산은 문단 수 변화를 잰다');
-  // state(메모 넣기 — 지금 시각을 쓴다)는 결과를 담고, 보내지 않은 연속 state 는 마지막 것만
-  a.doc.insertMemo(0, 0, 0, 3, JSON.stringify({ author: 'a', text: '첫 메모' }));
-  a.doc.insertMemo(0, 0, 4, 6, JSON.stringify({ author: 'a', text: '둘째 메모' }));
+  // state(스냅샷 복원 — 문서 객체 안 저장소에 기댄다)는 결과를 담고, 보내지 않은 연속 state 는 마지막 것만
+  const s1 = a.doc.saveSnapshot();
+  a.doc.insertText(0, 0, 0, '더 ');
+  const s2 = a.doc.saveSnapshot();
+  a.engine.takePending();
+  a.doc.restoreSnapshot(s1);
+  a.doc.restoreSnapshot(s2);
   got = a.engine.takePending();
   assert.deepEqual(got.map((e) => e.kind), ['state'], '연속된 보내지 않은 state 는 하나로');
   const check = new m.HwpDocument(base);

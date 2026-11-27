@@ -8,9 +8,12 @@
  * - `state`: 인자와 문서만으로 결과가 정해지지 않는 것 — 내부·전치 클립보드, 붙여넣기 연쇄 수, 로컬 저장소 id.
  * - `neutral`: 문단 수·텍스트 오프셋·개체 번호·표 행열 구조를 바꾸지 않는 것. `roles` 는 위치 인자.
  * - `layout: true`: 결과가 조판(쪽 나눔·렌더 위치)에 기댄다. 재생 전에 미뤄 둔 조판을 끝내야 한다.
- * - 개체 id 는 모두 문서·인자로 정해진다(next_instance_id·위치 해시·문서 전체 순서). 시각·난수 없음.
+ * - 개체 id 는 모두 문서·인자로 정해진다(next_instance_id·위치 해시·문서 전체 순서). 난수 없음. 시각은 메모를
+ *   만들 때 한 곳(업스트림 `memo_time::now`, 메모 명령의 작성 시각) — 아래 `memoTime` 으로 담는다.
  * - `ctx: ['activeField']`: 누름틀 문단에서 로컬 `active_field` 를 읽는 기능(숨은 입력). 기록 때 실측해 담고
  *   재생 때 그 값으로 맞춘다.
+ * - `ctx: ['memoTime']`: 메모를 만드는 기능. 기록 쪽이 시각 T 를 정해 호출 하나 동안 고정하고 담으며, 재생 쪽은 같은
+ *   T 로 고정한 채 부른다(0001 의 업스트림 한 줄이 고정값을 읽는다).
  * - `local`: 문서가 아닌 보기 상태(공유 안 함). `none`: 문서를 바꾸지 않음(기록 안 함).
  * - 레지스트리 밖 `&mut self` export 도 감사한다(R1 결정 3). 감사하지 않은 레지스트리 밖 새 이름은 digest 감시.
  */
@@ -227,9 +230,9 @@ export const OVERRIDES: Readonly<Record<string, CatalogOverride>> = {
   insertClickHereFieldEx: { params: ["options_json"] },
   insertClickHereFieldInCell: { params: ["section_idx", "parent_para_idx", "control_idx", "cell_idx", "cell_para_idx", "char_offset", "is_textbox", "guide", "memo", "name", "editable"] , roles: [{ kind: "anchor", arg: 1, control: 2 }]},
   insertClickHereFieldInCellEx: { params: ["options_json"] },
-  insertMemo: { params: ["section_idx", "para_idx", "start_char_idx", "end_char_idx", "json"], perm: "memo" },
-  insertMemoByPath: { params: ["section_idx", "para_idx", "path_json", "start_char_idx", "end_char_idx", "json"], perm: "memo" },
-  insertMemoReply: { params: ["parent_id", "json"], perm: "memo" },
+  insertMemo: { params: ["section_idx", "para_idx", "start_char_idx", "end_char_idx", "json"], perm: "memo", ctx: ["memoTime"] },
+  insertMemoByPath: { params: ["section_idx", "para_idx", "path_json", "start_char_idx", "end_char_idx", "json"], perm: "memo", ctx: ["memoTime"] },
+  insertMemoReply: { params: ["parent_id", "json"], perm: "memo", ctx: ["memoTime"] },
   insertParagraph: { params: ["section_idx", "para_idx"] , roles: [{ kind: "anchor", arg: 1 }]},
   insertPictureEx: { params: ["options_json", "image_data"], layout: true, why: "셀 안 그림 위치를 쪽 기준으로 계산한다(compute_cell_page_offset)" },
   insertRuby: { params: ["sec", "para", "char_offset", "json"] },

@@ -1005,3 +1005,50 @@ fn confined_state_on_real_files_compares_both_sides_after_export_and_reparse() {
         assert_eq!(v["ok"], json!(false), "{f} 메모 + 본문(state): {v}");
     }
 }
+
+// ── D4 후속: 메모 시각 고정(ctx.memoTime) ─────────────────────────────────────
+
+#[test]
+fn memo_inserts_are_deterministic_under_a_pinned_clock() {
+    // 업스트림이 메모 명령에 지금 시각을 박는다 — 고정하면 같은 호출이 같은 문서. 업스트림이 다른 시각 원천이나
+    // 난수를 더하면 여기와 R1b(check-behavior)가 잡는다.
+    const T: u64 = 134_000_000_000_000_000;
+    let run = || {
+        let _pin = super::MemoTimePin::new(T);
+        let mut c = CollabCore::new(blank());
+        c.insert_text_native(0, 0, 0, "메모 달 글자입니다").unwrap();
+        c.insert_memo_json_native(0, 0, 0, 2, r#"{"author":"갑","text":"첫 메모"}"#).unwrap();
+        let list: Value = serde_json::from_str(&c.get_memo_list_json()).unwrap();
+        let id = list[0]["id"].as_u64().unwrap() as u32;
+        c.insert_memo_reply_json_native(id, r#"{"author":"을","text":"답글"}"#).unwrap();
+        (c.export_state().unwrap(), c.digest(), c.get_memo_list_json())
+    };
+    let (a, b) = (run(), run());
+    assert_eq!(a.1, b.1, "digest");
+    assert_eq!(a.0, b.0, "내보낸 바이트");
+    assert_eq!(a.2, b.2, "메모 목록");
+    // 메모 명령에 고정한 시각이 들어간다(하위·상위 DWORD)
+    assert!(a.2.contains(&crate::model::memo_time::date(&format!("MEMO/1/1/{}/{}/x", T as u32, T >> 32)).unwrap()), "{}", a.2);
+    // 가드가 풀리면 원래대로
+    assert_eq!(super::pinned_memo_time(), None);
+}
+
+#[test]
+fn memo_time_pin_is_released_even_when_the_call_panics() {
+    let r = std::panic::catch_unwind(|| {
+        let _pin = super::MemoTimePin::new(7);
+        assert_eq!(super::pinned_memo_time(), Some(7));
+        panic!("호출 중 실패");
+    });
+    assert!(r.is_err());
+    assert_eq!(super::pinned_memo_time(), None);
+    // 겹쳐 걸면 안쪽이 풀릴 때 바깥 값으로
+    let outer = super::MemoTimePin::new(1);
+    {
+        let _inner = super::MemoTimePin::new(2);
+        assert_eq!(super::pinned_memo_time(), Some(2));
+    }
+    assert_eq!(super::pinned_memo_time(), Some(1));
+    drop(outer);
+    assert_eq!(super::pinned_memo_time(), None);
+}

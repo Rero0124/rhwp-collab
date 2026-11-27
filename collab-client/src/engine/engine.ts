@@ -21,7 +21,7 @@ import type { CatalogEntry } from './types.ts';
 
 /** 기록 하나 (§3 기록 형태). */
 export type Entry =
-  | { kind: 'op'; m: string; a: unknown[]; meta?: Record<string, unknown>; ctx?: { activeField?: unknown; clipboard?: unknown } }
+  | { kind: 'op'; m: string; a: unknown[]; meta?: Record<string, unknown>; ctx?: { activeField?: unknown; clipboard?: unknown; memoTime?: string } }
   | { kind: 'state'; data: string };
 
 /** 엔진이 쓰는 문서 핸들 — `HwpDocument` 의 collab 보조 export 와, 이름으로 부를 변경 export 들. */
@@ -44,6 +44,8 @@ export interface EngineDoc {
   collabFootprint?(entriesJson: string, catalogJson: string): string;
   /** 5단계 D4 클라이언트 문: 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가. */
   collabFieldContains?(method: string, argsJson: string, activeFieldJson: string): boolean;
+  /** D6: 메모 목록(작성자 확인) — 업스트림 `getMemoList` */
+  getMemoList?(): string;
   collabDigest(): string;
   collabFlushLayout(): void;
   /** rhwp 배치 괄호 — 안의 편집은 쪽 배치(pagination)를 끝에 한 번만 한다(R1 감사: 쪽 소속 확정만 미룸). */
@@ -54,6 +56,9 @@ export interface EngineDoc {
   /** 재생 쪽 — 기록의 클립보드로 잠시 바꾼다 / 되돌린다. */
   collabPushClipboard(json: string): void;
   collabPopClipboard(): void;
+  /** 메모 시각 고정(FILETIME 틱 10진 문자열, "" = 풂). 이전 값을 돌려준다. */
+  collabSetMemoTime(ticks: string): string;
+  collabMemoTimeNow(): string;
   /** 구역의 문단 수(읽기 전용 조회 — 기록 훅에 걸리지 않는다). 구조 연산의 문단 수 변화 `pd` 를 잰다(R13). */
   getParagraphCount(section: number): number;
 }
@@ -150,7 +155,19 @@ export const DENIED_TEXT = {
   view: '보기 권한이라 문서를 고칠 수 없습니다',
   form: '양식 칸에만 입력할 수 있습니다',
   comment: '메모만 달 수 있습니다',
+  /** D6: comment 권한으로 남의 메모를 고치거나 지우려 함 */
+  ownMemo: '자기 메모만 고칠 수 있습니다',
 } as const;
+
+/** D6: 메모를 만드는 함수 — `{author,text}` JSON 인자의 작성자를 세션 이름으로 바꿔 넣는다. */
+const MEMO_AUTHORED = new Set(['insertMemo', 'insertMemoByPath', 'insertMemoReply']);
+/** D6: comment 권한은 자기 메모만 고친다(답글은 누구의 메모에나). `setMemoShape` 은 구역 단위라 그 구역 메모가 모두 내 것일 때만. */
+const OWN_MEMO_ONLY = new Set(['setMemoText', 'removeMemo', 'setMemoShape']);
+
+/** 업스트림 `sanitize_author` 와 같은 정리(앞뒤 공백, `/`·`\`·`;`·제어 문자 뺌) — 저장된 작성자와 비교할 때 쓴다. */
+export function sanitizeMemoAuthor(name: string): string {
+  return name.trim().replace(/[/\\;\p{Cc}]/gu, '');
+}
 
 /** 빠른 경로 통계 (R11 측정·관문). */
 export interface FastStats {
@@ -201,6 +218,8 @@ export class CollabEngine {
   private readonly onDenied: (message: string, method: string) => void;
   /** 5단계 D4: 이 연결의 권한(`welcome.user.scope`). `null` = 제한 없음(edit, 인증을 끈 서버). */
   private scope: { edit: boolean; form: boolean; comment: boolean } | null = null;
+  /** D6: 메모 작성자로 쓸 세션 이름(`null` = 인증을 끈 서버, 넘긴 작성자 그대로) */
+  private memoAuthor: string | null = null;
   private readonly fast: boolean;
   private readonly verifyFast: boolean;
   readonly fastStats: FastStats = { fast: 0, slow: 0, fallback: 0, blocks: {}, mismatches: [], fastMs: 0, slowMs: 0 };
@@ -237,6 +256,14 @@ export class CollabEngine {
   }
 
   /**
+   * D6: 메모 작성자로 쓸 세션 이름(서버가 확인한 이름 — 토큰의 `name`, 없으면 hello 의 이름). `null` 이면(인증을 끈
+   * 서버) 넘긴 작성자 그대로. 메모를 만드는 호출의 `author` 를 이 이름으로 바꿔 core 에 넘기고 기록한다.
+   */
+  setMemoAuthor(name: string | null): void {
+    this.memoAuthor = name;
+  }
+
+  /**
    * 5단계 D4: 권한을 정한다(공백 구분 문자열 또는 목록, `null` = 제한 없음). `edit` 가 없으면 권한 문이 켜진다:
    * 기록하는 호출(분류표 `op`·`state`·`watch`)을 문서 코어에 닿기 전에 판정하고, 허용되지 않으면 `PermissionDenied`.
    * `view`: 모두 거절. `form`: `perm: 'form'` 과, 활성 누름틀 안에 완전히 드는 글자 연산. `comment`: `perm: 'memo'`.
@@ -256,7 +283,7 @@ export class CollabEngine {
     const s = this.scope;
     if (!s) return null;
     if (info.perm === 'form' && s.form) return null;
-    if (info.perm === 'memo' && s.comment) return null;
+    if (info.perm === 'memo' && s.comment) return OWN_MEMO_ONLY.has(name) ? this.ownMemoDenial(doc, name, args, info) : null;
     if (s.form && info.sync === 'op' && info.conc === 'text' && doc.collabFieldContains) {
       const af = doc.collabGetActiveField();
       if (af !== 'null') {
@@ -266,6 +293,35 @@ export class CollabEngine {
       }
     }
     return s.form ? DENIED_TEXT.form : s.comment ? DENIED_TEXT.comment : DENIED_TEXT.view;
+  }
+
+  /** D6: comment 권한의 메모 고치기·지우기·모양 — 대상 메모가 모두 내 것인가. 판정할 수 없으면 막는다. */
+  private ownMemoDenial(doc: EngineDoc, name: string, args: unknown[], info: CatalogEntry): string | null {
+    const me = this.memoAuthor === null ? null : sanitizeMemoAuthor(this.memoAuthor);
+    let memos: Array<{ id: number; author: string; sectionIndex?: number }>;
+    try { memos = JSON.parse(doc.getMemoList?.() ?? 'null'); } catch { memos = null as never; }
+    if (me === null || !Array.isArray(memos)) return DENIED_TEXT.ownMemo;
+    const params = info.params ?? [];
+    let targets: typeof memos;
+    if (name === 'setMemoShape') {
+      const sec = args[params.indexOf('section_idx')];
+      targets = memos.filter((m) => sec === -1 || m.sectionIndex === sec);
+    } else {
+      const id = args[params.indexOf('id')];
+      targets = memos.filter((m) => m.id === id);
+      if (targets.length === 0) return null; // 없는 메모 — core 가 거절한다(문서는 그대로)
+    }
+    return targets.every((m) => m.author === me) ? null : DENIED_TEXT.ownMemo;
+  }
+
+  /** D6: 메모를 만드는 호출의 `{author}` 를 세션 이름으로(인자 배열을 고친다 — 원래 호출도 이 배열로 부른다). */
+  private stampMemoAuthor(args: unknown[], info: CatalogEntry): void {
+    const at = (info.params ?? []).indexOf('json');
+    if (at < 0 || typeof args[at] !== 'string' || this.memoAuthor === null) return;
+    let input: unknown;
+    try { input = JSON.parse(args[at] as string); } catch { return; } // core 가 거절한다
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return;
+    args[at] = JSON.stringify({ ...(input as Record<string, unknown>), author: this.memoAuthor });
   }
 
   /** 미확정·확정 대기·스냅샷을 모두 버린다. */
@@ -312,6 +368,7 @@ export class CollabEngine {
         throw new PermissionDenied(denied, name);
       }
     }
+    if (MEMO_AUTHORED.has(name)) this.stampMemoAuthor(args, info);
     if (!this.recording) return invoke();
 
     const createdSnapshot = this.ensureSnapshot(doc);
@@ -321,7 +378,7 @@ export class CollabEngine {
     const anchored = info.sync === 'op' && info.conc === 'structural' && info.section !== null && (info.roles ?? []).some((r) => r.kind === 'anchor');
     const footSec = anchored ? (args[info.section as number] as number) : -1;
     let parasBefore: number | null = null;
-    let ctx: { activeField?: unknown; clipboard?: unknown } | undefined;
+    let ctx: { activeField?: unknown; clipboard?: unknown; memoTime?: string } | undefined;
     try {
       if (info.layout) doc.collabFlushLayout();
       if (info.sync === 'watch') digestBefore = doc.collabDigest();
@@ -331,6 +388,8 @@ export class CollabEngine {
       if (info.ctx?.includes('activeField')) ctx = { activeField: JSON.parse(doc.collabGetActiveField()) };
       // 붙여넣기: 받는 쪽은 직렬화→다시 읽은 클립보드로 붙이므로 나도 같은 값으로 붙인다(R13)
       if (info.ctx?.includes('clipboard')) ctx = { ...ctx, clipboard: JSON.parse(doc.collabNormalizeClipboard()) };
+      // 메모를 만드는 함수는 지금 시각을 메모에 박는다 — 시각 T 를 정해 이 호출 하나 동안 고정하고 같이 보낸다
+      if (info.ctx?.includes('memoTime')) ctx = { ...ctx, memoTime: doc.collabMemoTimeNow() };
       if (anchored && Number.isInteger(footSec)) parasBefore = doc.getParagraphCount(footSec);
     } catch (error) {
       if (createdSnapshot) this.dropSnapshotIfIdle(doc);
@@ -338,12 +397,15 @@ export class CollabEngine {
     }
 
     let result: unknown;
+    const pinned = ctx?.memoTime !== undefined ? doc.collabSetMemoTime(ctx.memoTime) : null;
     try {
       result = invoke();
     } catch (error) {
       // 원래 호출이 실패하면 기록하지 않는다(대부분의 export 는 바꾸기 전에 검증한다).
       if (createdSnapshot) this.dropSnapshotIfIdle(doc);
       throw error;
+    } finally {
+      if (pinned !== null) doc.collabSetMemoTime(pinned);
     }
 
     let entry: Entry | null = null;
@@ -472,11 +534,14 @@ export class CollabEngine {
     const args = decodeArgs(entry.a);
     const hasField = Boolean(entry.ctx && 'activeField' in entry.ctx);
     const hasClip = Boolean(entry.ctx && 'clipboard' in entry.ctx);
+    const memoTime = typeof entry.ctx?.memoTime === 'string' ? entry.ctx.memoTime : null;
     const previous = hasField ? doc.collabSetActiveField(JSON.stringify(entry.ctx?.activeField ?? null)) : null;
     if (hasClip) doc.collabPushClipboard(JSON.stringify(entry.ctx?.clipboard ?? null));
+    const pinned = memoTime !== null ? doc.collabSetMemoTime(memoTime) : null;
     try {
       callMethod(doc, entry.m, args);
     } finally {
+      if (pinned !== null) doc.collabSetMemoTime(pinned);
       if (hasClip) doc.collabPopClipboard();
       if (previous !== null) doc.collabSetActiveField(previous);
     }

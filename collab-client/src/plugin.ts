@@ -372,6 +372,7 @@ export const collabPlugin = {
       ready = false;
       engine.detach();
       engine.setScope(null);
+      engine.setMemoAuthor(null);
       applyFormMode(null);
       releaseIntercept();
       resumeHistory();
@@ -728,8 +729,10 @@ export const collabPlugin = {
       // 5단계 D4: 권한 문(엔진 — 모든 호출 경로가 지나는 자리)과 studio 양식 모드. 인증을 끈 서버는 user 가 없다 = edit.
       engine.setScope(user?.scope ?? null);
       applyFormMode(user?.scope ?? null);
-      if (!user) return;
+      if (!user) { engine.setMemoAuthor(null); return; }
       if (user.name && user.name !== name) { name = user.name; render(); }
+      // D6: 메모 작성자 = 서버가 아는 이 연결의 이름(토큰의 name, 없으면 hello 에 보낸 이름). studio 의 로컬 이름이 아니다.
+      engine.setMemoAuthor(name);
       if (editLevel(user.scope) === 'none' && !viewOnlyNoticed) { viewOnlyNoticed = true; notice(VIEW_ONLY_NOTICE, 'view-only'); }
     };
     /** unauthorized: 만료면 한 번 새 토큰으로 다시 붙고(닫힘 처리의 재접속이 새 토큰을 쓴다), 아니면 멈추고 안내한다. */
@@ -899,6 +902,7 @@ export const collabPlugin = {
       for (const t of noticeTimers) clearTimeout(t);
       engine.detach();
       engine.setScope(null);
+      engine.setMemoAuthor(null);
       applyFormMode(null);
       releaseIntercept();
       resumeHistory();

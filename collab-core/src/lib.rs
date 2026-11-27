@@ -40,6 +40,46 @@ mod confine;
 #[path = "wasm.rs"]
 mod wasm;
 
+// ── 메모 시각 고정 (5단계 D4 후속: 메모 함수를 op 로) ─────────────────────────────
+//
+// 메모를 만들 때 업스트림이 지금 UTC 시각(FILETIME)을 메모 명령에 박는다(`model/memo_time.rs`) — 같은 호출을 다른
+// 때 재생하면 다른 문서가 된다. 기록 쪽은 시각 T 를 정해 고정한 채 부르고 `ctx.memoTime = T` 로 남기며, 재생 쪽은 같은
+// T 로 고정한 채 부른다. 업스트림 `memo_time::now()` 는 고정값이 있으면 그 값을 쓴다(0001 의 한 줄).
+
+thread_local! {
+    static MEMO_TIME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// 지금 고정된 메모 시각(FILETIME 틱). 업스트림 `memo_time::now()` 가 부른다.
+pub fn pinned_memo_time() -> Option<u64> {
+    MEMO_TIME.with(std::cell::Cell::get)
+}
+
+/// 메모 시각을 고정하는 동안 살아 있는 가드. 버리면(패닉으로 풀릴 때도) 이전 값으로 돌아간다.
+pub struct MemoTimePin(Option<u64>);
+
+impl MemoTimePin {
+    pub fn new(ticks: u64) -> Self {
+        Self(MEMO_TIME.with(|c| c.replace(Some(ticks))))
+    }
+}
+
+impl Drop for MemoTimePin {
+    fn drop(&mut self) {
+        MEMO_TIME.with(|c| c.set(self.0));
+    }
+}
+
+/// 고정값을 바꾸고 이전 값을 돌려준다(JS 경계용 — 호출하는 쪽이 `finally` 에서 이전 값으로 되돌린다).
+pub fn set_pinned_memo_time(ticks: Option<u64>) -> Option<u64> {
+    MEMO_TIME.with(|c| c.replace(ticks))
+}
+
+/// 지금 시각(FILETIME 틱) — 고정돼 있으면 그 값. 기록 쪽이 고정할 T 를 정할 때 쓴다.
+pub fn memo_time_now() -> u64 {
+    crate::model::memo_time::now()
+}
+
 /// gzip 머리 (RFC 1952)
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// 결과 풀기 상한 — 압축 폭탄으로 메모리를 다 쓰지 않게 한다.

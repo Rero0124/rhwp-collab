@@ -139,6 +139,24 @@ impl HwpDocument {
         Ok(super::ot::footprint(&entries, &catalog).to_string())
     }
 
+    /// 메모 시각 고정(ctx.memoTime): FILETIME 틱을 10진 문자열로(JS 안전 정수 범위를 넘는다). 빈 문자열이면 푼다.
+    /// 이전 값을 돌려준다("" = 없음) — 부르는 쪽이 `finally` 에서 이전 값으로 되돌린다(호출 하나 동안만).
+    #[wasm_bindgen(js_name = collabSetMemoTime)]
+    pub fn collab_set_memo_time(&self, ticks: &str) -> Result<String, JsValue> {
+        let next = if ticks.is_empty() {
+            None
+        } else {
+            Some(ticks.parse::<u64>().map_err(|e| JsValue::from_str(&format!("memoTime 해석 실패: {e}")))?)
+        };
+        Ok(super::set_pinned_memo_time(next).map(|t| t.to_string()).unwrap_or_default())
+    }
+
+    /// 지금 메모 시각(FILETIME 틱, 10진 문자열) — 기록 쪽이 고정할 값을 정한다.
+    #[wasm_bindgen(js_name = collabMemoTimeNow)]
+    pub fn collab_memo_time_now(&self) -> String {
+        super::memo_time_now().to_string()
+    }
+
     /// 문서 모델의 지문(hex, 캐럿 제외).
     #[wasm_bindgen(js_name = collabDigest)]
     pub fn collab_digest(&self) -> String {

@@ -147,7 +147,7 @@ function validateOverride(name, o, params) {
   if (o.conc && !['text', 'neutral', 'structural'].includes(o.conc)) fail(`${where}: conc 값 ${o.conc}`);
   if ((['state', 'local', 'none'].includes(o.sync) || o.conc === 'neutral') && !o.why) fail(`${where}: state·local·none·neutral 은 why 가 필요합니다`);
   if (['local', 'none'].includes(o.sync) && (o.conc || o.roles || o.ctx || o.layout)) fail(`${where}: local·none 은 기록하지 않으므로 conc·roles·ctx·layout 을 쓰지 않습니다`);
-  for (const c of o.ctx ?? []) if (!['activeField', 'clipboard'].includes(c)) fail(`${where}: ctx 값 ${c}`);
+  for (const c of o.ctx ?? []) if (!['activeField', 'clipboard', 'memoTime'].includes(c)) fail(`${where}: ctx 값 ${c}`);
   if (o.perm !== undefined && !['form', 'memo'].includes(o.perm)) fail(`${where}: perm 값 ${o.perm}(form·memo, 없으면 edit)`);
   if (o.perm !== undefined && ['local', 'none'].includes(o.sync)) fail(`${where}: local·none 은 기록하지 않으므로 perm 을 쓰지 않습니다`);
   if (o.conc === 'neutral' && !Array.isArray(o.roles)) fail(`${where}: neutral 은 roles 가 필요합니다(위치 인자가 없으면 [])`);

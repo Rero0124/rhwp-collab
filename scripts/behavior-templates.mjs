@@ -171,7 +171,67 @@ function cellShapes(d, s) {
   return out;
 }
 
+// ── 5단계 D4 후속: 좁은 권한 함수(메모·양식)를 op 로 올리기 위한 사례 ──
+/** 문서에 있는 고칠 수 있는 메모 하나(getMemoList 의 id = field_id) */
+const memoOf = (d, r) => { try { const xs = JSON.parse(d.getMemoList()).filter((m) => m.editable); return xs.length ? xs[r.int(xs.length)] : null; } catch { return null; } };
+const withMemo = (argsOf) => (r) => ({ prep: [], argsFrom: (d) => { const m = memoOf(d, r); return m ? argsOf(m, r, d) : null; } });
+/** 끝 표의 칸 0 문단 0 의 양식 0 — form-in-cell(합성) 문서가 그 자리에 양식을 둔다 */
+const lastTable = (s) => s.tables[s.tables.length - 1] ?? null;
+const formValue = (r) => pick(r, [{ value: 1 }, { text: `칸 값 ${r.int(1000)}` }, { value: 1, text: `둘 다 ${r.int(1000)}` }]);
+
+/** 각주를 하나 만든 뒤 그 각주를 대상으로(무작위 인자로는 각주 개체 번호를 잘 못 맞힌다) */
+const inFootnote = (argsOf) => (r, s) => {
+  const { p, o } = spot(r, s);
+  return { prep: [['insertFootnote', [0, p, o]]], argsFrom: (d) => { const ci = findCtrl(d, p, ['fn']); return ci === null ? null : argsOf(p, ci, r); } };
+};
+
 export const TEMPLATES = {
+  insertTextInFootnote: inFootnote((p, ci, r) => [0, p, ci, 0, 0, `각주 글자 ${r.int(1000)}`]),
+  deleteTextInFootnote: inFootnote((p, ci, r) => ({ prep: [['insertTextInFootnote', [0, p, ci, 0, 0, '각주 글자 하나 둘']]], args: [0, p, ci, 0, r.int(4), 1 + r.int(2)] })),
+  applyParaFormatInFootnote: inFootnote((p, ci, r) => ({ prep: [['insertTextInFootnote', [0, p, ci, 0, 0, '각주 글자']]], args: [0, p, ci, 0, JSON.stringify(pick(r, [{ alignment: 'center' }, { alignment: 'right' }, { indent: 1000 }]))] })),
+  // 칸 안 누름틀을 만든 뒤 그 자리의 누름틀을 지운다
+  removeFieldAtInCell: (r, s) => {
+    const c = cellOf(r, s);
+    if (!c) return null;
+    return { prep: [['insertClickHereFieldInCell', [0, c.t.para, c.t.ci, c.cell, c.cp, c.off, false, '안내', '', uniq(r), true]]], args: [0, c.t.para, c.t.ci, c.cell, c.cp, c.off, false] };
+  },
+  // 글자가 둘 이상인 칸 문단 안의 범위를 지운다(무작위 인자는 칸 문단 범위를 자주 넘는다)
+  deleteRangeInCellByPath: (r, s) => {
+    const cs = [];
+    for (const t of s.tables) t.cells.forEach((ps, cell) => ps.forEach((len, cp) => { if (len >= 2) cs.push({ t, cell, cp, len }); }));
+    if (!cs.length) return null;
+    const c = cs[r.int(cs.length)];
+    const a = r.int(c.len - 1);
+    const b = a + 1 + r.int(c.len - a - 1);
+    return [0, c.t.para, cellPath(c.t.ci, c.cell, c.cp), c.cp, a, c.cp, b];
+  },
+  removeMemo: withMemo((m) => [m.id]),
+  setMemoText: withMemo((m, r) => [m.id, `고친 메모 ${r.int(1000)}`]),
+  insertMemoReply: withMemo((m, r) => [m.id, JSON.stringify({ author: '정', text: `답글 ${r.int(1000)}` })]),
+  setMemoShape: (r) => ({ prep: [], argsFrom: (d) => {
+    let shape;
+    try { shape = JSON.parse(d.getMemoShape(0)); } catch { return null; }
+    const change = pick(r, [{ width: 9000 + r.int(9000) }, { lineColor: '#ff0000' }, { fillColor: '#eeeeff' }, { lineType: 2 }]);
+    return [0, JSON.stringify({ ...shape, ...change })];
+  } }),
+  setFormValueInCell: (r, s) => { const t = lastTable(s); return t && [0, t.para, t.ci, 0, 0, 0, JSON.stringify(formValue(r))]; },
+  setFormValueInCellEx: (r, s) => { const t = lastTable(s); return t && [JSON.stringify({ sec: 0, tablePara: t.para, tableCi: t.ci, cellIdx: 0, cellPara: 0, formCi: 0, value: formValue(r) })]; },
+  applyFormActionUpdates: (r, s) => ({ prep: [], argsFrom: (d) => {
+    const fs = s.controls.filter((c) => c.ctrlId.trim() === 'form');
+    if (!fs.length) return null;
+    const c = fs[r.int(fs.length)];
+    let info;
+    try { info = JSON.parse(d.getFormObjectInfo(0, c.para, c.controlIndex)); } catch { return null; }
+    const update = {
+      address: { section: 0, para: c.para, control: c.controlIndex, cellPath: [] },
+      text: r.chance(0.5) ? `단추 글 ${r.int(1000)}` : info.text ?? '',
+      caption: info.caption ?? '',
+      value: r.chance(0.5) ? 1 - (info.value ?? 0) : info.value ?? 0,
+      enabled: info.enabled ?? true,
+      items: [],
+    };
+    return [JSON.stringify([update])];
+  } }),
   // 각주를 만들고 글을 넣은 뒤 그 안 문단을 나눈다
   splitParagraphInFootnote: (r, s) => {
     const { p, o } = spot(r, s);

@@ -21,7 +21,7 @@ export type Sync = 'op' | 'state' | 'local' | 'none' | 'watch';
  */
 export const FONT_POLICY = 'bundled-only' as const;
 
-export type CtxKey = 'activeField' | 'clipboard';
+export type CtxKey = 'activeField' | 'clipboard' | 'memoTime';
 
 /** `text`: §4.4 정밀 보정 / `neutral`: 구조 불변(§4.5) / `structural`: 구조를 바꿈(§4.5) */
 export type Conc = 'text' | 'neutral' | 'structural';

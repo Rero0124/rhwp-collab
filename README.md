@@ -7,7 +7,7 @@ rhwp-collab은 한글(HWP/HWPX) 문서를 여러 사람이 웹 브라우저에�
 그 위에서 각자의 편집을 주고받고, 순서를 맞추고, 서버에 저장하는 일을 맡습니다. rhwp를 포크하지 않고 고정한
 버전에 작은 패치 두 개만 적용하기 때문에, rhwp가 업데이트되어도 따라가기 쉽습니다.
 
-> 실험 단계의 프로젝트입니다. 접속 인증이 없으므로 신뢰할 수 있는 네트워크에서만 사용하세요.
+> 실험 단계의 프로젝트입니다. 다른 기기에서 쓰려면 HTTPS 와 접속 인증을 켜야 합니다([다른 기기에서 쓰기](#다른-기기에서-쓰기)).
 
 ## 주요 기능
 
@@ -18,6 +18,9 @@ rhwp-collab은 한글(HWP/HWPX) 문서를 여러 사람이 웹 브라우저에�
 - 연결이 끊겨도 계속 편집할 수 있고, 다시 연결되면 밀린 편집을 자동으로 주고받습니다.
 - 서버가 편집을 받는 즉시 디스크에 기록하므로, 서버가 갑자기 꺼져도 편집이 사라지지 않습니다.
 - Chrome, Firefox, Safari 엔진(WebKit)과 macOS, Windows에서 같은 문서가 같은 배치로 보입니다.
+- 파일을 올려 방을 만들고 링크로 나눠 줄 수 있습니다. 링크마다 편집, 보기, 양식 입력, 메모 권한을 줍니다.
+- 회사 문서 시스템처럼 이미 로그인과 파일 보관이 있는 곳에 붙일 수 있습니다. 토큰(JWT)이나 바깥 인증 서버로 접속을
+  확인하고, API 로 방을 만들고 최신 문서를 받습니다.
 
 ## 빠른 시작
 
@@ -43,9 +46,9 @@ scripts/build-wasm.sh                                            # rhwp를 WebAs
 `bootstrap.sh`는 rhwp 저장소에서 필요한 부분만 받아 `upstream/rhwp`에 둡니다. 처음 받을 때 430MB 정도
 내려받습니다.
 
-### 실행
+### 실행 (이 컴퓨터에서 시험)
 
-터미널 두 개에서 서버와 rhwp-studio를 각각 띄웁니다.
+터미널 두 개에서 서버와 rhwp-studio 개발 서버를 각각 띄웁니다. 서버가 `127.0.0.1` 에서만 받으면 접속 인증 없이 뜹니다.
 
 ```sh
 node server/server.mjs                        # 공동편집 서버 (ws://127.0.0.1:8787)
@@ -62,20 +65,51 @@ http://127.0.0.1:7700/?collab=ws://127.0.0.1:8787&room=demo&name=A
 http://127.0.0.1:7700/?collab=ws://127.0.0.1:8787&room=demo&name=B
 ```
 
+### 실행 (배포)
+
+편집기를 정적 파일로 빌드해 서버가 함께 내주게 합니다. 그러면 한 주소가 편집기이자 공동편집 서버가 됩니다.
+
+```sh
+scripts/build-studio.sh                                          # 편집기 빌드 → target/studio
+node server/token.mjs --new-secret > /안전한/경로/collab-secret    # 비밀키 (저장소 밖에 둡니다)
+
+HOST=0.0.0.0 PORT=8443 \
+COLLAB_AUTH=hs256 COLLAB_AUTH_SECRET_FILE=/안전한/경로/collab-secret \
+COLLAB_TLS_CERT=/경로/cert.pem COLLAB_TLS_KEY=/경로/key.pem \
+COLLAB_STATIC_DIR=target/studio COLLAB_DATA_DIR=./data \
+node server/server.mjs
+```
+
+방은 파일을 올려 만듭니다. 만들기 권한이 있는 토큰으로 업로드 페이지를 엽니다.
+
+```sh
+node server/token.mjs --room '*' --scope create --name 관리자 --ttl 1h   # 비밀키는 COLLAB_AUTH_SECRET(_FILE)에서 읽습니다
+```
+
+```
+https://호스트:8443/upload#token=<위에서 만든 토큰>
+```
+
+파일을 올리면 편집, 보기, 양식 입력, 메모 링크가 나옵니다. 받은 사람은 링크를 열고 자기 이름을 입력하면 들어옵니다.
+
 ## 사용 방법
 
 ### 방에 들어가기
 
-편집기 주소 뒤에 다음 값을 붙여서 엽니다.
+편집기 주소 뒤에 다음 값을 붙여서 엽니다. 쿼리(`?`)와 조각(`#`) 어느 쪽에 두어도 되지만, 토큰은 조각에만 둡니다.
 
-| 이름 | 설명 |
-|---|---|
-| `collab` | 공동편집 서버 주소 |
-| `room` | 방 이름. 같은 방에 들어온 사람끼리 같은 문서를 편집합니다 |
-| `name` | 다른 사람 화면의 커서 옆에 보일 이름 |
+| 이름 | 자리 | 설명 |
+|---|---|---|
+| `collab` | 쿼리 | 공동편집 서버 주소. 값을 비우면(`?collab`) 편집기와 같은 주소(`wss://<현재 호스트>/`)를 씁니다 |
+| `room` | 조각 또는 쿼리 | 방 이름. 같은 방에 들어온 사람끼리 같은 문서를 편집합니다 |
+| `token` | 조각 | 접속 토큰. 편집기가 읽은 뒤 주소에서 지웁니다. 새로고침해도 같은 탭에서는 다시 들어옵니다 |
+| `name` | 조각 또는 쿼리 | 다른 사람 화면의 커서 옆에 보일 이름. 토큰에 이름이 있으면 그 이름을 씁니다 |
 
-방에 처음 들어온 사람이 그때 열려 있는 문서를 방의 문서로 올리고, 열린 문서가 없으면 빈 문서로 시작합니다.
-나중에 들어온 사람은 그 방의 최신 문서를 받습니다.
+배포한 서버의 링크는 `https://호스트/?collab#token=…&room=…` 모양입니다. 인증을 켠 서버에서는 방을 서버가 만들므로
+(`POST /rooms`, 업로드 페이지), 주소에 아무 방 이름이나 넣어서는 들어갈 수 없습니다.
+
+인증을 끈 서버(이 컴퓨터에서 시험)에서는 방에 처음 들어온 사람이 그때 열려 있는 문서를 방의 문서로 올리고, 열린 문서가
+없으면 빈 문서로 시작합니다. 나중에 들어온 사람은 그 방의 최신 문서를 받습니다.
 
 ### 편집 중에 보이는 안내
 
@@ -84,6 +118,10 @@ http://127.0.0.1:7700/?collab=ws://127.0.0.1:8787&room=demo&name=B
 - 연결이 끊기면 화면에 안내가 뜹니다. 그동안의 편집은 다시 연결되면 보내집니다.
 - 공동편집 중에는 모든 참여자가 같은 배치를 보도록 rhwp 내장 글꼴 규칙으로 배치합니다. 그래서 혼자 편집할
   때와 줄이나 쪽 나눔이 조금 다를 수 있습니다.
+- 링크가 만료됐거나 맞지 않으면 들어가지 않고 안내가 뜹니다. 편집 중에 만료되면 연결이 끊긴 뒤 다시 들어갈 때 안내가
+  뜨고, 보내지 못한 편집 수를 알려 줍니다.
+- 보기 링크로 들어오면 편집이 다른 사람에게 보내지지 않고, 서버 문서로 되돌아갑니다.
+- `http://` 주소(이 컴퓨터가 아닌 곳)로 열면 "공동편집은 HTTPS 에서만 쓸 수 있습니다"가 뜨고 들어가지 않습니다.
 
 ### 문서 저장
 
@@ -96,19 +134,64 @@ COLLAB_DATA_DIR=./data node server/server.mjs
 방 디렉터리의 `doc.hwp`(또는 `doc.hwpx`)가 최신 문서 파일이고, 편집이 몇 초 멈추거나 모두 나갈 때 갱신됩니다.
 서버를 다시 시작하면 저장된 기록으로 방을 그대로 복원합니다.
 
+지금 문서는 API 로도 받을 수 있습니다: `GET /rooms/<방>/document`(그 방에 들어갈 수 있는 토큰을
+`Authorization: Bearer` 로). 업로드 페이지의 "지금 문서 내려받기"도 같은 API 입니다. `COLLAB_DATA_DIR` 이 없으면 방과
+문서는 서버 메모리에만 있습니다.
+
 ## 서버 설정
 
 환경 변수로 설정합니다.
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `PORT` | `8787` | 서버 포트 |
-| `HOST` | `127.0.0.1` | 서버가 받을 주소 |
+| `PORT` | `8787` | 서버 포트. HTTP(S) 와 WebSocket 을 함께 받습니다 |
+| `HOST` | `127.0.0.1` | 서버가 받을 주소. 루프백이 아니면 `COLLAB_AUTH` 를 정해야 시작합니다 |
+| `COLLAB_AUTH` | 루프백이면 `none` | 접속 확인 방식: `hs256`(JWT 공유 비밀키), `url`(바깥 인증 서버), `none`(확인 안 함). 루프백이 아닌 주소에 `none` 을 주면 경고를 남기고 뜹니다 |
+| `COLLAB_AUTH_SECRET` | 없음 | `hs256` 비밀키(32바이트 이상). `COLLAB_AUTH_SECRET_FILE` 로 파일에서 읽을 수도 있습니다 |
+| `COLLAB_AUTH_URL` | 없음 | `url` 방식에서 `{token, room}` 을 POST 할 주소. `{ok, sub, name, scope}` 를 돌려줘야 합니다 |
+| `COLLAB_INVITE_TTL` | `24h` | 방을 만들 때 서버가 만드는 초대 링크의 수명(`hs256` 만). `30m`, `7d`, 초 단위 숫자 |
+| `COLLAB_ALLOWED_ORIGINS` | 없음 | 쉼표로 구분한 출처 목록. 있으면 그 밖의 브라우저 출처에서 오는 WebSocket·방 만들기를 거절합니다. 같은 출처는 언제나 허용합니다 |
+| `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | 없음 | PEM 인증서와 키 파일. 둘 다 있으면 HTTPS/wss 로 뜹니다 |
+| `COLLAB_STATIC_DIR` | 없음 | 함께 내줄 편집기 빌드(`scripts/build-studio.sh` 의 `target/studio`) |
 | `COLLAB_DATA_DIR` | 없음 | 문서를 저장할 디렉터리. 없으면 메모리에만 두고 서버를 끄면 사라집니다 |
-| `COLLAB_CANONICAL` | 켜짐 | 서버에서 편집을 먼저 검사합니다. `0`이면 끕니다. 저장을 쓰려면 켜 두어야 합니다 |
+| `COLLAB_CANONICAL` | 켜짐 | 서버에서 편집을 먼저 검사합니다. `0`이면 끕니다. 저장, 파일로 방 만들기, 문서 내려받기, 양식·메모 권한에 필요합니다 |
 | `COLLAB_MAX_MESSAGE_BYTES` | 64MB | 주고받을 수 있는 최대 크기. 이보다 큰 문서로는 방을 열 수 없습니다 |
 | `COLLAB_DOC_SAVE_IDLE_MS` | `5000` | 편집이 이 시간만큼 멈추면 문서 파일을 갱신합니다 |
 | `COLLAB_GENERATION_IDLE_MS` | `600000` | 방이 이 시간만큼 비면 쌓인 기록을 문서 파일로 정리합니다 |
+
+### 다른 기기에서 쓰기
+
+다른 기기의 브라우저는 `https://` 주소에서만 공동편집을 합니다. 브라우저가 `http://` 주소(이 컴퓨터가 아닌 곳)에서는
+공동편집에 필요한 기능을 주지 않기 때문입니다. 방법은 두 가지입니다.
+
+- 서버가 직접 HTTPS 로 뜹니다: `COLLAB_TLS_CERT`·`COLLAB_TLS_KEY` 를 줍니다(위 [실행 (배포)](#실행-배포)).
+- 앞단의 역방향 프록시(nginx, Caddy 등)가 TLS 를 맡고, 서버는 `127.0.0.1` 의 http 로 둡니다. 프록시는 WebSocket
+  업그레이드를 넘겨야 하고, 큰 문서를 위해 본문 크기 제한을 `COLLAB_MAX_MESSAGE_BYTES` 이상으로 둡니다.
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 1h;
+    client_max_body_size 64m;
+}
+```
+
+프록시를 쓸 때도 서버가 루프백 주소에서만 받으면 인증 없이 뜹니다. 프록시 뒤에 둘 때는 `COLLAB_AUTH` 를 꼭 정하세요.
+
+### 다른 시스템에 붙이기
+
+- **토큰:** JWT HS256 을 쓰면 어느 언어의 라이브러리로도 토큰을 만들 수 있습니다. 클레임은 `sub`(사용자), `name`(보일 이름),
+  `room`(방 또는 `*`), `exp`(만료), `scope`(`view`·`form`·`comment`·`edit`·`create`, 공백으로 구분)입니다. 이미 로그인
+  세션이 있으면 `COLLAB_AUTH=url` 로 서버가 그 시스템에 토큰을 물어보게 할 수 있습니다.
+- **방 만들기:** `POST /rooms`(본문 = HWP/HWPX 파일, `create` 권한 토큰) → `{room, invite}`. 사용자에게
+  `https://호스트/?collab#token=…&room=…` 링크를 줍니다.
+- **문서 받기:** `GET /rooms/<방>/document` → 최신 문서 파일.
+- 메시지 형식, 이유 코드, 재접속 절차는 [공동편집 규약](docs/collab-protocol.md)에 있습니다. 네이티브 클라이언트도 이 문서를
+  따릅니다.
 
 ## 동작 원리
 
@@ -137,8 +220,8 @@ COLLAB_DATA_DIR=./data node server/server.mjs
 | `upstream.lock` | 사용하는 rhwp 저장소와 커밋 |
 | `patches/rhwp/` | rhwp에 적용하는 패치 |
 | `collab-core/` | rhwp와 함께 빌드되는 Rust 코드 (스냅샷, 위치 보정, 문서 비교) |
-| `collab-client/` | 편집 기록 엔진과 rhwp-studio 플러그인 |
-| `server/` | 공동편집 서버 |
+| `collab-client/` | 편집 기록 엔진, 플랫폼 중립 세션 계층(`src/session/`), rhwp-studio 플러그인 |
+| `server/` | 공동편집 서버 (인증 `auth.mjs`, HTTP API·정적 파일 `http.mjs`, 업로드 페이지 `public/`, 토큰 도구 `token.mjs`) |
 | `scripts/` | 설치, 빌드, rhwp 업데이트용 스크립트 |
 | `docs/` | 단계별 설계와 검증 기록 |
 
@@ -156,7 +239,7 @@ node collab-client/test/sim.mjs --seeds 500 --ops 200 --clients 3
 ```
 
 브라우저 시험은 `collab-client/e2e/`에 있으며 Chrome이 필요합니다. 각 파일 첫머리에 준비할 것과 실행 방법이
-적혀 있습니다.
+적혀 있습니다. 배포 구성(HTTPS, 인증, 파일로 방 만들기)은 `collab-client/e2e/s5-deploy.mjs` 로 시험합니다.
 
 ### rhwp 버전 올리기
 
@@ -171,8 +254,10 @@ node collab-client/test/sim.mjs --seeds 500 --ops 200 --clients 3
 ## 알려진 한계
 
 - 공동편집 중에는 아직 되돌리기(Ctrl+Z)를 쓸 수 없습니다. 자기 편집만 되돌리는 기능을 만들고 있습니다.
-- 파일을 골라 방을 여는 화면이 아직 없습니다.
-- 접속 인증이 없어서, 방 이름을 아는 사람은 누구나 들어올 수 있습니다.
+- 편집기 안에서 "공동편집 시작"으로 지금 문서를 방으로 만드는 메뉴는 아직 없습니다. 업로드 페이지(`/upload`)나 API 를 씁니다.
+- 양식 입력·메모 링크의 편집은 서버의 판정 기능이 들어갈 때까지 거절됩니다. 보기 링크는 편집 화면을 막지 않습니다(입력은
+  보내지지 않고 되돌아갑니다).
+- 링크 하나로 받은 토큰은 갱신되지 않습니다. 만료되면 링크를 다시 받아야 합니다.
 - 웹 브라우저에서만 동작합니다.
 - Linux 브라우저에서는 시험하지 않았습니다.
 
@@ -182,6 +267,8 @@ node collab-client/test/sim.mjs --seeds 500 --ops 200 --clients 3
 - [2단계: 모든 기능 동기화와 동시 편집](docs/collab-stage2.md)
 - [3단계: 서버 검사, 저장, 재접속, 기기 간 시험](docs/collab-stage3.md)
 - [4단계: 사용자별 되돌리기 (진행 중)](docs/collab-stage4.md)
+- [5단계: 배포 준비 — 인증, HTTPS, 파일로 방 열기](docs/collab-stage5.md)
+- [공동편집 규약 (클라이언트·서버 메시지, 토큰, 이유 코드)](docs/collab-protocol.md)
 
 ## 라이선스
 

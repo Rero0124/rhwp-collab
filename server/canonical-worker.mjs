@@ -4,8 +4,10 @@
 //
 // 메시지(주 스레드 ↔ 워커): {id, op, ...} → {id, ok, ...}
 //   load   {base}     base = gzip 으로 감싼 문서(base64). 정본을 새로 연다 → {digest}
-//   apply  {entries}  기록 열을 적용한다. 실패하면 적용 전으로 되돌린다 → {digest} | {reason}
+//   apply  {entries, confine?}  기록 열을 적용한다. 실패하면 적용 전으로 되돌린다 → {digest} | {reason}
 //                     rhwp 가 오류 대신 패닉(WASM trap)하면 {panic: true} — 이 인스턴스는 더 믿을 수 없다(주 스레드가 버림)
+//                     confine(5단계 D4, form·comment 연결)이 있으면 적용 뒤 checkConfined 로 결과를 판정하고, 벗어나면
+//                     되돌리고 {forbidden: true, reason: 'confined' | 'unsupported'}
 //   replayAll {log}   기록 여러 묶음을 한 번에(복원·재생성 — 이미 받아 둔 기록이라 되돌림 없음, 쪽 배치는 끝에 한 번) → {digest}
 //   export {}         정본을 결과 전송 형식으로 → {data}
 //   digest {}         → {digest}
@@ -40,6 +42,30 @@ function validate(entries) {
   return null;
 }
 
+/**
+ * 5단계 D4 판정 자리: 스냅샷(snap) 뒤 적용한 결과가 허용된 부분(kinds = ['form'] | ['comment'] | 둘 다)만 바꿨는지.
+ * 판정은 Rust 보조 `collabCheckConfined(snapshotId, kind)` 가 한다(함수 이름·state 바이트를 믿지 않고 결과로 — 우회 불가).
+ * 그 보조가 합쳐지기 전에는 판정할 수 없으므로 언제나 unsupported 다.
+ * @returns {{ ok: true } | { ok: false, reason: 'confined' | 'unsupported', detail?: string }}
+ */
+function checkConfined(snap, kinds) {
+  if (typeof doc.collabCheckConfined !== 'function') return { ok: false, reason: 'unsupported', detail: 'collabCheckConfined 가 없다' };
+  // 권한이 여럿이면(form comment) 그중 하나로 설명되면 통과한다. 보조의 반환 형식은 보조가 합쳐질 때 정한다 —
+  // 여기서는 {ok, detail?}(JSON 문자열 또는 객체)이나 boolean 을 받는다.
+  // TODO(D4, 보조 합친 뒤): 한 묶음이 양식과 메모를 함께 바꾸는 경우는 kind 를 합쳐 한 번에 판정해야 한다.
+  let detail = '';
+  for (const kind of kinds) {
+    const raw = doc.collabCheckConfined(snap, kind);
+    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (res === true || res?.ok === true) return { ok: true };
+    detail = String(res?.detail ?? res?.reason ?? detail);
+  }
+  return { ok: false, reason: 'confined', detail };
+}
+
+/** 판정 보조가 있는지 — 없으면 적용해 보지도 않고 거절한다. */
+const confinedSupported = () => typeof doc?.collabCheckConfined === 'function';
+
 function open(base) {
   const raw = gunzipSync(Buffer.from(base, 'base64'));
   const next = new wasm.HwpDocument(raw);
@@ -61,6 +87,10 @@ parentPort.on('message', ({ id, op, ...p }) => {
         if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
         const bad = validate(p.entries);
         if (bad) return reply({ ok: false, reason: bad });
+        const confine = Array.isArray(p.confine) && p.confine.length ? p.confine : null;
+        if (confine && !confinedSupported()) return reply({ ok: false, forbidden: true, reason: 'unsupported', detail: 'collabCheckConfined 가 없다' });
+        // D4: 스냅샷 → 적용 → 판정 → 벗어나면 복원. 복원 뒤 정본 digest 가 적용 전과 같은지 확인한다.
+        const before = confine ? doc.collabDigest() : null;
         const snap = doc.collabSnapshotSave();
         try {
           engine.replay(p.entries);
@@ -69,6 +99,23 @@ parentPort.on('message', ({ id, op, ...p }) => {
           doc.collabSnapshotRestore(snap);
           doc.collabSnapshotDiscard(snap);
           return reply({ ok: false, reason: reasonOf(e) });
+        }
+        if (confine) {
+          let verdict;
+          try {
+            verdict = checkConfined(snap, confine);
+          } catch (e) {
+            if (isTrap(e)) return reply({ ok: false, panic: true, reason: reasonOf(e) });
+            verdict = { ok: false, reason: 'confined', detail: `판정 오류: ${reasonOf(e)}` };
+          }
+          if (!verdict.ok) {
+            doc.collabSnapshotRestore(snap);
+            doc.collabSnapshotDiscard(snap);
+            const after = doc.collabDigest();
+            // 되돌린 정본이 적용 전과 다르면 이 인스턴스를 더 믿을 수 없다 — 패닉처럼 버리고 다시 만든다.
+            if (after !== before) return reply({ ok: false, panic: true, reason: `판정 뒤 복원한 정본 digest 가 다름 (${before} → ${after})` });
+            return reply({ ok: false, forbidden: true, reason: verdict.reason, detail: verdict.detail });
+          }
         }
         doc.collabSnapshotDiscard(snap);
         return reply({ ok: true, digest: doc.collabDigest() });

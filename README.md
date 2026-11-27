@@ -46,6 +46,10 @@ scripts/build-wasm.sh                                            # rhwp를 WebAs
 `bootstrap.sh`는 rhwp 저장소에서 필요한 부분만 받아 `upstream/rhwp`에 둡니다. 처음 받을 때 430MB 정도
 내려받습니다.
 
+패치(`patches/`)나 `upstream.lock`이 바뀐 커밋을 받았으면 `scripts/bootstrap.sh`를 다시 실행하고 WASM 을 다시
+빌드합니다. `bootstrap.sh`는 적용한 패치의 사본을 `upstream/rhwp/.git/cc-applied/`에 남겨 두었다가, 패치가 바뀌면
+옛 패치를 되돌리고 새 패치를 적용합니다. `upstream/rhwp`에 패치가 아닌 변경이 섞여 있으면 덮어쓰지 않고 멈춥니다.
+
 ### 실행 (이 컴퓨터에서 시험)
 
 터미널 두 개에서 서버와 rhwp-studio 개발 서버를 각각 띄웁니다. 서버가 `127.0.0.1` 에서만 받으면 접속 인증 없이 뜹니다.
@@ -243,11 +247,12 @@ node collab-client/test/sim.mjs --seeds 500 --ops 200 --clients 3
 
 ### rhwp 버전 올리기
 
-1. `upstream/rhwp`에 적용된 패치 변경을 되돌립니다. 패치 원본은 `patches/`에 있습니다.
-2. `upstream.lock`의 `rev`를 새 커밋으로 바꾸고 `scripts/bootstrap.sh`를 실행합니다. 패치가 맞지 않으면
-   `upstream/rhwp`에서 고친 뒤 `scripts/update-patch.sh`로 패치를 다시 만듭니다.
-3. `scripts/build-wasm.sh`를 실행합니다. 함수별 결과 비교가 자동으로 돌아서 동기화 방식을 다시 정합니다.
-4. 브라우저 간 시험 `collab-client/e2e/s31-cross-browser.mjs`를 다시 돌립니다.
+1. `upstream.lock`의 `rev`를 새 커밋으로 바꾸고 `scripts/bootstrap.sh`를 실행합니다. 적용해 둔 패치는
+   `bootstrap.sh`가 먼저 되돌린 뒤 새 커밋으로 바꿉니다. `upstream/rhwp`에 패치가 아닌 변경이 있으면 아무것도
+   바꾸지 않고 멈춥니다. 새 커밋에 패치가 맞지 않으면 `upstream/rhwp`에서 고친 뒤 `scripts/update-patch.sh`로
+   패치를 다시 만들고 `bootstrap.sh`를 다시 실행합니다.
+2. `scripts/build-wasm.sh`를 실행합니다. 함수별 결과 비교가 자동으로 돌아서 동기화 방식을 다시 정합니다.
+3. 브라우저 간 시험 `collab-client/e2e/s31-cross-browser.mjs`를 다시 돌립니다.
 
 참여자와 서버는 같은 버전으로 빌드되어 있어야 합니다. 버전이 다른 참여자는 방에 들어올 수 없습니다.
 

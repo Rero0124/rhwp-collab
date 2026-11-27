@@ -121,10 +121,50 @@ rhwp-collab 은 부품이다. 실제로 쓰는 곳(회사 문서 시스템 등)�
 - 방 이름은 서버가 만든다(추측하기 어려운 무작위 값). `room` 을 주소에서 임의로 만들어 들어가는 지금 방식은
   `COLLAB_AUTH=none` 일 때만 허용한다.
 
+## D4 양식 입력·메모 권한 (사용자 결정, 2026-11-27)
+
+`scope` 에 두 가지를 더한다. 목록이라 함께 줄 수 있다(예: `form comment`).
+- `form`: 양식만 채운다. 누름틀 안의 글자와 양식 개체(체크박스·라디오·콤보·입력란)의 값만 바꿀 수 있다.
+  누름틀을 만들거나 지우거나 이름·속성을 바꾸는 것은 양식의 구조를 바꾸는 일이므로 `edit` 이다.
+- `comment`: 메모만 단다. 메모 넣기·답글·고치기·지우기와 메모 모양을 바꿀 수 있고, 본문은 못 고친다.
+- 둘 다 보기는 `view` 와 같다.
+
+관련 export(분류표 기준):
+- 양식: `setFormValue`(op), `setFormValueInCell(Ex)`(state), `applyFormActionUpdates`(state), `setFieldValue`·
+  `setFieldValueByName`(op). 누름틀 안 입력은 일반 글자 연산에 `ctx.activeField` 가 붙은 형태다.
+- 메모: `insertMemo`·`insertMemoByPath`·`insertMemoReply`·`removeMemo`·`setMemoShape`·`setMemoText`(모두 state).
+
+### 판정은 두 겹이다
+
+1. **클라이언트 기록 프록시의 문 (사용성, 빠름).**
+   - 분류표에 `perm` 표시를 더한다. 값은 `form`·`memo`이고, 표시가 없으면 `edit` 이다. 새 함수는 `edit` 가 되어
+     좁은 권한에서는 막힌다.
+   - 글자 연산은 `form` 권한일 때만 판정이 더 필요하다. `ctx.activeField` 가 있고, 연산 범위가 그 누름틀 안에
+     완전히 들 때만 통과시킨다(Rust 보조 `collabFieldContains`).
+   - 문에서 막히면 core 에 닿지 않고 안내만 뜬다("양식 칸에만 입력할 수 있습니다", "메모만 달 수 있습니다").
+2. **서버 정본의 확인 (보안상 최종 판정).**
+   - 클라이언트가 보낸 함수 이름이나 state 바이트는 믿지 않는다. 그래서 `form`·`comment` 연결의 묶음은 정본이
+     스냅샷을 뜬 뒤 적용해 보고, **바뀐 곳이 허용된 부분뿐인지**를 Rust 보조 `collabCheckConfined(snapshotId, kind)`
+     로 비교한다. 벗어나면 되돌리고 `forbidden` 을 보낸다.
+   - 비교 규칙(조사 후 확정):
+     - 구역은 허용 부분을 가린 채 같아야 한다. `form` 은 누름틀 안 글자와 양식 개체 값을 가리고, `comment` 는 메모
+       개체와 그 내용을 가린다.
+     - 줄 배치(`line_segs`)는 비교하지 않는다. 앞 문단이 늘면 뒤 문단 위치가 바뀌는 조판 결과라서다.
+     - DocInfo 는 **앞부분이 같아야 한다**(기존 항목은 그대로, 새 글자 모양 등은 뒤에 덧붙는 것만 허용). 기존 글자
+       모양을 고쳐 본문 모양을 바꾸는 우회를 막기 위해서다.
+   - 이 확인은 op 와 state 모두에 쓴다. 함수 이름과 무관하게 결과로 판정하므로 우회할 수 없다.
+
+### 분담
+- 기존 코드 세션(4단계 U1 뒤, U2 전): 분류표 `perm`, 클라이언트 문(view·form·comment), Rust 보조
+  `collabFieldContains`·`collabCheckConfined`.
+- 이 단계의 세션: 규약의 scope 목록, 서버 중계·정본의 판정 연결. `collabCheckConfined` 가 합쳐지기 전에는 `form`·
+  `comment` 연결의 편집 묶음을 `forbidden`(reason `unsupported`)으로 거절한다. 초대 토큰은 `form`·`comment` 도 만든다.
+
 ## 관문
 
 - 다른 기기(Windows Chrome)가 LAN https 로 들어와 Mac 과 함께 편집한다. digest 가 일치하고 재동기화가 0 이다.
 - 인증: 잘못된 서명, 만료, 다른 방 토큰, 토큰 없음이 모두 `unauthorized` 로 거절된다. 재접속 중 만료되면 안내가 뜬다.
+- 권한: `view` 는 편집이 막힌다. `form` 은 누름틀 안 입력과 양식 값만, `comment` 는 메모만 된다. 그 밖의 편집은 클라이언트 문에서 막히고, 문을 우회한 원시 클라이언트가 보낸 묶음은 서버 정본이 `forbidden` 으로 거절하며 seq 는 그대로다. 우회 사례: 함수 이름 위조, state 바이트 위조, 기존 글자 모양 고치기.
 - `POST /rooms` 로 만든 방에 두 브라우저가 들어오고, `GET …/document` 가 편집이 반영된 파일을 준다. 그 파일을
   다시 열면 digest 가 같다(내보내기 후 다시 읽기 규칙에 따름).
 - 기존 회귀: 서버, collab-client, R8, R7, S3-4.

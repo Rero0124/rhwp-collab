@@ -278,6 +278,8 @@ export class CollabSession {
   private digestSentSeq = -1;
   private digestSentAt = 0;
   private digestTimer: unknown = null;
+  /** digestTimer 가 울릴 시각 */
+  private digestDueAt = 0;
   private cursorTimer: unknown = null;
   /** 조합 중 보류한 원격 메시지 */
   private readonly held: ServerMessage[] = [];
@@ -508,13 +510,22 @@ export class CollabSession {
     this.digestSentSeq = this._lastSeq;
     this.digestSentAt = this.clock.now();
   }
-  private scheduleDigest(): void {
-    if (this.digestTimer !== null) return;
-    const wait = Math.max(0, this.digestSentAt + DIGEST_INTERVAL_MS - this.clock.now());
+  /**
+   * 보고할 때를 잡는다: 마지막 보고에서 간격(DIGEST_INTERVAL_MS)이 지난 뒤. 울렸는데 아직 바쁘면(보내는 중·끊김·조합·
+   * 재동기화) 한 간격 뒤에 다시 본다 — 바로 다시 걸면 브라우저에서 약 4ms 마다 돈다. 바쁜 동안 걸어 둔 늦은 타이머는,
+   * 일이 끝나 한가해진 자리(확정·따라잡기·welcome 이 이것을 부른다)에서 당겨 지금처럼 곧 보고하게 한다.
+   */
+  private scheduleDigest(wait = Math.max(0, this.digestSentAt + DIGEST_INTERVAL_MS - this.clock.now())): void {
+    const due = this.clock.now() + wait;
+    if (this.digestTimer !== null) {
+      if (due >= this.digestDueAt || !this.idle()) return;
+      this.clock.clearTimeout(this.digestTimer);
+    }
+    this.digestDueAt = due;
     this.digestTimer = this.clock.setTimeout(() => {
       this.digestTimer = null;
       this.tryReportDigest();
-      if (!this.idle()) this.scheduleDigest();
+      if (!this.idle()) this.scheduleDigest(DIGEST_INTERVAL_MS);
     }, wait);
   }
 

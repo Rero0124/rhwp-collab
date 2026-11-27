@@ -20,14 +20,17 @@ class FakeClock {
   seq = 0;
   timers = new Map();
   now() { return this.t; }
-  // 브라우저처럼 0ms 도 조금 뒤로(세션의 digest 타이머는 바쁜 동안 0ms 로 다시 걸린다 — plugin.ts 때부터의 동작)
-  setTimeout(fn, ms) { const id = ++this.seq; this.timers.set(id, { at: this.t + Math.max(4, ms), fn }); return id; }
+  /** 건 setTimeout 의 대기(ms) — 시험이 타이머가 얼마나 자주 걸리는지 본다 */
+  waits = [];
+  setTimeout(fn, ms) { const id = ++this.seq; this.waits.push(ms); this.timers.set(id, { at: this.t + ms, fn }); return id; }
   clearTimeout(id) { this.timers.delete(id); }
   setInterval(fn, ms) { const id = ++this.seq; this.timers.set(id, { at: this.t + ms, fn, every: ms }); return id; }
   clearInterval(id) { this.timers.delete(id); }
   async advance(ms) {
     const end = this.t + ms;
+    let fired = 0;
     for (;;) {
+      if (++fired > 5000) throw new Error(`타이머가 멈추지 않습니다(${this.t})`);
       let next = null;
       for (const [id, tm] of this.timers) if (tm.at <= end && (!next || tm.at < next[1].at)) next = [id, tm];
       if (!next) break;
@@ -140,6 +143,37 @@ test('들어오기: hello(토큰 connect) → welcome → 문서 열기·joined�
   for (const k of ['room', 'name', 'clientId', 'lastSeq', 'inflight', 'ready', 'resyncing', 'left', 'desynced', 'desyncReason', 'connection',
     'pending', 'unsent', 'sentEntries', 'droppedTotal', 'replacedAcks', 'lastDigest', 'digestSentSeq', 'resyncCount', 'engine', 'cursors',
     'reconnects', 'disconnectedAt', 'inflightBatch', 'user', 'fast']) assert.ok(k in st, k);
+  s.dispose();
+});
+
+test('digest: 바쁜 동안은 한 간격마다만 다시 보고(0ms 로 다시 걸지 않음), 한가해지면(확정) 곧 보고한다', async () => {
+  const { s, clock, net, h } = await joined();
+  await clock.advance(1000);
+  assert.equal(net.sentOf('digest').length, 1, '들어온 뒤 한 번');
+  edit(s, h, 'a');
+  await settle();
+  // 내 묶음이 확정되기 전에 남의 묶음이 온다 → 보고를 잡지만 바쁘다(inflight). 예전에는 여기서 0ms 로 계속 다시 걸렸다.
+  await net.deliver({ type: 'ops', seq: 1, clientId: 'B', entries: [op('X')] });
+  let before = clock.waits.length;
+  await clock.advance(10_000);
+  let waits = clock.waits.slice(before);
+  assert.ok(waits.length <= 12 && waits.filter((w) => w === 0).length === 0, `10초 동안 타이머 [${waits.join(',')}]`);
+  assert.equal(net.sentOf('digest').length, 1, '바쁜 동안 보고하지 않음');
+  await clock.advance(300);
+  await net.deliver({ type: 'ops', seq: 2, clientId: 'A', entries: [op('a')], batchId: 'A:1' });
+  await clock.advance(0);
+  const reports = net.sentOf('digest');
+  assert.equal(reports.length, 2, '확정되자 1초 뒤로 걸어 둔 타이머를 당겨 곧 보고');
+  assert.deepEqual([reports[1].seq, reports[1].digest], [2, h.doc.collabDigest()]);
+  // 끊긴 동안도 같다: 남의 묶음으로 보고를 잡은 뒤 끊김
+  edit(s, h, 'b');
+  await settle();
+  await net.deliver({ type: 'ops', seq: 3, clientId: 'B', entries: [op('Y')] });
+  await net.drop();
+  before = clock.waits.length;
+  await clock.advance(10_000);
+  waits = clock.waits.slice(before);
+  assert.ok(waits.length <= 14 && waits.filter((w) => w === 0).length === 0, `끊긴 10초 동안 타이머 [${waits.join(',')}]`);
   s.dispose();
 });
 

@@ -1,11 +1,13 @@
 // 5단계 D3 브라우저 확인 (docs/collab-stage5.md D3): studio 안 "공동편집 시작" — 공동편집으로 열지 않은 studio(A)가
 // 지금 문서로 방을 만들고 링크를 보여 준다. 다른 탭(B)이 편집 링크로 들어오면 같은 문서이고, A 가 "이 방으로 들어가기"로
 // 들어가 편집하면 B 와 수렴한다. 암호를 풀고 연 HWPX(업스트림 샘플, 읽기만 — 문서 정보의 encrypted 는 false)는 D5 대로
-// 막는다(host.documentProtection — 첫 참여자 막기와 같은 판정).
+// 막는다(host.documentProtection — 첫 참여자 막기와 같은 판정). 같은 실행에서 플러그인의 첫 참여자 확인(D5)도 본다: 암호
+// HWPX 를 연 채 새 방에 처음 들어가면 base 를 올리지 않고 "암호 문서는 공동편집할 수 없습니다"로 나가며 서버에 문서가 없다.
 //
 // 준비: node server/server.mjs (8787) + (cd upstream/rhwp/rhwp-studio && COLLAB_DEV_SERVER=http://127.0.0.1:8787 npx vite) (7700)
-//       — 서버의 /healthz 가 인증 방식(auth)을 알려야 메뉴가 뜬다.
 // 실행: node collab-client/e2e/d3-launcher.mjs
+// hs256 서버: D3_CREATE_TOKEN=<만들기(create) 토큰> D3_JOIN_TOKEN=<모든 방 edit 토큰> COLLAB_HTTP=http://127.0.0.1:<포트> 로
+//       돌린다(studio 를 #create= 로 열고, 토큰이 없는 탭은 입력 칸으로 만든다). 토큰은 저장소 밖에서 만든다(server/token.mjs).
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +23,11 @@ const ENCRYPTED_HWPX = path.resolve(here, '../../upstream/rhwp/samples/HWP5-pass
 const ENCRYPTED_PASSWORD = '123456';
 const ENCRYPTED_TEXT = '암호 문서는 공동편집할 수 없습니다';
 const MENU = '[data-cmd="ext:collab.start"]';
+const CREATE_TOKEN = process.env.D3_CREATE_TOKEN ?? '';
+const JOIN_TOKEN = process.env.D3_JOIN_TOKEN ?? '';
+const HTTP = process.env.COLLAB_HTTP ?? 'http://127.0.0.1:8787';
+const WS = HTTP.replace(/^http/, 'ws') + '/';
+const MODE = CREATE_TOKEN ? 'hs256' : 'none';
 
 const results = [];
 const record = (name, ok, detail = '') => {
@@ -61,11 +68,13 @@ const openLauncher = (page) => page.evaluate((sel) => { document.querySelector(s
 
 const browser = await puppeteer.launch({ headless: process.env.HEADFUL !== '1', executablePath: CHROME, args: ['--lang=ko-KR'] });
 try {
-  // A: 평소 studio — 메뉴가 뜨고 콘솔 오류가 없다
-  const A = await tab(browser, 'A', `${STUDIO}/`);
+  console.log(`  서버 ${HTTP} (인증 ${MODE})`);
+  // A: 평소 studio — 메뉴가 뜨고 콘솔 오류가 없다(hs256 이면 #create= 로 연다)
+  const A = await tab(browser, 'A', `${STUDIO}/${CREATE_TOKEN ? `#create=${encodeURIComponent(CREATE_TOKEN)}` : ''}`);
   const menu = await A.waitForSelector(MENU, { timeout: 30_000 }).catch(() => null);
   record('평소 studio 에 "공동편집 시작…" 메뉴', Boolean(menu), menu ? '' : '메뉴 없음(서버의 /healthz 가 auth 를 알려야 한다)');
   if (!menu) throw new Error('메뉴 없음');
+  if (CREATE_TOKEN) record('만들기 토큰을 주소에서 지움', !(await A.evaluate(() => location.hash)).includes('create'), await A.evaluate(() => location.hash));
   await A.evaluate(() => window.__inputHandler.textarea.focus());
   await sleep(800);
   // 영문으로 친다(헤드리스 크롬의 한글 입력은 새 문서 첫 글자를 흘린다 — 이 시험의 대상이 아니다)
@@ -80,7 +89,9 @@ try {
   await A.waitForSelector('[data-collab="launcher-link"][data-scope="edit"] code', { timeout: 30_000 });
   const links = await A.$$eval('[data-collab="launcher-link"]', (rows) => rows.map((r) => [r.dataset.scope, r.querySelector('code').textContent]));
   const edit = links.find(([s]) => s === 'edit')?.[1];
-  record('방을 만들고 링크를 보여 줌', Boolean(edit) && /\?collab(=[^#]*)?#.*room=/.test(edit), JSON.stringify(links.map(([s, u]) => [s, u.replace(/token=[^&]+/, 'token=…')])));
+  const wantScopes = MODE === 'hs256' ? ['edit', 'view', 'form', 'comment'] : ['edit'];
+  const scopesOk = JSON.stringify(links.map(([s]) => s)) === JSON.stringify(wantScopes) && (MODE === 'none' || links.every(([, u]) => /#token=/.test(u)));
+  record('방을 만들고 링크를 보여 줌', Boolean(edit) && /\?collab(=[^#]*)?#.*room=/.test(edit) && scopesOk, JSON.stringify(links.map(([s, u]) => [s, u.replace(/token=[^&]+/, 'token=…')])));
 
   // B: 편집 링크로 들어온다 — 같은 문서
   const B = await tab(browser, 'B', edit);
@@ -105,8 +116,24 @@ try {
   const [da, db] = await Promise.all([A, B].map((p) => p.evaluate(() => window.__collab.digest())));
   const [ta, tb] = await Promise.all([text(A), text(B)]);
   record('만든 탭도 들어가 편집 — 두 탭 수렴, 재동기화 0', da === db && ta === tb && ta.endsWith(' added') && ta.startsWith(original) && st.every((s) => s.resyncCount === 0), `A ${JSON.stringify(ta)} B ${JSON.stringify(tb)}`);
-  record('들어가기에서 "저장하지 않은 변경" 확인이 뜨지 않음', A.dialogs.length === 0, A.dialogs.join(' | '));
+  // 초대 토큰에는 이름이 없어 플러그인이 보일 이름을 묻는다(prompt) — 그것은 정상, 이탈 확인(beforeunload)만 실패로 본다
+  const unload = A.dialogs.filter((d) => d.startsWith('beforeunload'));
+  record('들어가기에서 "저장하지 않은 변경" 확인이 뜨지 않음', unload.length === 0, A.dialogs.join(' | '));
   record('평소 studio·방 만들기에서 콘솔 오류 없음', A.errors.length === 0, A.errors.join(' | '));
+
+  // hs256: 만들기 토큰이 없는 탭은 대화상자의 입력 칸으로 만든다
+  if (CREATE_TOKEN) {
+    const D = await tab(browser, 'D', `${STUDIO}/`);
+    await D.waitForSelector(MENU, { timeout: 30_000 });
+    await openLauncher(D);
+    const input = await D.waitForSelector('[data-collab="launcher-token"]', { timeout: 10_000 }).catch(() => null);
+    if (input) {
+      await input.type(CREATE_TOKEN);
+      await D.click('[data-collab="launcher-create"]');
+    }
+    const made = await D.waitForSelector('[data-collab="launcher-link"]', { timeout: 30_000 }).then(() => true, () => false);
+    record('만들기 토큰이 없는 탭은 입력 칸으로 방을 만든다', Boolean(input) && made);
+  }
 
   // C: 암호를 풀고 연 HWPX — 막힘(문서 정보의 encrypted 는 false 라 그것으로는 못 가린다)
   const C = await tab(browser, 'C', `${STUDIO}/`);
@@ -126,6 +153,35 @@ try {
     create: Boolean(document.querySelector('[data-collab="launcher-create"]')),
   }));
   record('암호를 풀고 연 HWPX 는 막힘(방 만들기 단추 없음)', blocked.text === ENCRYPTED_TEXT && !blocked.create, `${JSON.stringify(blocked)} (문서 정보 encrypted ${info}, studio requiresPasswordForSave ${studioFlag})`);
+
+  // 첫 참여자 확인(D5, 플러그인): 암호 HWPX 를 연 채 새 방에 처음 들어간다 — 주소를 공동편집 주소로 바꾸고 플러그인을 올린다
+  // (새로 열면 연 문서가 사라지므로). base 를 올리지 않고 나가며, 서버에 그 방의 문서가 없다.
+  await C.evaluate(() => document.querySelector('[data-collab="launcher"]')?.remove());
+  const room = `enc-${Date.now().toString(36)}`;
+  if (MODE === 'hs256' && !JOIN_TOKEN) {
+    record('첫 참여자 암호 확인', false, 'hs256 서버에는 D3_JOIN_TOKEN(모든 방 edit 토큰)이 필요하다');
+  } else {
+    await C.evaluate((ws, r, token) => {
+      const frag = new URLSearchParams();
+      if (token) frag.set('token', token);
+      frag.set('room', r);
+      history.replaceState(null, '', `/?collab=${encodeURIComponent(ws)}#${frag}`);
+      return window.rhwpStudio.plugins.load('collab').then(() => true);
+    }, WS, room, JOIN_TOKEN);
+    const banner = await C.waitForFunction(() => document.querySelector('[data-collab="desynced"]')?.textContent ?? null, { timeout: 30_000, polling: 250 })
+      .then((h) => h.jsonValue(), () => null);
+    const left = await C.evaluate(() => window.__collab?.status().left ?? null);
+    const doc = await fetch(`${HTTP}/rooms/${encodeURIComponent(room)}/document`, { headers: JOIN_TOKEN ? { authorization: `Bearer ${JOIN_TOKEN}` } : {} });
+    if (MODE === 'none') {
+      record('첫 참여자로 암호 HWPX — base 를 올리지 않고 나감, 서버에 문서 없음', typeof banner === 'string' && banner.includes(ENCRYPTED_TEXT) && left === true && doc.status === 404,
+        `${JSON.stringify(banner)} left ${left}, GET 문서 ${doc.status}`);
+    } else {
+      // 인증을 켠 서버는 방을 파일로만 만든다(POST /rooms — 정본이 그 파일을 열어 본다). 없는 방에 들어가면 "방이 없습니다" —
+      // 첫 참여자가 base 를 올리는 경로 자체가 없다(암호 파일은 POST /rooms 의 encrypted 거절이 막는다)
+      const shown = await C.evaluate(() => [...document.querySelectorAll('[data-collab="unauthorized"]')].map((e) => e.textContent).join(' '));
+      record('인증 서버: 없는 방에는 들어가지 못함(첫 참여자 경로 없음), 서버에 문서 없음', /방이 없습니다/.test(shown) && left === true && doc.status === 404, `${JSON.stringify(shown)} left ${left}, GET 문서 ${doc.status}`);
+    }
+  }
 } catch (error) {
   record('시나리오 실행', false, error.stack ?? String(error));
 } finally {

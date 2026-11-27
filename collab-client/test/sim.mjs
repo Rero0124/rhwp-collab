@@ -2,9 +2,11 @@
 // R5 무작위 다중 클라이언트 시뮬레이션 (docs/collab-stage2.md §8). Node + 실제 WASM + 엔진 그대로.
 //
 //   node collab-client/test/sim.mjs [--seeds 500] [--ops 200] [--clients 3] [--from 1] [--verbose]
-//                                   [--mix all|tn] [--verify-fast] [--no-fast] [--realistic]
+//                                   [--mix all|tn] [--verify-fast] [--no-fast] [--realistic] [--rewrite-state]
 //
 // --mix tn       R11 관문: text·neutral 만(표가 든 base 에서 셀 삭제·셀 서식 포함). 구조·state 없음.
+// --rewrite-state 6단계 S1: 서버(정본)가 받은 state 를 바뀐 부분만 모델에서 다시 쓴 바이트로 바꿔 기록·방송하고(보낸
+//                사람에게는 `replaced` 확정), 섞기에 state 편집(덧말 넣기 — 분류표 state)을 넣는다. 붙여넣기 몫의 일부를 쓴다.
 // --verify-fast  빠른 경로를 쓸 때마다 되감기 결과와 digest 비교(불일치 수를 요약에 낸다 — 관문은 0).
 // --no-fast      빠른 경로를 끈다(언제나 되감기).
 // --realistic    R9 현실 조건: 시간 축 위에서 사람 속도(클라이언트마다 초당 약 5타, 서식·구조 드물게),
@@ -35,6 +37,8 @@ const FAST = !flag('no-fast');
 const REALISTIC = flag('realistic');
 /** --realistic 에서 표 만들기·붙여넣기를 빼려면 --no-struct (그 자리는 글자 입력) */
 const NO_STRUCT = flag('no-struct');
+/** 6단계 S1: 서버가 다시 쓴 state(`replaced`) + 섞기에 state 편집 */
+const REWRITE_STATE = flag('rewrite-state');
 /**
  * --s3: 3단계 조건(docs/collab-stage3.md 관문 "R5 시뮬레이션 확장") — 서버 정본(S3-2), 무작위 연결 끊김·다시 붙기
  * (S3-4 catchup/welcome), 체크포인트(기준점 이동, S3-3), 서버 재시작(모든 연결 끊김 + 정본을 체크포인트 + 기록으로
@@ -210,6 +214,11 @@ function randomEdit(r, doc) {
       const t = r.pick(s.tables);
       doc.insertTableRow(0, t.p, t.ci, r.int(t.rows), r.chance(0.5));
       return 'insertTableRow';
+    }
+    if (REWRITE_STATE && kind >= 0.95 && kind < 0.97) {
+      // 6단계 S1: 결과 전송(state) 편집 — 덧말 넣기(분류표 state). 서버가 다시 쓴 바이트로 확정된다
+      doc.insertRuby(0, p, offsetIn(r, len), JSON.stringify({ mainText: word(r, 2), rubyText: 'ㄱ', below: r.chance(0.5), styleId: null }));
+      return 'insertRuby';
     }
     if (kind < 0.97) {
       if (len === 0) return null;
@@ -472,6 +481,7 @@ function finish(seed, server, clients, made, edits) {
     dropped: clients.reduce((n, c) => n + c.dropped, 0), droppedByClass,
     reasons: clients.flatMap((c) => c.drops), fast,
     digests: digests.map((d) => d.slice(0, 10)), replay: replay.slice(0, 10), errors,
+    ...(REWRITE_STATE ? { rewrite: { rewrites: server.rewrites, replacedAcks: clients.reduce((n, c) => n + (c.replacedAcks ?? 0), 0) } } : {}),
     ...(S3 ? { s3: { canon: canon?.slice(0, 10), generations: server.generations, newcomers: clients.length - CLIENTS, restarts: server.restarts, invalids: server.invalids,
       catchups: clients.reduce((n, c) => n + c.catchups, 0), welcomes: clients.reduce((n, c) => n + c.resyncs, 0) } } : {}),
   };
@@ -489,7 +499,7 @@ const normalized = (m, bytes) => {
 
 async function runSeed(seed, base) {
   const r = prng(seed);
-  const server = new Server(base, { canonical: S3 });
+  const server = new Server(base, { canonical: S3, rewriteState: REWRITE_STATE });
   const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(String.fromCharCode(65 + i), base, server, { fast: FAST, verifyFast: VERIFY_FAST }));
   const made = {};
   let edits = 0;
@@ -539,7 +549,7 @@ const m = await loadWasm();
 const base = (() => { const b = MIX === 'tn' ? tableBaseBytes(m) : blankBytes(); return S3 ? normalized(m, b) : b; })();
 const total = { seeds: 0, failed: [], edits: 0, made: {}, dropped: 0, droppedByClass: {}, reasons: {}, dropPairs: {},
   fast: { fast: 0, slow: 0, fallback: 0, blocks: {}, fastMs: 0, slowMs: 0 }, mismatches: [], mismatchSeeds: [],
-  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 } };
+  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 }, rewrite: { rewrites: 0, replacedAcks: 0 } };
 for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   const res = REALISTIC ? await runRealisticSeed(seed, base) : await runSeed(seed, base);
   for (const k of ['fast', 'slow', 'fallback', 'fastMs', 'slowMs']) total.fast[k] += res.fast[k];
@@ -551,6 +561,7 @@ for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   }
   total.seeds += 1;
   if (res.s3) for (const k of Object.keys(total.s3)) total.s3[k] += res.s3[k];
+  if (res.rewrite) for (const k of Object.keys(total.rewrite)) total.rewrite[k] += res.rewrite[k];
   total.edits += res.edits;
   total.dropped += res.dropped;
   for (const [k, v] of Object.entries(res.made)) total.made[k] = (total.made[k] ?? 0) + v;
@@ -573,7 +584,7 @@ console.log(JSON.stringify({
   seeds: total.seeds, ops: OPS, clients: CLIENTS, failed: total.failed.length, failedSeeds: total.failed.slice(0, 20),
   edits: total.edits, made: total.made, madeByClass, dropped: total.dropped, droppedByClass: total.droppedByClass,
   conflictRateByClass: rate, dropReasons: total.reasons,
-  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
+  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), ...(REWRITE_STATE ? { rewrite: total.rewrite } : {}), cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
   dropRate: total.edits ? `${((total.dropped / total.edits) * 100).toFixed(2)}%` : '-',
   dropPairs: Object.fromEntries(Object.entries(total.dropPairs).sort((a, b) => b[1] - a[1])),
   dropEvents: Object.values(total.reasons).reduce((n, v) => n + v, 0),

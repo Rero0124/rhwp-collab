@@ -21,10 +21,11 @@ import {
   type ForbiddenMessage, type SessionUser, type TokenProvider, type UnauthorizedMessage, type UnauthorizedReason,
 } from './session/index.ts';
 
-type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string };
+type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string; replaced?: boolean };
 type ServerMessage =
   | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number; user?: SessionUser; allowEncrypted?: boolean; encryptedSource?: boolean }
-  | { type: 'ops'; seq: number; clientId: string; entries: Entry[]; batchId?: string }
+  // 6단계 S1: `replaced` 면 서버가 그 묶음의 state 를 모델에서 다시 쓴 바이트로 바꿔 기록했다(entries 가 바뀐 것)
+  | { type: 'ops'; seq: number; clientId: string; entries: Entry[]; batchId?: string; replaced?: boolean }
   | { type: 'catchup'; seq: number; log: LogItem[]; maxMessageBytes?: number; cont?: boolean; user?: SessionUser }
   | { type: 'reject'; seq: number; batchId?: string }
   | { type: 'diverged'; seq: number }
@@ -255,6 +256,8 @@ export const collabPlugin = {
     const resyncTimes: number[] = [];
     let sentEntries = 0;
     let droppedTotal = 0;
+    /** 6단계 S1: 서버가 다시 쓴 state 로 확정한 내 묶음 수(시험·진단용) */
+    let replacedAcks = 0;
     let lastDigest = '';
     let digestSentSeq = -1;
     let digestSentAt = 0;
@@ -648,7 +651,11 @@ export const collabPlugin = {
         return;
       }
       if (msg.clientId === clientId) {
-        engine.ack(inflight);
+        if (msg.replaced === true) {
+          if (!applyReplaced(msg)) return;
+        } else {
+          engine.ack(inflight);
+        }
         inflight = 0;
         inflightBatch = null;
         lastSeq = msg.seq;
@@ -689,6 +696,32 @@ export const collabPlugin = {
       return true;
     };
 
+    /**
+     * 6단계 S1: 내 묶음의 state 를 서버가 모델에서 다시 쓴 바이트(S)로 바꿔 확정했다. 원격 state 와 같은 경로로 studio 에
+     * 반영한다 — 확정 상태를 R(S) 로 두고 뒤의 미확정을 그대로 다시 얹는다(엔진 `ackReplaced`). 같은 모델이라 캐럿·되돌리기
+     * 위치는 그대로이고, 다시 얹다 버린 편집만 알린다.
+     */
+    const applyReplaced = (msg: { seq: number; entries: Entry[] }): boolean => {
+      const doc = handle();
+      if (!doc) return false;
+      const before = host.getCaret();
+      const result = host.applyExternal('collab:replaced', () => engine.ackReplaced(msg.entries, toTextCaret(doc, before)));
+      replacedAcks += 1;
+      if (!result.ok) {
+        requestResync(`서버가 다시 쓴 결과 적용 실패: ${result.error}`);
+        return false;
+      }
+      undo.onRemote(result);
+      const caret = toPluginCaret(doc, result.caret, before);
+      if (caret && before) host.setCaret(caret);
+      if (result.dropped > 0) {
+        droppedTotal += result.dropped;
+        notice(`동시 편집 충돌로 내 편집 ${result.dropped}건이 취소됐습니다`);
+        console.warn(`[collab ${name}] 서버가 다시 쓴 결과 위에 다시 얹기 실패: ${result.dropReason}`);
+      }
+      return true;
+    };
+
     /** 다시 붙음: 끊김 표시를 걷는다. */
     const reconnected = () => {
       disconnectedAt = 0;
@@ -713,7 +746,11 @@ export const collabPlugin = {
         }
         const mine = item.batchId !== undefined ? item.batchId === inflightBatch : item.clientId === clientId;
         if (mine && inflight > 0) {
-          engine.ack(inflight);
+          if (item.replaced === true) {
+            if (!applyReplaced(item)) return;
+          } else {
+            engine.ack(inflight);
+          }
           inflight = 0;
           inflightBatch = null;
           lastSeq = item.seq;
@@ -907,7 +944,7 @@ export const collabPlugin = {
     const surface = {
       status: () => ({
         room, name, clientId, lastSeq, inflight, ready, resyncing, left, desynced, desyncReason, connection,
-        pending: engine.pendingCount, unsent: engine.unsentCount, sentEntries, droppedTotal,
+        pending: engine.pendingCount, unsent: engine.unsentCount, sentEntries, droppedTotal, replacedAcks,
         lastDigest, digestSentSeq, resyncCount: resyncTimes.length, engine: ENGINE_FINGERPRINT,
         cursors: [...cursors.entries()].map(([id, c]) => ({ clientId: id, name: c.name, caret: c.caret })),
         reconnects, disconnectedAt, inflightBatch, user: auth.user,

@@ -1,3 +1,16 @@
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index d47217e2..f6f03075 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -37,6 +37,8 @@ pub use host_font_environment::{
+     DeclaredFontFallbackRequest, ObservedFontFallback, ObservedFontSource,
+ };
+ mod commands;
++// cc-rhwp 다운스트림 패치(0001): 공동편집 정본이 받은 결과를 다시 쓸 때(6단계 S1) 참조 없는 BinData 를 버린다 — 보이기만 바꾼다.
++pub(crate) use commands::bin_data_prune::prune_unreferenced_bin_data;
+ pub use commands::paragraph_block::{
+     FillTemplateRequest, FillTemplateResult, ImportParagraphBlockLimits,
+     ImportParagraphBlockPreview, ImportParagraphBlockRequest, ImportParagraphBlockResult,
 diff --git a/src/lib.rs b/src/lib.rs
 index 3ba518dd..b0a7e446 100644
 --- a/src/lib.rs

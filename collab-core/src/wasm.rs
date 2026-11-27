@@ -123,6 +123,13 @@ impl HwpDocument {
         self.check_confined(snapshot_id, kind).map(|v| v.to_string()).map_err(js_err)
     }
 
+    /// 6단계 S1(서버 정본): 받은 결과 C(gzip)를 바뀐 부분만 모델에서 다시 쓴 바이트 S(gzip)로 바꾼다. 이 문서(정본)는
+    /// 바꾸지 않는다 — 부른 쪽이 S 를 `collabLoadState` 로 읽는다.
+    #[wasm_bindgen(js_name = collabRewriteState)]
+    pub fn collab_rewrite_state(&self, state: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.rewrite_state(state).map_err(js_err)
+    }
+
     /// 5단계 D4(클라이언트 문): 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가.
     #[wasm_bindgen(js_name = collabFieldContains)]
     pub fn collab_field_contains(&self, method: &str, args_json: &str, active_field_json: &str) -> Result<bool, JsValue> {

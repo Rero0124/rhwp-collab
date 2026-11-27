@@ -507,6 +507,67 @@ export class CollabEngine {
     }
   }
 
+  /**
+   * 6단계 S1: 서버가 내 묶음의 state 를 모델에서 다시 쓴 바이트 S 로 바꿔 확정했다(`confirmed` = 서버가 기록에 남긴 그
+   * 묶음, 내 미확정 앞 `confirmed.length` 개 자리). 확정 상태를 그 기록(R(S) 포함)으로 두고, 뒤의 미확정은 **그대로** 다시
+   * 얹는다 — S 는 내가 보낸 C 와 같은 모델이라(원본 바이트 캐시·참조 없는 BinData 만 다르다) 보통 그대로 얹힌다. 원격 state
+   * 를 받은 것처럼 보정하면 state 와 겹친 미확정이 모두 버려지므로 보정하지 않는다. 다시 얹다 실패하면 거기부터 버린다.
+   * 캐럿은 같은 모델이라 그대로 돌려준다.
+   */
+  ackReplaced(confirmed: readonly Entry[], caret: TextCaret | null): ReceiveResult {
+    const doc = this.doc;
+    if (!doc) return { ok: false, rebased: false, dropped: 0, caret, error: '공유 문서가 없습니다' };
+    const n = Math.min(confirmed.length, this.unconfirmed.length);
+    if (n === 0) return { ok: true, rebased: false, dropped: 0, droppedLids: [], remap: [], remapLocal: [], remapComplete: true, caret };
+    if (this.snapshot === null) return { ok: false, rebased: false, dropped: 0, caret, error: '미확정이 있는데 스냅샷이 없습니다' };
+    this.replaying = true;
+    try {
+      const rest = this.unconfirmed.slice(n);
+      const restLids = this.lids.slice(n);
+      const sentRest = Math.max(0, this.sent - n);
+      doc.collabSnapshotRestore(this.snapshot);
+      for (const e of this.acked) this.applyEntry(doc, structuredClone(e));
+      for (const e of confirmed.slice(0, n)) this.applyEntry(doc, structuredClone(e) as Entry);
+      doc.collabSnapshotDiscard(this.snapshot);
+      this.snapshot = rest.length > 0 ? doc.collabSnapshotSave() : null;
+      this.acked = [];
+      const kept: Entry[] = [];
+      const keptLids: number[][] = [];
+      const droppedEntries: Entry[] = [];
+      const droppedLids: number[] = [];
+      let dropReason: string | undefined;
+      for (let i = 0; i < rest.length; i += 1) {
+        try {
+          this.applyEntry(doc, rest[i]);
+          kept.push(rest[i]);
+          keptLids.push(restLids[i] ?? []);
+        } catch (error) {
+          droppedEntries.push(...rest.slice(i));
+          for (let j = i; j < rest.length; j += 1) droppedLids.push(...(restLids[j] ?? []));
+          const failed = rest[i];
+          const what = failed.kind === 'op' ? `${failed.m}(${JSON.stringify(failed.a)})` : 'state';
+          dropReason = `서버가 다시 쓴 결과 위에 다시 얹기 실패: ${what}: ${error instanceof Error ? error.message : String(error)}`;
+          break;
+        }
+      }
+      this.unconfirmed = kept;
+      this.lids = keptLids;
+      this.sent = Math.min(sentRest, kept.length);
+      if (kept.length === 0 && this.snapshot !== null) {
+        doc.collabSnapshotDiscard(this.snapshot);
+        this.snapshot = null;
+      }
+      return {
+        ok: true, rebased: true, dropped: droppedEntries.length, droppedEntries, dropReason, droppedLids,
+        remap: [], remapLocal: [], remapComplete: droppedEntries.length === 0, caret,
+      };
+    } catch (error) {
+      return { ok: false, rebased: false, dropped: 0, caret, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      this.replaying = false;
+    }
+  }
+
   /** 서버가 거절했다(낡은 base). 미확정 전부를 다시 보낸다. */
   requeue(): void {
     this.sent = 0;

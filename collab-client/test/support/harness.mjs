@@ -7,6 +7,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { CollabEngine } from '../../src/engine/engine.ts';
+import { base64ToBytes, bytesToBase64 } from '../../src/engine/codec.ts';
 import { methodsToIntercept, classify } from '../../src/engine/classify.ts';
 import { interceptPrototype } from '../../../upstream/rhwp/rhwp-studio/src/plugin/document-intercept.ts';
 
@@ -141,7 +142,7 @@ export class Client {
       for (const item of msg.log) {
         if (item.batchId === this.inflightBatch && this.inflight > 0) {
           if (item.seq !== this.lastSeq + 1) this.errors.push(`catchup seq 건너뜀 ${this.lastSeq} → ${item.seq}`);
-          this.engine.ack(this.inflight);
+          this.ackOwn(item);
           this.inflight = 0;
           this.inflightBatch = null;
           this.lastSeq = item.seq;
@@ -161,7 +162,7 @@ export class Client {
     }
     if (msg.seq !== this.lastSeq + 1) this.errors.push(`seq 건너뜀 ${this.lastSeq} → ${msg.seq}`);
     if (msg.clientId === this.id) {
-      this.engine.ack(this.inflight);
+      this.ackOwn(msg);
       this.inflight = 0;
       this.inflightBatch = null;
     } else {
@@ -182,6 +183,22 @@ export class Client {
       }
     }
     this.lastSeq = msg.seq;
+  }
+
+  /** 내 묶음의 확정. 6단계 S1: 서버가 state 를 다시 쓴 바이트로 바꿨으면(`replaced`) 확정 상태를 그 기록으로 두고 미확정을 다시 얹는다. */
+  ackOwn(msg) {
+    if (msg.replaced !== true) {
+      this.engine.ack(this.inflight);
+      return;
+    }
+    this.replacedAcks = (this.replacedAcks ?? 0) + 1;
+    const res = this.engine.ackReplaced(msg.entries, this.caret);
+    if (!res.ok) this.errors.push(`다시 쓴 결과 적용 실패 seq ${msg.seq}: ${res.error}`);
+    if (res.dropped > 0) {
+      this.dropped += res.dropped;
+      this.drops.push(res.dropReason ?? '');
+      this.droppedEntries.push(...(res.droppedEntries ?? []));
+    }
   }
 
   digest() {
@@ -210,7 +227,10 @@ export class Server {
     this.log = [];
     this.queues = new Map();
     this.offline = new Set();
-    this.canonical = options.canonical ? this.openCanonical() : null;
+    this.canonical = options.canonical || options.rewriteState ? this.openCanonical() : null;
+    /** 6단계 S1: 정본이 받은 state 를 바뀐 부분만 모델에서 다시 쓴 바이트로 바꿔 기록·방송한다(보낸 사람에게도, `replaced`) */
+    this.rewriteState = Boolean(options.rewriteState);
+    this.rewrites = 0;
     this.invalids = 0;
     this.generations = 0;
     this.restarts = 0;
@@ -231,6 +251,7 @@ export class Server {
   canonicalDigest() { return this.canonical?.doc.collabDigest() ?? null; }
   join(client) { this.queues.set(client, []); }
   submit(client, base, entries, batchId) {
+    let replaced = false;
     if (this.offline.has(client)) return; // 끊긴 연결로는 닿지 않는다
     if (base !== this.seq) {
       this.queues.get(client).push({ type: 'reject', seq: this.seq, ...(batchId ? { batchId } : {}) });
@@ -240,7 +261,20 @@ export class Server {
       const { doc, engine } = this.canonical;
       const snap = doc.collabSnapshotSave();
       try {
-        engine.replay(entries);
+        if (this.rewriteState && entries.some((e) => e.kind === 'state')) {
+          // 묶음의 앞 연산까지 적용한 정본과 비교해야 하므로 하나씩 적용하며 state 를 바꾼다
+          entries = structuredClone(entries);
+          for (const e of entries) {
+            if (e.kind === 'state') {
+              e.data = bytesToBase64(doc.collabRewriteState(base64ToBytes(e.data)));
+              this.rewrites += 1;
+            }
+            engine.replay([e]);
+          }
+          replaced = true;
+        } else {
+          engine.replay(entries);
+        }
       } catch {
         doc.collabSnapshotRestore(snap);
         doc.collabSnapshotDiscard(snap);
@@ -251,7 +285,7 @@ export class Server {
       doc.collabSnapshotDiscard(snap);
     }
     this.seq += 1;
-    const msg = { type: 'ops', seq: this.seq, clientId: client.id, entries: structuredClone(entries), ...(batchId ? { batchId } : {}) };
+    const msg = { type: 'ops', seq: this.seq, clientId: client.id, entries: structuredClone(entries), ...(batchId ? { batchId } : {}), ...(replaced ? { replaced: true } : {}) };
     this.log.push(msg);
     for (const [c, q] of this.queues) if (!this.offline.has(c)) q.push(structuredClone(msg));
   }

@@ -759,6 +759,54 @@ impl CollabCore {
         Ok(DocumentCore::from_bytes(&raw?)?.document)
     }
 
+    /// 6단계 S1(docs/collab-stage6.md): 받은 결과(state) 바이트 C 를 "바뀐 부분만 모델에서 다시 쓴" 바이트 S 로 바꾼다.
+    /// C·S 모두 `export_state` 와 같은 gzip 감싸기다. **정본(이 문서)은 바꾸지 않는다** — 부른 쪽이 S 를 `load_state` 로
+    /// 읽는다(계보: 모두가 같은 바이트 S 를 읽는다).
+    ///
+    /// - 구역·DocInfo: C 를 읽은 모델의 원본 바이트가 정본의 지금 원본 바이트와 같으면 그 바이트를 그대로 쓰고, 다르면
+    ///   캐시를 버려 모델에서 다시 쓴다 — 파서가 모델에 남기지 않는 레코드가 사라진다. 정본의 원본 바이트는 **봉인이 지금
+    ///   모델과 맞을 때만**(저장기가 다시 쓰는 조건과 같다) 기준으로 삼는다: 연산으로 바뀐 구역의 낡은 바이트와 같다고 보지
+    ///   않는다. 어느 쪽이든 S 의 내용은 C 의 모델이다.
+    /// - 부속 스트림(`extra_streams`·HWPX 부속 항목)·미리보기·파일 머리·출처 표지는 정본의 지금 것을 쓴다. 저장기가 모델에서
+    ///   다시 만드는 것(`/RhwpLineSegTags`, 테두리 칠 표지)은 저장할 때 새로 생긴다. 편집 기능 중 문서 객체의 부속 스트림을
+    ///   바꾸는 것은 없다(내보낼 때 사본에 붙이는 계보 표지뿐).
+    /// - BinData: 모델이 참조하는 것만 남긴다(업스트림 `prune_unreferenced_bin_data` — 참조 번호를 함께 옮긴다).
+    /// - 형식: 정본의 형식 계열로 쓴다.
+    pub fn rewrite_state(&self, state: &[u8]) -> Result<Vec<u8>, HwpError> {
+        let raw = unpack_state(state)?;
+        let mut tmp = DocumentCore::from_bytes(&raw)?;
+        let canon = &self.inner.document;
+        {
+            let doc = &mut tmp.document;
+            for (i, section) in doc.sections.iter_mut().enumerate() {
+                let trusted = canon.sections.get(i).filter(|c| c.raw_provenance_permits_reuse()).and_then(|c| c.raw_stream.as_ref());
+                if section.raw_stream.is_none() || section.raw_stream.as_ref() != trusted {
+                    section.raw_stream = None;
+                    section.raw_provenance = None;
+                }
+            }
+            let trusted_info = if canon.doc_info.raw_provenance_permits_reuse(&canon.doc_properties) { canon.doc_info.raw_stream.as_ref() } else { None };
+            if doc.doc_info.raw_stream.is_none() || doc.doc_info.raw_stream.as_ref() != trusted_info {
+                doc.doc_info.raw_stream = None;
+                doc.doc_info.raw_provenance = None;
+            }
+            doc.extra_streams = canon.extra_streams.clone();
+            doc.hwpx_aux_entries = canon.hwpx_aux_entries.clone();
+            doc.preview = canon.preview.clone();
+            doc.header = canon.header.clone();
+            doc.is_hwp3_variant = canon.is_hwp3_variant;
+            doc.is_hwpx_variant = canon.is_hwpx_variant;
+            doc.provenance = canon.provenance.clone();
+            crate::document_core::prune_unreferenced_bin_data(doc);
+        }
+        tmp.source_format = self.inner.source_format;
+        let out = match tmp.source_format {
+            crate::parser::FileFormat::Hwpx => tmp.export_hwpx_native()?,
+            _ => tmp.export_hwp_native()?,
+        };
+        pack_state(&out)
+    }
+
     /// 5단계 D4 클라이언트 문: 글자 연산 호출(`method`·`args`, 호출 전)이 활성 누름틀(`active_field`) 안에 완전히 드는가.
     /// `insertTextLogical` 은 논리 오프셋을 텍스트 좌표로 바꿔 본다.
     pub fn field_contains_call(&self, method: &str, args: &[Value], active_field: &Value) -> Result<bool, HwpError> {

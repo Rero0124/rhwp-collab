@@ -3,7 +3,7 @@
 import type { CatalogEntry } from './types.ts';
 
 /** 엔진 지문: 업스트림 커밋-패치 해시-보정·기록 코드 해시-분류표 해시. 방의 참여자는 모두 같아야 한다. */
-export const ENGINE_FINGERPRINT = "981ce66b4183-d1686b889fce-6227a17d6195-d0e76ac479bb";
+export const ENGINE_FINGERPRINT = "981ce66b4183-8ab67845cf3a-c0f608bb21d8-d0e76ac479bb";
 
 /** studio 합성 메서드(레지스트리에 있으나 export 가 아님). 내부에서 분류표의 export 를 부른다. */
 export const COMPOSED_METHODS: readonly string[] = ["setPageMargin","insertHyperlink","updateHyperlink","replaceHyperlinkText","removeHyperlink"];

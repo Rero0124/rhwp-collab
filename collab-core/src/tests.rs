@@ -1057,3 +1057,105 @@ fn memo_time_pin_is_released_even_when_the_call_panics() {
     drop(outer);
     assert_eq!(super::pinned_memo_time(), None);
 }
+
+// ── 6단계 S1: 받은 결과(state)를 바뀐 부분만 모델에서 다시 쓰기 ────────────────────────────
+
+const MARKER: &[u8] = b"EVIL-RECORD-PAYLOAD";
+const PNG_1PX: [u8; 70] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+
+/// 바이트(결과 전송 gzip 또는 원본)의 어느 구역 원본 바이트에 표지가 있는가 — 다시 읽어서 본다.
+fn sections_carry_marker(bytes: &[u8]) -> bool {
+    let doc = DocumentCore::from_bytes(&super::unpack_state(bytes).unwrap()).unwrap();
+    doc.document.sections.iter().any(|s| s.raw_stream.as_ref().is_some_and(|r| r.windows(MARKER.len()).any(|w| w == MARKER)))
+}
+
+/// 구역 0 의 원본 바이트 끝에 모르는 태그(0x3f0) 레코드를 끼우고 봉인을 다시 해 저장기가 그 바이트를 그대로 쓰게 한 결과.
+/// 한/글 파일을 직접 고친 위조와 같은 바이트가 나온다.
+fn with_injected_record(c: &mut CollabCore) -> Vec<u8> {
+    let section = &mut c.document.sections[0];
+    let raw = section.raw_stream.as_mut().expect("구역 원본 바이트");
+    let header: u32 = 0x3f0 | ((MARKER.len() as u32) << 20);
+    raw.extend_from_slice(&header.to_le_bytes());
+    raw.extend_from_slice(MARKER);
+    section.seal_raw_provenance();
+    c.export_state().unwrap()
+}
+
+fn text_doc() -> Vec<u8> {
+    let mut c = CollabCore::new(blank());
+    c.insert_text_native(0, 0, 0, "본문 글자입니다").unwrap();
+    let packed = c.export_state().unwrap();
+    super::unpack_state(&packed).unwrap().into_owned()
+}
+
+#[test]
+fn rewrite_state_keeps_the_canonical_document_and_reloads_to_the_same_model() {
+    let raw = text_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let before = canon.digest();
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    client.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let c = client.export_state().unwrap();
+    let s = canon.rewrite_state(&c).unwrap();
+    assert_eq!(canon.digest(), before, "정본은 바꾸지 않는다");
+    let mut via_c = CollabCore::new(blank());
+    via_c.load_state(&c).unwrap();
+    canon.load_state(&s).unwrap();
+    assert_eq!(canon.digest(), via_c.digest(), "R(S) 와 R(C) 는 같은 모델");
+    // 편집 없는 결과 전송: 바이트까지 정본의 지금 것을 그대로(구역·DocInfo 원본 바이트 재사용)
+    let same = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap()).export_state().unwrap();
+    let s2 = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap()).rewrite_state(&same).unwrap();
+    let mut a = CollabCore::new(blank());
+    a.load_state(&s2).unwrap();
+    assert_eq!(a.digest(), CollabCore::new(DocumentCore::from_bytes(&raw).unwrap()).digest());
+}
+
+#[test]
+fn rewrite_state_drops_a_record_injected_into_section_bytes() {
+    let raw = text_doc();
+    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let c = with_injected_record(&mut client);
+    assert!(sections_carry_marker(&c), "위조 바이트에 레코드가 있다(전제)");
+    let s = canon.rewrite_state(&c).unwrap();
+    assert!(!sections_carry_marker(&s), "다시 쓴 바이트에는 없다");
+    let unpacked = super::unpack_state(&s).unwrap();
+    assert!(!unpacked.windows(MARKER.len()).any(|w| w == MARKER) || !sections_carry_marker(&s), "S 안 어디에도(압축 안 된 구역 포함)");
+}
+
+#[test]
+fn rewrite_state_trusts_canonical_bytes_only_while_their_seal_matches() {
+    // 정본의 원본에 모르는 레코드가 있다(올린 파일 — 믿는 바이트). 그 바이트를 그대로 돌려보낸 결과는 재사용되고(표지 남음),
+    // 정본에서 연산으로 그 구역이 바뀐 뒤에는 같은 바이트여도 "같음"으로 보지 않고 모델에서 다시 쓴다(표지 사라짐).
+    let raw = text_doc();
+    let mut origin = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let base = super::unpack_state(&with_injected_record(&mut origin)).unwrap().into_owned();
+    assert!(sections_carry_marker(&base));
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&base).unwrap());
+    let stale = CollabCore::new(DocumentCore::from_bytes(&base).unwrap()).export_state().unwrap();
+    assert!(sections_carry_marker(&canon.rewrite_state(&stale).unwrap()), "봉인이 맞는 정본 바이트와 같으면 그대로");
+    canon.insert_text_native(0, 0, 0, "연산 ").unwrap();
+    assert!(!sections_carry_marker(&canon.rewrite_state(&stale).unwrap()), "연산으로 바뀐 구역은 낡은 바이트와 같다고 보지 않는다");
+}
+
+#[test]
+fn rewrite_state_uses_canonical_streams_and_drops_unreferenced_bin_data() {
+    let raw = text_doc();
+    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    // 그림을 넣었다 지워 참조 없는 BinData 를 남기고, 스크립트 스트림을 더한다
+    client.insert_picture_native(0, 0, 0, &[], &PNG_1PX, 1000, 1000, 1, 1, "png", "그림", None, None).unwrap();
+    let ci = client.document.sections[0].paragraphs[0].controls.iter().position(|c| matches!(c, crate::model::control::Control::Picture(_)) || matches!(c, crate::model::control::Control::Shape(_))).expect("그림");
+    client.delete_picture_control_native(0, 0, ci).unwrap();
+    client.document.extra_streams.push(("/Scripts/Evil".to_string(), b"evil();".to_vec()));
+    let c = client.export_state().unwrap();
+    let reread = DocumentCore::from_bytes(&super::unpack_state(&c).unwrap()).unwrap();
+    assert!(!reread.document.bin_data_content.is_empty(), "결과 전송에 참조 없는 BinData 가 있다(전제)");
+    assert!(reread.document.extra_streams.iter().any(|(p, _)| p == "/Scripts/Evil"), "결과 전송에 더한 스트림이 있다(전제)");
+    let s = canon.rewrite_state(&c).unwrap();
+    let out = DocumentCore::from_bytes(&super::unpack_state(&s).unwrap()).unwrap();
+    assert!(out.document.bin_data_content.is_empty(), "참조 없는 BinData 를 버림");
+    assert!(!out.document.extra_streams.iter().any(|(p, _)| p == "/Scripts/Evil"), "부속 스트림은 정본의 것");
+    let names = |d: &crate::model::document::Document| d.extra_streams.iter().map(|(p, _)| p.clone()).filter(|p| p != crate::model::line_seg_tags::HWP_STREAM).collect::<Vec<_>>();
+    assert_eq!(names(&out.document), names(&canon.document));
+}

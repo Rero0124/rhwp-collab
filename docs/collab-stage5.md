@@ -125,13 +125,15 @@ rhwp-collab 은 부품이다. 실제로 쓰는 곳(회사 문서 시스템 등)�
 `scope` 에 두 가지를 더한다. 목록이라 함께 줄 수 있다(예: `form comment`).
 - `form`: 양식만 채운다. 누름틀 안의 글자와 양식 개체(체크박스·라디오·콤보·입력란)의 값만 바꿀 수 있다.
   누름틀을 만들거나 지우거나 이름·속성을 바꾸는 것은 양식의 구조를 바꾸는 일이므로 `edit` 이다.
-- `comment`: 메모만 단다. 메모 넣기·답글·고치기·지우기와 메모 모양을 바꿀 수 있고, 본문은 못 고친다.
+- `comment`: 메모만 단다. 메모 넣기·답글·고치기·지우기를 할 수 있고, 본문은 못 고친다. 메모 모양(`setMemoShape`)은
+  구역 전체의 메모 겉모습을 바꾸는 문서 설정이라 `edit` 이다(2026-11-27 정정).
 - 둘 다 보기는 `view` 와 같다.
 
 관련 export(분류표 기준):
 - 양식: `setFormValue`(op), `setFormValueInCell(Ex)`(state), `applyFormActionUpdates`(state), `setFieldValue`·
   `setFieldValueByName`(op). 누름틀 안 입력은 일반 글자 연산에 `ctx.activeField` 가 붙은 형태다.
-- 메모: `insertMemo`·`insertMemoByPath`·`insertMemoReply`·`removeMemo`·`setMemoShape`·`setMemoText`(모두 state).
+- 메모: `insertMemo`·`insertMemoByPath`·`insertMemoReply`·`removeMemo`·`setMemoText`(조사 때 모두 state, 뒤에 op 로 올림).
+  `setMemoShape` 는 `edit`.
 
 ### 판정은 두 겹이다
 
@@ -186,7 +188,7 @@ rhwp-collab 은 부품이다. 실제로 쓰는 곳(회사 문서 시스템 등)�
 - **서버 중계:** 메모가 op 로 올라가면 인자가 기록에 그대로 있다. 그래서 정본 전에 `author` 가 그 연결의 이름과
   같은지 본다. 다르면 `forbidden {reason:"author"}`. 모든 권한에 적용한다.
   - 이름은 토큰의 `name` 이 있으면 그것, 없으면(초대 토큰) hello 의 이름(확인되지 않은 표시 이름)이다.
-- **comment 권한은 자기 메모만 고치고 지운다:** `setMemoText`·`removeMemo`·`setMemoShape` 대상 메모의 작성자가 그
+- **comment 권한은 자기 메모만 고치고 지운다:** `setMemoText`·`removeMemo` 대상 메모의 작성자가 그
   연결의 이름과 같아야 한다. 정본의 메모 목록에서 확인한다. 답글은 누구의 메모에나 달 수 있다. edit 는 모든 메모를
   고치고 지울 수 있다(Google Docs 의 댓글 작성자·편집자와 같은 구분).
   - 클라이언트 문도 같은 판정을 해서 미리 막고 안내한다("자기 메모만 고칠 수 있습니다").

@@ -72,7 +72,7 @@ test('정적 파일: index.html·assets 캐시·wasm MIME·ETag, 경로 탈출�
     assert.equal(res.status, 200);
     assert.match(await res.text(), /공동편집 방 만들기/);
     res = await fetch(`${base}/healthz`);
-    assert.deepEqual(await res.json(), { ok: true });
+    assert.deepEqual(await res.json(), { ok: true, auth: 'none', encryptedAllowed: false });
     res = await fetch(`${base}/`, { method: 'DELETE' });
     assert.equal(res.status, 405);
 
@@ -117,7 +117,7 @@ test('TLS: COLLAB_TLS_CERT·KEY 를 주면 HTTPS/wss 로 뜬다', { skip: !opens
         res.on('end', () => resolve(data));
       }).on('error', reject);
     });
-    assert.deepEqual(JSON.parse(body), { ok: true });
+    assert.deepEqual(JSON.parse(body).ok, true);
     const ws = new WebSocket(`wss://127.0.0.1:${server.port}/`, { ca });
     await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
     const msg = new Promise((r) => ws.once('message', (d) => r(JSON.parse(d.toString()))));
@@ -135,5 +135,17 @@ test('TLS: COLLAB_TLS_CERT·KEY 를 주면 HTTPS/wss 로 뜬다', { skip: !opens
     assert.throws(() => startServer({ port: 0, log: () => {}, canonical: false }), /함께/);
   } finally {
     delete process.env.COLLAB_TLS_CERT;
+  }
+});
+
+test('/healthz: 확인 방식과 암호 문서 허용 여부(비밀이 아닌 설정 요약)', async () => {
+  const { hs256Auth } = await import('../auth.mjs');
+  const server = startServer({ port: 0, log: () => {}, canonical: false, auth: hs256Auth('k'.repeat(40)), allowEncrypted: true });
+  await server.ready;
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+    assert.deepEqual(await res.json(), { ok: true, auth: 'hs256', encryptedAllowed: true });
+  } finally {
+    await server.close();
   }
 });

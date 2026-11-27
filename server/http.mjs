@@ -3,7 +3,7 @@
 //   POST /rooms                  본문 = HWP/HWPX 바이트 → 201 {room, invite?, inviteExpiresAt?}
 //   GET  /rooms/{room}/document  → 200 최신 문서 파일(원본 형식)
 //   GET  /upload                 업로드 페이지(server/public/upload.html)
-//   GET  /healthz                → 200 ok
+//   GET  /healthz                → 200 {ok, auth, encryptedAllowed}
 //   GET  그 밖                    staticDir 의 정적 파일(빌드한 studio). 없으면 404
 //
 // 인증·방 처리는 server.mjs 가 넘기는 api 가 한다. 여기서는 경로, 본문 상한, 오류 응답, 정적 파일만 다룬다.
@@ -140,7 +140,7 @@ function serveFile(req, res, { file, stat }, { cache } = {}) {
  *   staticDir?: string|null, maxBodyBytes: number, originAllowed(req): boolean, log(m: string): void,
  * }} opts
  */
-export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originAllowed, log }) {
+export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originAllowed, log, health = () => ({}) }) {
   return async (req, res) => {
     let url;
     try { url = new URL(req.url ?? '/', 'http://x'); } catch { return sendJson(res, 400, { error: 'bad-url' }); }
@@ -170,7 +170,8 @@ export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originA
         return res.end(req.method === 'HEAD' ? undefined : raw);
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method' }, { allow: 'GET, HEAD' });
-      if (pathname === '/healthz') return sendJson(res, 200, { ok: true });
+      // 서버 상태와 설정 요약(비밀이 아닌 것만) — studio 의 공동편집 시작 메뉴가 메뉴를 보일지·토큰이 필요한지 정한다
+      if (pathname === '/healthz') return sendJson(res, 200, { ok: true, ...health() });
       if (pathname === '/upload' || pathname === '/upload.html') {
         const stat = await fs.stat(UPLOAD_PAGE);
         return serveFile(req, res, { file: UPLOAD_PAGE, stat });

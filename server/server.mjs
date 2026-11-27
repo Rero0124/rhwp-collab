@@ -7,7 +7,7 @@
 //   POST /rooms        파일로 방 만들기 (scope create)
 //   GET  /rooms/{room}/document   방의 최신 문서 파일 (room 이 맞는 토큰)
 //   GET  /upload       업로드 페이지(server/public/upload.html)
-//   GET  /healthz      {ok: true}
+//   GET  /healthz      {ok, auth: 확인 방식, encryptedAllowed}
 //   GET  그 밖          COLLAB_STATIC_DIR 의 정적 파일(빌드한 studio)
 // 접속 인증(5단계 D1)은 hello 에서 `auth.verify(token, room)`(server/auth.mjs)로 하고, 실패하면 unauthorized 후 닫는다.
 // 권한(scope)이 view 인 연결은 편집(ops·base)을 보낼 수 없다 — forbidden 으로 거절하고 연결은 둔다. form·comment 연결은
@@ -804,6 +804,7 @@ export function startServer({
   const onRequest = createHttpHandler({
     api: { createRoom: createRoomFromFile, download: downloadDocument },
     staticDir, maxBodyBytes: maxMessageBytes, originAllowed, log,
+    health: () => ({ auth: auth.mode, encryptedAllowed: allowEncrypted }),
   });
   const httpServer = tls ? https.createServer({ cert: tls.cert, key: tls.key }, onRequest) : http.createServer(onRequest);
   httpServer.on('upgrade', (req, socket, head) => {

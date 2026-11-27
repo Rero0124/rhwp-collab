@@ -154,7 +154,7 @@ COLLAB_DATA_DIR=./data node server/server.mjs
 | `COLLAB_AUTH_SECRET` | 없음 | `hs256` 비밀키(32바이트 이상). `COLLAB_AUTH_SECRET_FILE` 로 파일에서 읽을 수도 있습니다 |
 | `COLLAB_AUTH_URL` | 없음 | `url` 방식에서 `{token, room}` 을 POST 할 주소. `{ok, sub, name, scope}` 를 돌려줘야 합니다 |
 | `COLLAB_INVITE_TTL` | `24h` | 방을 만들 때 서버가 만드는 초대 링크의 수명(`hs256` 만). `30m`, `7d`, 초 단위 숫자 |
-| `COLLAB_ALLOW_ENCRYPTED` | 없음 | `1` 이면 암호 문서로도 방을 엽니다. 그 방의 문서는 암호가 풀린 상태로 저장되고 오갑니다(기본은 거절) |
+| `COLLAB_ALLOW_ENCRYPTED` | 없음 | `1` 이면 암호 문서로도 방을 엽니다. 문서 암호는 방을 만들 때 요청 머리 `X-Collab-Document-Password` 로 한 번 받고 저장하지 않습니다. 역방향 프록시가 요청 머리를 기록하지 않게 설정하세요. 그 방의 문서는 암호가 풀린 상태로 저장되고 오갑니다(기본은 거절) |
 | `COLLAB_ALLOWED_ORIGINS` | 없음 | 쉼표로 구분한 출처 목록. 있으면 그 밖의 브라우저 출처에서 오는 WebSocket·방 만들기를 거절합니다. 같은 출처는 언제나 허용합니다 |
 | `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | 없음 | PEM 인증서와 키 파일. 둘 다 있으면 HTTPS/wss 로 뜹니다 |
 | `COLLAB_STATIC_DIR` | 없음 | 함께 내줄 편집기 빌드(`scripts/build-studio.sh` 의 `target/studio`) |

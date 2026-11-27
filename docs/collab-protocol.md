@@ -316,7 +316,9 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
 ### 그 밖
 
 - `GET /upload`: 업로드 페이지(`#token=<create 토큰>` 으로 연다). 방을 만들고 권한별 링크를 보여 준다.
-- `GET /healthz`: `{ok: true}`.
+- `GET /healthz`: `{ok: true, auth, encryptedAllowed}`. `auth` 는 확인 방식(`none`·`hs256`·`url`, 끼운 검증 함수면 그 이름), `encryptedAllowed` 는
+  암호 문서를 받는지(`COLLAB_ALLOW_ENCRYPTED`). 인증 없이 누구나 볼 수 있으므로 비밀이 아닌 설정만 싣는다. 편집기는 이것으로
+  "공동편집 시작" 메뉴를 보일지, 토큰이 필요한지 정한다.
 - 그 밖의 `GET`: `COLLAB_STATIC_DIR` 의 정적 파일(빌드한 편집기). 같은 출처로 띄우면 편집기 주소는
   `https://호스트/?collab#token=…&room=…` 이다(값이 빈 `collab` = 같은 출처 `wss://호스트/`).
 

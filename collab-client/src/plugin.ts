@@ -128,17 +128,14 @@ const ENCRYPTED_REFUSED = '암호 문서는 공동편집할 수 없습니다';
 const ENCRYPTED_NOTICE = '원래 암호가 걸린 문서입니다. 공동편집 중에는 암호가 풀린 상태로 서버에 저장됩니다';
 
 /**
- * D5: 지금 열린 문서가 암호 문서인가. studio 가 알려 주면(`requiresPasswordForSave` — 암호로 연 문서) 그것을 쓰고, 아니면
- * 문서 정보의 `encrypted`(HWP 파일 머리 표시 — 암호로 연 HWPX 는 false 라 못 가린다)를 본다.
+ * D5: 지금 열린 문서가 암호 문서(암호로 열어 저장할 때 암호가 필요한 문서)인가. studio 가 `host.documentProtection()` 으로
+ * 알려 준다(0002). 그 API 가 없는 studio 에서는 가릴 수 없으므로 막지 않는다.
  * 실수로 공유하는 것을 막는 장치다. 서버는 받은 바이트(암호 없음)로 원래 암호 문서였는지 알 수 없다.
  */
-function documentIsEncrypted(host: PluginHost, doc: EngineDoc): boolean {
-  const studio = host as unknown as { requiresPasswordForSave?: () => boolean };
-  if (typeof studio.requiresPasswordForSave === 'function') {
-    try { if (studio.requiresPasswordForSave()) return true; } catch { /* 모름 — 아래로 */ }
-  }
+function documentIsEncrypted(host: PluginHost): boolean {
+  const studio = host as unknown as { documentProtection?: () => { requiresPasswordForSave?: boolean } | null | undefined };
   try {
-    return JSON.parse((doc as unknown as { getDocumentInfo(): string }).getDocumentInfo()).encrypted === true;
+    return studio.documentProtection?.()?.requiresPasswordForSave === true;
   } catch {
     return false;
   }
@@ -604,7 +601,7 @@ export const collabPlugin = {
           // 첫 참여자: 지금 문서를 base 로 올리고 같은 바이트로 다시 연다(모두 같은 파싱 결과에서 출발).
           if (!host.borrowDocument()) await host.createBlankDocument();
           // 5단계 D5: 암호 문서는 서버가 허용할 때만 올린다
-          const encrypted = host.read((d) => documentIsEncrypted(host, d as unknown as EngineDoc));
+          const encrypted = documentIsEncrypted(host);
           if (encrypted && !msg.allowEncrypted) { leave(ENCRYPTED_REFUSED); return; }
           const packed = host.read((d) => (d as unknown as EngineDoc).collabExportState());
           const data = bytesToBase64(packed);

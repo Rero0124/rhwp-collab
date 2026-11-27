@@ -466,3 +466,80 @@ window.addEventListener('message', async (event) => {
 **다음 후보:** 위 (가)~(다)의 자리도 막는다. 해석하지 않은 바이트를 그대로 들고 있는 대신, 정본에 같은 자리의 같은 바이트가
 있을 때만 그 바이트를 쓰고 아니면 버리거나 모델에서 다시 만든다(구역 끝 목록에 쓴 방식과 같다). (라)는 그림·OLE 내용 자체라
 막을 수 없고, 받는 쪽 프로그램이 그 내용을 다루는 방식의 문제다.
+
+## 9. 다른 플랫폼에서 클라이언트 만들기 (6단계 N1)
+
+§4 의 클라이언트 동작(연결·hello·welcome/catchup·재접속·보내기·재동기화·digest·커서·권한)은 플랫폼 중립 세션
+`collab-client/src/session/` 의 `CollabSession` 이 한다. DOM·studio 를 쓰지 않는다(시험이 `window`·`document`·`location`·
+`localStorage`·`sessionStorage`·`DecompressionStream` 이 없는지 본다). 다른 편집기·플랫폼은 아래 넷을 넘겨 같은 세션을 쓴다.
+studio 어댑터 `collab-client/src/plugin.ts` 가 예다.
+
+**현재 한계:** 편집 기록 엔진(`CollabEngine`, `collab-client/src/engine/`)이 TypeScript 다. 세션은 그 엔진을 만들어 쓰므로,
+JS 런타임이 없는 네이티브 클라이언트는 엔진을 옮기거나 같은 규약(§3·§4, 기록 형태와 되감기·보정 규칙)을 따로 구현해야
+한다. 엔진의 조율 부분을 Rust(`collab-core`)로 옮기는 일은 아직 정하지 않았다. 문서 자체는 rhwp(WASM 또는 네이티브)다.
+
+### 9.1 넘기는 것
+
+- **`Transport`(연결 하나):** `TransportFactory(events) → { isOpen, send(text), close() }`. 사건은 `open()`, `message(text)`
+  (서버 메시지 하나, JSON 문자열), `close()`(닫힘·오류 모두, 한 번)이고, 만든 함수가 돌아온 뒤에 부른다. 세션은 재접속마다
+  새로 만들고 옛 연결의 사건은 버린다. `send` 는 열려 있지 않으면 버린다. 브라우저는 WebSocket 을 그대로 감싼다.
+- **`CollabHost`(편집기):**
+
+  | 메서드 | 하는 일 |
+  |---|---|
+  | `doc()` | 지금 문서(rhwp 문서 핸들). 없으면 null |
+  | `ensureDoc()` | 첫 참여자: 열린 문서가 없으면 빈 문서를 만든다 |
+  | `isEncrypted()` | 지금 문서가 암호 문서인가(§4.1, 모르면 false) |
+  | `exportState()` | `base` 로 올릴 바이트(`collabExportState`, gzip) |
+  | `openDoc(bytes)` | 받은 바이트로 문서를 연다(gzip 이면 풀어서, 확인 창 없이) |
+  | `layoutPolicyHolds(doc)` | 모두 같은 조판 규칙(글꼴 정책)이 걸렸나 — 아니면 세션이 나간다 |
+  | `applyExternal(kind, fn)` | 원격 반영 구역(`resync`·`replay`·`remote`·`replaced`). 그 안의 변경은 사용자 편집이 아니다(기록·되돌리기·자동 저장 밖), 끝나면 화면을 갱신한다 |
+  | `captureCaret()` / `restoreCaret(snap, moved)` | 캐럿 스냅숏. `text` 는 엔진 좌표(못 바꾸면 null), 나머지는 편집기 좌표. 원격 반영 뒤 `moved`(없으면 원래 자리)에 놓는다. 스냅숏이 null 이면 캐럿 없음 |
+  | `isComposing()` | 입력기 조합 중인가(조합 중에는 원격을 보류하고 보내지 않는다) |
+  | `event(e)` | 세션이 알리는 일(§9.2) |
+  | `log(level, msg)` | 개발자 진단(선택) |
+
+- **`TokenProvider`:** §2.1 그대로(`connect`·`reconnect`·`expired`). 세션 안의 `AuthSession` 이 부른다.
+- **`Clock`:** `now`·`setTimeout`·`clearTimeout`·`setInterval`·`clearInterval`(기본 globalThis — 시험에서 바꿔 끼운다).
+
+편집기는 세션에 이런 일을 알린다: 문서 호출을 `session.engine.intercept(...)` 로 가로채 기록, 내 편집이 기록됨
+`edited()`, 문서 표시가 바뀜 `changed()`, 조합 끝 `compositionEnded()`, 편집기가 문서를 바꿈 `documentSwapped()`(세션이 일으킨
+것이 아니면 방을 나간다). 되돌리기를 붙이면 `setUndo({ onRemote, clear })`(start 전). 이탈 확인은 `hasUnconfirmedEdits()`.
+권한 문(`engine.setScope`)과 메모 작성자(`engine.setMemoAuthor`)는 세션이 입장 때 건다 — 편집기가 하지 않는다.
+
+### 9.2 세션이 알리는 것
+
+문구는 정하지 않고 이유 코드로 넘긴다. 기본 한국어 문구는 `session/texts.ts`(`noticeTexts`·`leaveText`·`leftBanner`·
+`resyncCauseText`·`PHASE_TEXT`)에 있고, 편집기는 그대로 쓰거나 덮어쓴다.
+
+| 사건 | 뜻 | 편집기가 할 일(studio 예) |
+|---|---|---|
+| `status` | 상태가 바뀜(`session.phase`·`lastSeq`·`name`) | 상태 표시 |
+| `cursors` | 다른 사람 커서가 바뀜(`session.cursors`, 엔진 좌표) | 커서 그리기 |
+| `notice` | 안내 하나(아래 코드) | 잠깐 보이는 안내 |
+| `disconnected` / `reconnected` | 방에 들어간 뒤 끊김 / 다시 붙음 | 배너 / 걷기 |
+| `admitted` | 확인된 사용자·권한(`welcome.user`) | 화면 일(양식 모드 등) |
+| `desynced` | 동기화가 깨져 멈춤(까닭 코드) | 새로고침 안내 |
+| `left` | 방에서 나옴(까닭 코드) | 빌린 자원을 풀고 안내 |
+
+- **안내(`notice.code`):** `joined`, `resynced`, `resume-fallback`, `reconnected{received}`, `long-disconnect`,
+  `dropped{count}`, `too-large`, `invalid`, `forbidden{reason}`, `denied{message}`(엔진 권한 문), `view-only`,
+  `encrypted-source`, `roundtrip{result}`.
+- **재동기화 까닭(`ResyncCause`):** `seq-gap{expected, got, during}`, `apply-failed{error, during}`, `diverged{seq}`,
+  `invalid{reason}`, `forbidden{reason}`, `too-large{limit, side}`, `error{error}`, `limit{limit, last}`(1분 3회를 넘음 —
+  `desynced` 에서만).
+- **나온 까닭(`LeaveReason`):** `swapped`, `incompatible`, `encrypted`, `base-too-large`, `base-invalid{reason}`,
+  `base-forbidden`, `font-policy`, `unauthorized{reason, unsent}`, `host{detail}`(편집기가 `leave` 로 나가게 함).
+- **상태(`session.phase`):** `left` > `desynced` > `connecting` > `closed` > `resyncing` > `loading` > `sending` > `synced`
+  (앞의 것이 이긴다). `session.status()` 는 진단용 전체 상태다(studio 의 `__collab.status()`).
+
+```ts
+const session = new CollabSession({ room, name, transport, host, getToken });
+editor.onCall((method, args, invoke, target) => session.engine.intercept(method, args, invoke, target));
+editor.on('mutated', () => session.edited());
+editor.on('changed', () => session.changed());
+editor.on('composition-end', () => session.compositionEnded());
+editor.on('document-swapped', () => session.documentSwapped());
+session.start();
+// 내릴 때: session.dispose()
+```

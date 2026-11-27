@@ -313,7 +313,7 @@ test('DocInfo 위조가 실제로 rhwp 를 지난다: 다시 읽은 모델은 �
   b.free();
 });
 
-test('S1(C): DocInfo 에 끼운 모르는 레코드도 방송·다른 참여자·서버 저장본 어디에도 없다', { skip: NEEDS_REWRITE, todo: '구역 꼬리·DocInfo 모르는 레코드 처리(결정 (C))가 합쳐지면 todo 를 푼다' }, async () => {
+test('S1(C): DocInfo 에 끼운 모르는 레코드도 방송·다른 참여자·서버 저장본 어디에도 없다', { skip: NEEDS_REWRITE }, async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const E = await client(room, 'E');

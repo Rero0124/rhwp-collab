@@ -1159,3 +1159,152 @@ fn rewrite_state_uses_canonical_streams_and_drops_unreferenced_bin_data() {
     let names = |d: &crate::model::document::Document| d.extra_streams.iter().map(|(p, _)| p.clone()).filter(|p| p != crate::model::line_seg_tags::HWP_STREAM).collect::<Vec<_>>();
     assert_eq!(names(&out.document), names(&canon.document));
 }
+
+/// 결과 바이트를 다시 읽은 문서 모델
+fn reread(bytes: &[u8]) -> DocumentCore {
+    DocumentCore::from_bytes(&super::unpack_state(bytes).unwrap()).unwrap()
+}
+fn digest_of(bytes: &[u8]) -> String {
+    let mut c = CollabCore::new(blank());
+    c.load_state(bytes).unwrap();
+    c.digest()
+}
+fn doc_info_marker(doc: &DocumentCore) -> bool {
+    doc.document.doc_info.extra_records.iter().any(|r| r.data == MARKER)
+}
+fn tail_marker(doc: &DocumentCore) -> bool {
+    doc.document.sections.iter().filter_map(|s| s.trailing_lists.as_ref()).any(|t| t.records.iter().any(|r| r.data.windows(MARKER.len()).any(|w| w == MARKER)))
+}
+fn memo_texts(doc: &DocumentCore) -> Vec<String> {
+    let lists = crate::model::section_tail::collect(&doc.document.sections, &crate::storage::Unbounded).unwrap();
+    lists.iter().map(|(_, paras)| paras.iter().map(|p| p.text.clone()).collect::<Vec<_>>().join("\n")).collect()
+}
+const MEMO_SHAPE_JSON: &str = r##"{"width":15591,"lineType":0,"lineWidth":1,"lineColor":"#112233","fillColor":"#F0F0F0","activeColor":"#CCDDEE"}"##;
+
+#[test]
+fn rewrite_state_drops_unknown_doc_info_records_the_canonical_does_not_have() {
+    // 결정 (C): 파서가 해석하지 않아 모델이 날 바이트로 들고 있는 DocInfo 레코드(extra_records)에 끼운 것 — 모델에서 다시
+    // 써도 남으므로(전제) 정본에 같은 내용으로 없던 것을 버린다. 정본에 있던 것은 그대로.
+    let raw = text_doc();
+    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    client.document.doc_info.extra_records.push(crate::model::document::RawRecord { tag_id: 0x0fe, level: 0, data: MARKER.to_vec() });
+    client.document.doc_info.raw_stream = None;
+    let c = client.export_state().unwrap();
+    assert!(doc_info_marker(&reread(&c)), "끼운 레코드는 결과와, 다시 읽은 모델에 남는다(전제)");
+    let s = canon.rewrite_state(&c).unwrap();
+    let out = reread(&s);
+    assert!(!doc_info_marker(&out), "다시 쓴 결과에서는 사라진다");
+    let keys = |d: &DocumentCore| d.document.doc_info.extra_records.iter().map(|r| (r.tag_id, r.level, r.data.clone())).collect::<Vec<_>>();
+    assert_eq!(keys(&out), keys(&canon), "정본에 있던 모르는 레코드는 그대로");
+    // 버린 만큼 S 의 내용은 C 와 다르다(모두가 S 를 읽으므로 계보는 맞다) — 끼운 것 말고는 바꾼 것이 없으니 정본과 같다
+    assert_ne!(digest_of(&s), digest_of(&c));
+    assert_eq!(digest_of(&s), canon.digest());
+}
+
+#[test]
+fn rewrite_state_keeps_memo_shapes_an_earlier_op_made() {
+    // 정상 기능 중 DocInfo 모르는 레코드에 새 내용을 만드는 유일한 것: 메모 모양(연산). 정본이 state 보다 먼저 적용하므로
+    // 같은 내용이 있어 남는다.
+    let raw = text_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    canon.set_memo_shape_json(Some(0), MEMO_SHAPE_JSON).unwrap();
+    client.set_memo_shape_json(Some(0), MEMO_SHAPE_JSON).unwrap();
+    client.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let c = client.export_state().unwrap();
+    let s = canon.rewrite_state(&c).unwrap();
+    let out = reread(&s);
+    let shapes = crate::model::memo_shape::memo_shapes(&out.document.doc_info);
+    assert_eq!(shapes, crate::model::memo_shape::memo_shapes(&canon.document.doc_info));
+    assert!(!shapes.is_empty());
+    assert_eq!(out.document.doc_info.memo_shape_count, canon.document.doc_info.memo_shape_count);
+    assert_eq!(digest_of(&s), digest_of(&c));
+}
+
+/// 메모가 있는 문서(마지막 구역 끝 목록에 메모 묶음이 날 레코드로 있다)
+fn memo_doc() -> Vec<u8> {
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    c.insert_memo_json_native(0, 0, 0, 2, r#"{"author":"가","text":"메모 본문"}"#).unwrap();
+    super::unpack_state(&c.export_state().unwrap()).unwrap().into_owned()
+}
+
+#[test]
+fn rewrite_state_rewrites_memo_lists_from_the_model_instead_of_dropping_memos() {
+    // 메모를 고치면 저장기가 메모 목록을 모델에서 써서, 다시 읽으면 끝 목록이 된다 — 정본(끝 목록 없음)에 같은 내용이 없어
+    // 버리지만 메모 봉인을 풀어 모델(메모 본문)에서 다시 쓴다: 메모를 잃지 않는다.
+    let raw = text_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    for c in [&mut canon, &mut client] {
+        c.insert_memo_json_native(0, 0, 0, 2, r#"{"author":"가","text":"메모 본문"}"#).unwrap();
+    }
+    let c = client.export_state().unwrap();
+    assert!(reread(&c).document.sections.iter().any(|s| s.trailing_lists.is_some()), "결과에는 끝 목록(메모 묶음)이 있다(전제)");
+    let s = canon.rewrite_state(&c).unwrap();
+    assert_eq!(memo_texts(&reread(&s)), vec!["메모 본문".to_string()]);
+    assert_eq!(digest_of(&s), digest_of(&c));
+}
+
+#[test]
+fn rewrite_state_drops_records_injected_into_the_section_tail() {
+    // 결정 (C): 구역 끝 목록에 끼운 것 — (가) 메모 묶음 안, (나) 따로 선 목록(바탕쪽이 아닌 0×0 LIST_HEADER — 끝 목록의
+    // 묶음은 늘 수준 1 LIST_HEADER·MEMO_LIST 로 시작한다). 둘 다 사라지고 메모는 그대로.
+    let raw = memo_doc();
+    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let inject = |front: bool| {
+        let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+        let last = client.document.sections.len() - 1;
+        let section = &mut client.document.sections[last];
+        let tail = section.trailing_lists.as_mut().expect("메모 끝 목록");
+        if front {
+            tail.records.push(crate::model::document::RawRecord { tag_id: crate::parser::tags::HWPTAG_LIST_HEADER, level: 1, data: vec![0; 34] });
+        }
+        tail.records.push(crate::model::document::RawRecord { tag_id: 0x3f0, level: 2, data: MARKER.to_vec() });
+        section.raw_stream = None;
+        client.export_state().unwrap()
+    };
+    for front in [false, true] {
+        let c = inject(front);
+        assert!(tail_marker(&reread(&c)), "끼운 레코드는 결과와, 다시 읽은 끝 목록에 남는다(전제, front={front})");
+        let s = canon.rewrite_state(&c).unwrap();
+        let out = reread(&s);
+        assert!(!tail_marker(&out), "다시 쓴 결과에서는 사라진다(front={front})");
+        assert_eq!(memo_texts(&out), vec!["메모 본문".to_string()], "메모는 그대로(front={front})");
+        assert_eq!(digest_of(&s), canon.digest(), "끼운 것 말고는 바꾼 것이 없으니 정본과 같다(front={front})");
+    }
+    // 끼운 것이 없으면 끝 목록은 정본 것 그대로
+    let untouched = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut edited = untouched;
+    edited.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let s = canon.rewrite_state(&edited.export_state().unwrap()).unwrap();
+    let tails = |d: &DocumentCore| d.document.sections.iter().map(|s| s.trailing_lists.as_ref().map(|t| t.records.iter().map(|r| (r.tag_id, r.level, r.data.clone())).collect::<Vec<_>>())).collect::<Vec<_>>();
+    assert_eq!(tails(&reread(&s)), tails(&canon));
+}
+
+#[test]
+fn rewrite_state_rewrites_extension_master_pages_from_the_model() {
+    // 확장 바탕쪽 만들기(state): 저장기가 모델에서 확장 바탕쪽 목록을 끝 목록에 쓴다 — 정본에 같은 내용이 없어 버리지만
+    // 그 구역의 원본 바탕쪽 묶음을 모두 버려 모델이 다시 쓴다(바탕쪽을 잃지 않는다). 다시 쓴 뒤에는 그 목록이 정본과 같아
+    // 그대로 남는다.
+    let raw = text_doc();
+    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    client.create_master_page_native(0, r#"{"kind":"last"}"#).unwrap();
+    let c = client.export_state().unwrap();
+    assert!(reread(&c).document.sections[0].trailing_lists.is_some(), "결과에는 끝 목록(확장 바탕쪽)이 있다(전제)");
+    let s = canon.rewrite_state(&c).unwrap();
+    let out = reread(&s);
+    assert!(out.document.sections[0].section_def.master_pages.iter().any(|m| m.is_extension), "확장 바탕쪽이 남는다");
+    assert_eq!(digest_of(&s), digest_of(&c));
+    // 그 결과를 읽은 정본에서는 같은 끝 목록이 그대로 재사용된다
+    let raw2 = super::unpack_state(&s).unwrap().into_owned();
+    let canon2 = CollabCore::new(DocumentCore::from_bytes(&raw2).unwrap());
+    let mut client2 = CollabCore::new(DocumentCore::from_bytes(&raw2).unwrap());
+    client2.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let c2 = client2.export_state().unwrap();
+    let s2 = canon2.rewrite_state(&c2).unwrap();
+    let tail = |d: &DocumentCore| d.document.sections[0].trailing_lists.as_ref().map(|t| t.records.iter().map(|r| (r.tag_id, r.level, r.data.clone())).collect::<Vec<_>>());
+    assert_eq!(tail(&reread(&s2)), tail(&canon2));
+    assert_eq!(digest_of(&s2), digest_of(&c2));
+}

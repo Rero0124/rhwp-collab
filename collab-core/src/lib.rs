@@ -20,7 +20,7 @@
 //! 이 파일은 업스트림 rhwp 크레이트 안에 `#[path]` 로 포함된다 (`patches/rhwp/0001`). 크레이트 내부
 //! 모듈이라 `pub(crate)` 필드·메서드를 쓸 수 있다.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use serde_json::{json, Value};
@@ -91,6 +91,118 @@ pub fn pack_state(raw: &[u8]) -> Result<Vec<u8>, HwpError> {
     let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(raw.len() / 2 + 64), flate2::Compression::fast());
     enc.write_all(raw).map_err(|e| HwpError::RenderError(format!("결과 압축 실패: {e}")))?;
     enc.finish().map_err(|e| HwpError::RenderError(format!("결과 압축 실패: {e}")))
+}
+
+/// 원본 레코드 묶음의 내용 열쇠(태그·수준·길이·바이트) — 6단계 S1 의 "같은 내용" 비교.
+fn raw_records_key(records: &[crate::model::document::RawRecord]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(records.iter().map(|r| 8 + r.data.len()).sum());
+    for r in records {
+        key.extend_from_slice(&r.tag_id.to_le_bytes());
+        key.extend_from_slice(&r.level.to_le_bytes());
+        key.extend_from_slice(&(r.data.len() as u32).to_le_bytes());
+        key.extend_from_slice(&r.data);
+    }
+    key
+}
+
+/// 열쇠마다 남은 개수 — 같은 내용이 둘이면 둘까지만 받아들인다.
+fn take_known(known: &mut HashMap<Vec<u8>, usize>, key: &[u8]) -> bool {
+    match known.get_mut(key) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 6단계 S1 결정 (C): DocInfo 의 모르는 레코드(`extra_records` — 파서가 해석하지 않아 날 바이트로 들고 있는 레코드) 중
+/// 정본에 같은 내용으로 없는 것을 버린다. 정상 기능 중 여기에 새 내용을 만드는 것은 메모 모양(`setMemoShape`, 연산 —
+/// 정본이 state 보다 먼저 적용한다)뿐이고, 배포용 문서 풀기(`convertToEditable`)는 빼기만 한다. 메모 모양을 버렸으면
+/// ID_MAPPINGS 의 메모 모양 수를 남은 레코드 수로 맞춘다. 버린 것이 있으면 true.
+fn keep_known_doc_info_records(doc: &mut Document, canon: &Document) -> bool {
+    use crate::parser::tags::HWPTAG_MEMO_SHAPE;
+    let mut known: HashMap<Vec<u8>, usize> = HashMap::new();
+    for r in &canon.doc_info.extra_records {
+        *known.entry(raw_records_key(std::slice::from_ref(r))).or_default() += 1;
+    }
+    let memo_shapes = |records: &[crate::model::document::RawRecord]| records.iter().filter(|r| r.tag_id == HWPTAG_MEMO_SHAPE).count();
+    let (before, memo_before) = (doc.doc_info.extra_records.len(), memo_shapes(&doc.doc_info.extra_records));
+    doc.doc_info.extra_records.retain(|r| take_known(&mut known, &raw_records_key(std::slice::from_ref(r))));
+    if doc.doc_info.extra_records.len() == before {
+        return false;
+    }
+    let memo_after = memo_shapes(&doc.doc_info.extra_records);
+    if memo_after != memo_before {
+        doc.doc_info.memo_shape_count = memo_after as u32;
+    }
+    doc.doc_info.raw_stream = None;
+    doc.doc_info.raw_provenance = None;
+    true
+}
+
+/// 6단계 S1 결정 (C): 구역 끝 목록(`trailing_lists` — 마지막 문단 뒤의 메모 목록·확장 바탕쪽 목록·모르는 목록을 날
+/// 레코드로 들고 있다)의 묶음 중 정본 문서 어디에도 같은 내용으로 없는 것을 버린다(구역을 합치거나 나눠 자리가 옮겨도
+/// 받아들이게 문서 전체에서 찾는다).
+///
+/// 정상 기능이 여기에 새 내용을 만드는 길은 저장기뿐이다 — 메모를 고치면 메모 목록을, 원본 바탕쪽 목록이 없는 구역은
+/// 확장 바탕쪽 목록을 모델에서 써서, 그 바이트를 다시 읽으면 끝 목록이 된다. 그래서 버려도 모델에서 다시 쓰게 한다:
+/// - 메모 묶음을 버리면 그 끝 목록의 메모 봉인을 푼다 → 저장기가 원본 메모 묶음을 쓰지 않고 모델(메모 본문)에서 다시 쓴다.
+/// - 바탕쪽 묶음을 하나라도 버리면 그 구역의 원본 바탕쪽 묶음을 **모두** 버린다 → 모델이 확장 바탕쪽을 모두 쓴다
+///   (일부만 남기면 저장기가 남은 원본만 쓰고 모델의 나머지를 잃는다). 업스트림 바탕쪽 편집과 같은 방식으로, 봉인이
+///   맞았으면 버린 뒤의 투영으로 다시 봉인한다.
+/// - 그 밖의 모르는 목록은 그냥 버린다(모델에 없다).
+///
+/// 버린 것이 있으면 true.
+fn keep_known_section_tails(doc: &mut Document, canon: &Document) -> bool {
+    let mut known: HashMap<Vec<u8>, usize> = HashMap::new();
+    for tail in canon.sections.iter().filter_map(|s| s.trailing_lists.as_ref()) {
+        for (_, group) in tail.record_groups() {
+            *known.entry(raw_records_key(group)).or_default() += 1;
+        }
+    }
+    let sealed = crate::model::section_tail::validate_preservation(doc).is_ok();
+    let mut changed = false;
+    for section in &mut doc.sections {
+        let Some(tail) = section.trailing_lists.as_mut() else { continue };
+        let masters = tail.master_list_mask();
+        let mut keep = Vec::with_capacity(tail.records.len());
+        let (mut memo_dropped, mut master_dropped) = (false, false);
+        for (memo, group) in tail.record_groups() {
+            let ok = take_known(&mut known, &raw_records_key(group));
+            if !ok {
+                if memo {
+                    memo_dropped = true;
+                } else if masters[keep.len()] {
+                    master_dropped = true;
+                }
+            }
+            keep.extend(std::iter::repeat_n(ok, group.len()));
+        }
+        if master_dropped {
+            for (k, master) in keep.iter_mut().zip(&masters) {
+                *k &= !master;
+            }
+        }
+        if keep.iter().all(|k| *k) {
+            continue;
+        }
+        changed = true;
+        let mut flags = keep.into_iter();
+        tail.records.retain(|_| flags.next().unwrap_or(false));
+        if memo_dropped {
+            tail.memo_seal = None;
+        }
+        if tail.records.is_empty() {
+            section.trailing_lists = None;
+        }
+        section.raw_stream = None;
+        section.raw_provenance = None;
+    }
+    if changed && sealed {
+        doc.seal_section_tail_provenance();
+    }
+    changed
 }
 
 /// gzip 이면 풀고, 아니면(HWP·HWPX 원본) 그대로 돌려준다.
@@ -770,6 +882,11 @@ impl CollabCore {
     /// - 부속 스트림(`extra_streams`·HWPX 부속 항목)·미리보기·파일 머리·출처 표지는 정본의 지금 것을 쓴다. 저장기가 모델에서
     ///   다시 만드는 것(`/RhwpLineSegTags`, 테두리 칠 표지)은 저장할 때 새로 생긴다. 편집 기능 중 문서 객체의 부속 스트림을
     ///   바꾸는 것은 없다(내보낼 때 사본에 붙이는 계보 표지뿐).
+    /// - 모델 안에 날 바이트로 보존되는 자리 중 두 곳(결정 (C))은 **정본 문서에 같은 내용으로 없던 것을 버린다** —
+    ///   DocInfo 의 모르는 레코드(`extra_records`, [`keep_known_doc_info_records`])와 구역 끝 목록(`trailing_lists`,
+    ///   [`keep_known_section_tails`]). 정상 기능이 여기에 새 내용을 만드는 길은 메모 모양(연산 — 정본이 먼저 적용해 같은
+    ///   내용이 있다)과 저장기가 모델에서 만드는 메모 목록·확장 바탕쪽 목록뿐이고, 뒤의 둘은 버려도 모델에서 다시 쓴다.
+    ///   그 밖의 날 바이트 자리(개체 `ctrl_data_records`, 스타일 `raw_data` 등)는 그대로 남는다(규약 문서의 알려진 한계).
     /// - BinData: 모델이 참조하는 것만 남긴다(업스트림 `prune_unreferenced_bin_data` — 참조 번호를 함께 옮긴다).
     /// - 형식: 정본의 형식 계열로 쓴다.
     pub fn rewrite_state(&self, state: &[u8]) -> Result<Vec<u8>, HwpError> {
@@ -797,6 +914,8 @@ impl CollabCore {
             doc.is_hwp3_variant = canon.is_hwp3_variant;
             doc.is_hwpx_variant = canon.is_hwpx_variant;
             doc.provenance = canon.provenance.clone();
+            keep_known_doc_info_records(doc, canon);
+            keep_known_section_tails(doc, canon);
             crate::document_core::prune_unreferenced_bin_data(doc);
         }
         tmp.source_format = self.inner.source_format;

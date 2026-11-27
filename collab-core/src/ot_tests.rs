@@ -528,3 +528,140 @@ fn delete_range_in_one_paragraph_may_delete_objects() {
     let out = rb13(&[range(0, 2, 0, 6)], &[ins(0, 0, "ab")]);
     assert_eq!(names_args(&out), one("deleteRange", json!([0, 0, 4, 0, 8])), "옮겨도 deleteRange 로 잇는다");
 }
+
+// ── 4단계 U1: 되돌리기 스택의 위치 옮기기·발자국 ─────────────────────────────────
+
+fn cat4() -> Value {
+    let mut c = cat();
+    c["insertTextInCell"] = json!({ "conc": "text", "section": 0 });
+    c["applyCharFormatInCell"] = json!({ "conc": "neutral", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] });
+    c["insertTextInCellByPath"] = json!({ "conc": "text", "section": 0 });
+    c
+}
+fn body(p: usize, o: usize) -> Value {
+    json!({ "section": 0, "para": p, "offset": o })
+}
+fn cellpos(pp: usize, ci: usize, cell: usize, cp: usize, o: usize) -> Value {
+    json!({ "section": 0, "para": pp, "offset": o, "cell": { "control": ci, "cell": cell, "cellPara": cp } })
+}
+fn cell_ins(pp: usize, ci: usize, cell: usize, cp: usize, o: usize, t: &str) -> Value {
+    json!({ "kind": "op", "m": "insertTextInCell", "a": [0, pp, ci, cell, cp, o, t], "meta": { "len": t.chars().count() } })
+}
+/// (문단, 글자, hit) — 셀이면 문단은 칸 문단.
+fn mp(recs: &[Value], item: Value) -> (usize, usize, Option<String>) {
+    let out = map_positions(recs, &cat4(), &[item]);
+    let v = &out[0];
+    let para = if v["cell"].is_null() { v["para"].as_u64().unwrap() } else { v["cell"]["cellPara"].as_u64().unwrap() } as usize;
+    (para, v["offset"].as_u64().unwrap() as usize, v["hit"].as_str().map(String::from))
+}
+
+#[test]
+fn undo_positions_move_with_edits_elsewhere_and_flag_same_paragraph() {
+    // 다른 문단 입력: 그대로, 막힘 없음
+    assert_eq!(mp(&[ins(1, 0, "abc")], body(3, 2)), (3, 2, None));
+    // 앞 문단 Enter: 문단 번호만 밀림(3.1 — 막지 않음)
+    assert_eq!(mp(&[split(1, 2)], body(3, 2)), (4, 2, None));
+    // 앞 문단 합침: 당겨짐
+    assert_eq!(mp(&[merge(2, 5)], body(3, 2)), (2, 2, None));
+    // 같은 문단 입력(앞이든 뒤든) → touched (3.2-1, 글자도 막는다)
+    assert_eq!(mp(&[ins(3, 9, "x")], body(3, 2)).2.as_deref(), Some("touched"));
+    assert_eq!(mp(&[ins(3, 0, "x")], body(3, 2)), (3, 3, Some("touched".into())));
+    // 같은 문단을 나눔 → touched
+    assert_eq!(mp(&[split(3, 5)], body(3, 2)).2.as_deref(), Some("touched"));
+    // 문단을 통째로 지움 → gone
+    assert_eq!(mp(&[range(2, 0, 4, 0)], body(3, 2)).2.as_deref(), Some("gone"));
+    // 같은 문단 서식(neutral) → touched, 다른 문단 서식 → 없음
+    assert_eq!(mp(&[op("applyCharFormat", json!([0, 3, 0, 1, "{}"]))], body(3, 2)).2.as_deref(), Some("touched"));
+    assert_eq!(mp(&[op("applyCharFormat", json!([0, 4, 0, 1, "{}"]))], body(3, 2)).2, None);
+    // 같은 구역 구조 편집 → structural (3.2-2), 다른 구역 → 없음
+    assert_eq!(mp(&[op("createTable", json!([0, 7, 0, 2, 2]))], body(3, 2)).2.as_deref(), Some("structural"));
+    assert_eq!(mp(&[op("createTable", json!([1, 7, 0, 2, 2]))], body(3, 2)).2, None);
+    // state → whole
+    assert_eq!(mp(&[state()], body(3, 2)).2.as_deref(), Some("whole"));
+    // 다른 구역 글자 → 없음
+    assert_eq!(mp(&[ins_sec(1, 3, 0, "x")], body(3, 2)), (3, 2, None));
+    // 첫 사유만 남는다
+    assert_eq!(mp(&[ins(3, 0, "x"), state()], body(3, 2)).2.as_deref(), Some("touched"));
+}
+
+#[test]
+fn undo_positions_bias_follows_content_at_split_point() {
+    // 기본(after): 나눔 지점에 있던 위치는 뒤 문단으로 따라간다 — 내 Enter 를 되돌리면(merge) 원래 자리
+    let after = map_positions(&[split(3, 4)], &cat4(), &[body(3, 4)]);
+    assert_eq!((after[0]["para"].as_u64(), after[0]["offset"].as_u64()), (Some(4), Some(0)));
+    let back = map_positions(&[merge(4, 4)], &cat4(), &[after[0].clone()]);
+    assert_eq!((back[0]["para"].as_u64(), back[0]["offset"].as_u64()), (Some(3), Some(4)));
+    // before: 범위 끝처럼 앞에 남는다
+    let mut b = body(3, 4);
+    b["bias"] = json!("before");
+    let out = map_positions(&[split(3, 4)], &cat4(), &[b]);
+    assert_eq!((out[0]["para"].as_u64(), out[0]["offset"].as_u64()), (Some(3), Some(4)));
+}
+
+#[test]
+fn undo_positions_in_cells() {
+    // 같은 칸 같은 칸 문단 입력 → touched, 같은 칸 다른 칸 문단 → 없음, 다른 칸 → 없음
+    assert_eq!(mp(&[cell_ins(2, 0, 1, 0, 0, "x")], cellpos(2, 0, 1, 0, 3)), (0, 4, Some("touched".into())));
+    assert_eq!(mp(&[cell_ins(2, 0, 1, 1, 0, "x")], cellpos(2, 0, 1, 0, 3)), (0, 3, None));
+    assert_eq!(mp(&[cell_ins(2, 0, 2, 0, 0, "x")], cellpos(2, 0, 1, 0, 3)), (0, 3, None));
+    // 본문에서 표 앞 문단 Enter → 표를 품은 문단 번호만 밀림
+    let out = map_positions(&[split(0, 0)], &cat4(), &[cellpos(2, 0, 1, 0, 3)]);
+    assert_eq!((out[0]["para"].as_u64(), out[0]["hit"].clone()), (Some(3), Value::Null));
+    // 표를 품은 문단 안 글자 입력은 칸과 무관
+    assert_eq!(mp(&[ins(2, 0, "x")], cellpos(2, 0, 1, 0, 3)).2, None);
+    // 같은 칸 문단 서식 → touched, 다른 칸 서식 → 없음
+    assert_eq!(mp(&[op("applyCharFormatInCell", json!([0, 2, 0, 1, 0, 0, 1, "{}"]))], cellpos(2, 0, 1, 0, 3)).2.as_deref(), Some("touched"));
+    assert_eq!(mp(&[op("applyCharFormatInCell", json!([0, 2, 0, 2, 0, 0, 1, "{}"]))], cellpos(2, 0, 1, 0, 3)).2, None);
+    // 셀 위치의 칸 문단 안 중첩 표 편집 → touched
+    let nested = json!({ "kind": "op", "m": "insertTextInCellByPath", "a": [0, 2, "[{\"controlIndex\":0,\"cellIndex\":1,\"cellParaIndex\":0},{\"controlIndex\":0,\"cellIndex\":0,\"cellParaIndex\":0}]", 0, "x"], "meta": { "len": 1 } });
+    assert_eq!(mp(&[nested], cellpos(2, 0, 1, 0, 3)).2.as_deref(), Some("touched"));
+}
+
+fn fp(entries: &[Value]) -> (Vec<(usize, Option<usize>)>, bool, bool) {
+    let out = footprint(entries, &cat4());
+    let items = out["items"].as_array().unwrap().iter().map(|v| (v["para"].as_u64().unwrap() as usize, v["cell"]["cellPara"].as_u64().map(|x| x as usize))).collect();
+    (items, out["whole"].as_bool().unwrap(), out["nested"].as_bool().unwrap())
+}
+
+#[test]
+fn footprint_of_a_command_is_the_paragraphs_it_left_changed() {
+    assert_eq!(fp(&[ins(3, 0, "ab"), ins(3, 2, "c")]), (vec![(3, None)], false, false));
+    // Enter: 앞뒤 두 문단
+    assert_eq!(fp(&[split(3, 2)]), (vec![(3, None), (4, None)], false, false));
+    // 입력 뒤 앞 문단에서 Enter(같은 명령 안): 입력 문단이 밀린 번호로
+    assert_eq!(fp(&[ins(3, 0, "ab"), split(1, 0)]), (vec![(4, None), (1, None), (2, None)], false, false));
+    // 여러 문단 지움: 남은 한 문단
+    assert_eq!(fp(&[range(2, 1, 4, 0)]), (vec![(2, None)], false, false));
+    // Backspace 로 합침: 앞 문단
+    assert_eq!(fp(&[merge(4, 3)]), (vec![(3, None)], false, false));
+    // 서식
+    assert_eq!(fp(&[op("applyCharFormat", json!([0, 5, 0, 2, "{}"]))]), (vec![(5, None)], false, false));
+    assert_eq!(fp(&[op("applyParaFormat", json!([0, 5, "{}"])), op("applyParaFormat", json!([0, 6, "{}"]))]), (vec![(5, None), (6, None)], false, false));
+    // 셀
+    assert_eq!(fp(&[cell_ins(2, 0, 1, 1, 0, "x")]), (vec![(2, Some(1))], false, false));
+    assert_eq!(fp(&[op("applyCharFormatInCell", json!([0, 2, 0, 1, 0, 0, 1, "{}"]))]), (vec![(2, Some(0))], false, false));
+    // 결과 전송·구조(발자국 없음)·역할 없는 neutral → whole
+    assert!(fp(&[state()]).1);
+    assert!(fp(&[op("createTable", json!([0, 7, 0, 2, 2]))]).1);
+    assert!(fp(&[op("updateStyle", json!([1, "{}"]))]).1);
+    // 중첩 셀
+    let nested = json!({ "kind": "op", "m": "insertTextInCellByPath", "a": [0, 2, "[{\"controlIndex\":0,\"cellIndex\":1,\"cellParaIndex\":0},{\"controlIndex\":0,\"cellIndex\":0,\"cellParaIndex\":0}]", 0, "x"], "meta": { "len": 1 } });
+    assert!(fp(&[nested]).2);
+}
+
+#[test]
+fn rebase_reports_origin_and_remote_after_pending() {
+    // 미확정 2개(문단 1, 문단 3), 원격은 문단 0 에서 Enter
+    let out = rebase(&[ins(1, 0, "a"), ins(3, 0, "b")], &[split(0, 0)], &cat4(), &Value::Null);
+    assert_eq!(out["origin"], json!([0, 1]));
+    // 원격을 미확정 뒤로 옮긴 열(이 경우 미확정이 원격 앞 문단을 바꾸지 않으므로 같은 자리)
+    assert_eq!(out["remoteAfter"].as_array().unwrap().len(), 1);
+    assert_eq!(out["remoteAfter"][0]["a"], json!([0, 0, 0]));
+    // 미확정이 원격 위치를 민다: 내 입력이 같은 문단 앞이면 원격 Enter 자리가 뒤로
+    let out = rebase(&[ins(0, 0, "xy")], &[split(0, 1)], &cat4(), &Value::Null);
+    assert_eq!(out["remoteAfter"][0]["a"], json!([0, 0, 3]));
+    // 버린 미확정은 origin 에 없다(구역 1 의 구조 편집끼리 충돌, 구역 0 의 입력은 남음)
+    let out = rebase(&[ins(1, 0, "a"), op("createTable", json!([1, 2, 0, 1, 1]))], &[op("createTable", json!([1, 5, 0, 1, 1]))], &cat4(), &Value::Null);
+    assert_eq!(out["origin"], json!([0]));
+    assert_eq!(out["dropped"], json!([1]));
+}

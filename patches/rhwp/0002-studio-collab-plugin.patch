@@ -131,11 +131,324 @@ index 1e2a6986..4caa8146 100644
    /** 줌/스크롤 변경 시 위치를 갱신한다 */
    updatePosition(zoom: number): void {
      if (!this.currentRect) return;
+diff --git a/rhwp-studio/src/engine/collab-undo.ts b/rhwp-studio/src/engine/collab-undo.ts
+new file mode 100644
+index 00000000..7b572d71
+--- /dev/null
++++ b/rhwp-studio/src/engine/collab-undo.ts
+@@ -0,0 +1,299 @@
++/**
++ * cc-rhwp(4단계 U1): 공동편집 중 되돌리기 — 명령이 기억한 위치의 표 (docs/collab-stage4.md §5).
++ *
++ * 공동편집 플러그인은 남의 편집이 들어올 때마다 되돌리기 스택의 위치를 옮기고, 겹치면 그 단계를 막는다.
++ * 명령은 위치를 저마다 다른 필드에 들고 있으므로(공통 타입이 없다), 여기 표가 명령 종류마다 "어느 필드가
++ * 어떤 위치인가"를 알려 준다. 표에 없는 종류(스냅샷 명령, 머리말·꼬리말·각주, 개체, 구역, 양식, 그리고
++ * 업스트림이 나중에 더한 명령)는 `null` — 플러그인이 "뒤에 남의 편집이 하나라도 있으면 막음"(3.2-3)으로 다룬다.
++ *
++ * 이 파일은 명령 클래스를 import 하지 않는다(필드 이름으로 읽고 쓴다). 업스트림이 필드 이름을 바꾸면
++ * `tests/plugin-collab-undo.test.ts` 의 대조 시험이 깨진다.
++ */
++
++/** 위치 하나(텍스트 좌표). 셀이면 한 단계 표의 (개체, 칸, 칸 문단) — `para` 는 표를 품은 본문 문단. */
++export interface CollabUndoPosition {
++  section: number;
++  para: number;
++  offset: number;
++  cell?: { control: number; cell: number; cellPara: number } | null;
++  /** 나눔 지점에서 뒤 문단으로 따라가는가(기본 after). 범위 끝은 before. */
++  bias?: 'before' | 'after';
++}
++
++/** 명령 안의 위치 한 자리. */
++export interface CollabUndoSlot {
++  /** 같은 위치 객체를 여러 자리가 가리킬 수 있다 — 플러그인이 (key, field)로 한 번만 옮긴다. */
++  readonly key: object;
++  readonly field: string;
++  /** 지금 위치. 옮길 수 없는 모양(중첩 셀·글상자·캡션)이면 `null` — 그 명령은 3.2-3. */
++  get(): CollabUndoPosition | null;
++  set(p: CollabUndoPosition): void;
++  /** 캐럿·선택 복원용 — 옮기기만 하고 막힘 판정에는 쓰지 않는다. */
++  readonly caret?: boolean;
++}
++
++/** 되돌리기가 기대는 WASM 저장소. `fragment` 는 절대 문단 번호로 복원하는 삭제 조각, `snapshot` 은 문서 전체. */
++export type CollabUndoStore = 'none' | 'fragment' | 'snapshot';
++
++export interface CollabUndoDescriptor {
++  slots: CollabUndoSlot[];
++  store: CollabUndoStore;
++  /** `store === 'fragment'`: 조각이 기억한 문단 자리. 이것이 옮겨지면(앞쪽 문단 수 변화) 되돌릴 수 없다. */
++  fragmentAnchor?: CollabUndoSlot;
++}
++
++/** 히스토리가 공동편집 플러그인에 알리는 훅. */
++export interface CollabHistoryHook {
++  /** 명령이 스택에 들어갔다(병합이면 `replaced` 가 이전 top). 직전 경계 뒤의 로컬 기록이 이 명령 것이다. */
++  recorded(command: object, replaced: object | null): void;
++  /** 명령을 남기지 않은 경계(no-op·실패·기록 중지) — 그 사이 로컬 기록은 어느 명령 것도 아니다. */
++  settled(): void;
++  /** 되돌리기/다시 하기 전 막힘 판정. 막히면 알림 문구. */
++  blocked(command: object, dir: 'undo' | 'redo'): string | null;
++  /** 막혀서 스택에서 버렸다(호스트가 알림을 띄운다). */
++  rejected(command: object, dir: 'undo' | 'redo', reason: string): void;
++  undone(command: object): void;
++  redone(command: object): void;
++}
++
++/** 플러그인이 쓰는 히스토리 조작. */
++export interface CollabHistoryController {
++  /** 양 스택(아래→위). 읽기 전용 사본. */
++  stacks(): { undo: readonly object[]; redo: readonly object[] };
++  /** 명령들을 스택에서 빼고 자원을 해제한다(버려진 편집, 3.3). */
++  remove(commands: ReadonlySet<object>): void;
++  /** 양 스택을 비운다(재동기화·문서 교체, 3.4). */
++  clear(): void;
++  describe(command: object): CollabUndoDescriptor | null;
++}
++
++/**
++ * 명령 클래스 → 이 표의 다룸. `table` 은 위치를 옮기고 3.2-1·2·4 로 판정, `strict` 는 3.2-3.
++ * `tests/plugin-collab-undo.test.ts` 가 `command.ts` 의 명령 클래스 목록과 대조한다(새 클래스가 생기면 실패).
++ */
++export const COLLAB_UNDO_CLASSES: Readonly<Record<string, 'table' | 'strict'>> = {
++  InsertTextCommand: 'table',
++  DeleteTextCommand: 'table',
++  InsertLineBreakCommand: 'table',
++  InsertTabCommand: 'table',
++  SplitParagraphCommand: 'table',
++  MergeParagraphCommand: 'table',
++  FragmentDeleteCommand: 'table',
++  DeleteSelectionCommand: 'table',
++  ApplyCharFormatCommand: 'table',
++  ApplyParaFormatCommand: 'table',
++  MergeNextParagraphCommand: 'table',
++  SplitParagraphInCellCommand: 'table',
++  MergeParagraphInCellCommand: 'table',
++  MergeNextParagraphInCellCommand: 'table',
++  // U2 후보(머리말·꼬리말·각주, 개체, 구역, 양식) — 지금은 3.2-3
++  InsertTextInHeaderFooterCommand: 'strict',
++  InsertFieldInHeaderFooterCommand: 'strict',
++  DeleteTextInHeaderFooterCommand: 'strict',
++  SplitParagraphInHeaderFooterCommand: 'strict',
++  MergeParagraphInHeaderFooterCommand: 'strict',
++  InsertTextInFootnoteCommand: 'strict',
++  DeleteTextInFootnoteCommand: 'strict',
++  SplitParagraphInFootnoteCommand: 'strict',
++  MergeParagraphInFootnoteCommand: 'strict',
++  MoveTableCommand: 'strict',
++  MovePictureCommand: 'strict',
++  MoveShapeCommand: 'strict',
++  ResizeObjectCommand: 'strict',
++  MoveLineEndpointCommand: 'strict',
++  SetObjectPropsCommand: 'strict',
++  SetSectionPropsCommand: 'strict',
++  SetCellBorderFillCommand: 'strict',
++  SetZOrderCommand: 'strict',
++  SetSectionPropsAllCommand: 'strict',
++  SetFormValueCommand: 'strict',
++  // 문서 전체 스냅샷으로 되돌린다 — 그사이 남의 편집까지 지우므로 언제나 3.2-3
++  SnapshotCommand: 'strict',
++  SubmodeSnapshotCommand: 'strict',
++  SubmodeSelectionSnapshotCommand: 'strict',
++};
++
++type Rec = Record<string, unknown>;
++type CellEntry = { controlIndex: number; cellIndex: number; cellParaIndex: number };
++
++const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
++/** 캡션·글상자 가상 칸 번호(셀 경로로 쓰지만 표 칸이 아니다) */
++const VIRTUAL_CELL = 65534;
++
++/** `DocumentPosition` 하나(필드 `field` 에 든 객체)의 자리. 없으면 `null`(자리를 만들지 않는다). */
++function docPos(owner: Rec, field: string, opts: { caret?: boolean; bias?: 'before' | 'after' } = {}): CollabUndoSlot | null {
++  const pos = owner[field] as Rec | undefined;
++  if (!pos || typeof pos !== 'object') return null;
++  return {
++    key: pos,
++    field: '',
++    caret: opts.caret,
++    get() {
++      if (!isNum(pos.sectionIndex) || !isNum(pos.charOffset)) return null;
++      const bias = opts.bias;
++      if (pos.parentParaIndex === undefined) {
++        if (!isNum(pos.paragraphIndex) || pos.isTextBox) return null;
++        return { section: pos.sectionIndex, para: pos.paragraphIndex, offset: pos.charOffset, bias };
++      }
++      const path = pos.cellPath as CellEntry[] | undefined;
++      if (path && path.length > 1) return null; // 중첩 셀: U1 밖
++      const step: CellEntry = path?.length ? path[0] : {
++        controlIndex: pos.controlIndex as number, cellIndex: pos.cellIndex as number, cellParaIndex: pos.cellParaIndex as number,
++      };
++      if (pos.isTextBox || !isNum(pos.parentParaIndex) || !isNum(step.controlIndex) || !isNum(step.cellIndex) || !isNum(step.cellParaIndex)
++        || step.cellIndex === VIRTUAL_CELL) return null;
++      return {
++        section: pos.sectionIndex, para: pos.parentParaIndex, offset: pos.charOffset, bias,
++        cell: { control: step.controlIndex, cell: step.cellIndex, cellPara: step.cellParaIndex },
++      };
++    },
++    set(p) {
++      pos.charOffset = p.offset;
++      if (!p.cell) {
++        pos.paragraphIndex = p.para;
++        return;
++      }
++      pos.parentParaIndex = p.para;
++      // 셀 위치의 paragraphIndex 는 칸 문단 번호다(command.ts cellParagraphPosition)
++      if (pos.paragraphIndex === pos.cellParaIndex || pos.paragraphIndex === undefined) pos.paragraphIndex = p.cell.cellPara;
++      if (pos.cellParaIndex !== undefined) pos.cellParaIndex = p.cell.cellPara;
++      const path = pos.cellPath as CellEntry[] | undefined;
++      if (path?.length === 1) pos.cellPath = [{ ...path[0], cellParaIndex: p.cell.cellPara }];
++    },
++  };
++}
++
++/** (구역, 문단) 숫자 두 필드. `span` 이 있으면 그 필드도 같은 만큼 민다(조각의 끝 문단). */
++function secPara(owner: Rec, secField: string, paraField: string, span?: string): CollabUndoSlot | null {
++  if (!isNum(owner[secField]) || !isNum(owner[paraField])) return null;
++  return {
++    key: owner,
++    field: paraField,
++    get: () => (isNum(owner[secField]) && isNum(owner[paraField]) ? { section: owner[secField] as number, para: owner[paraField] as number, offset: 0 } : null),
++    set(p) {
++      if (span && isNum(owner[span])) owner[span] = (owner[span] as number) + (p.para - (owner[paraField] as number));
++      owner[paraField] = p.para;
++    },
++  };
++}
++
++/** ApplyCharFormat 의 문단별 기록(`paraIndex` 또는 셀이면 `cellPathJson` 의 칸 문단). */
++function charFormatEntries(cmd: Rec): CollabUndoSlot[] {
++  const start = cmd.start as Rec | undefined;
++  const entries = (cmd.entries as Rec[] | undefined) ?? [];
++  if (!start) return [];
++  return entries.map((entry) => ({
++    key: entry,
++    field: 'para',
++    get() {
++      if (!isNum(start.sectionIndex)) return null;
++      if (typeof entry.cellPathJson !== 'string') {
++        return isNum(entry.paraIndex) ? { section: start.sectionIndex, para: entry.paraIndex, offset: 0 } : null;
++      }
++      let path: CellEntry[];
++      try { path = JSON.parse(entry.cellPathJson); } catch { return null; }
++      if (path.length !== 1 || !isNum(start.parentParaIndex) || path[0].cellIndex === VIRTUAL_CELL) return null;
++      // 표를 품은 문단은 start 가 들고 있다(같은 지도로 따로 옮겨진다) — 여기선 칸 문단만
++      return { section: start.sectionIndex, para: start.parentParaIndex, offset: 0, cell: { control: path[0].controlIndex, cell: path[0].cellIndex, cellPara: path[0].cellParaIndex } };
++    },
++    set(p) {
++      if (typeof entry.cellPathJson !== 'string') {
++        entry.paraIndex = p.para;
++        return;
++      }
++      const path = JSON.parse(entry.cellPathJson) as CellEntry[];
++      path[0] = { ...path[0], cellParaIndex: p.cell?.cellPara ?? path[0].cellParaIndex };
++      entry.cellPathJson = JSON.stringify(path);
++      if (isNum(entry.paraIndex)) entry.paraIndex = p.cell?.cellPara ?? entry.paraIndex;
++    },
++  }));
++}
++
++/** ApplyParaFormat 의 대상(본문 문단 / 셀 문단 / 셀 경로). 같은 대상 객체를 history 기록도 가리킨다. */
++function paraTargets(cmd: Rec): CollabUndoSlot[] {
++  const targets = (cmd.targets as Rec[] | undefined) ?? [];
++  return targets.map((t) => ({
++    key: t,
++    field: 'target',
++    get() {
++      if (!isNum(t.sec)) return null;
++      if (t.kind === 'body') return isNum(t.para) ? { section: t.sec, para: t.para, offset: 0 } : null;
++      if (!isNum(t.parentPara)) return null;
++      if (t.kind === 'cell') {
++        return isNum(t.controlIdx) && isNum(t.cellIdx) && isNum(t.cellParaIdx) && t.cellIdx !== VIRTUAL_CELL
++          ? { section: t.sec, para: t.parentPara, offset: 0, cell: { control: t.controlIdx, cell: t.cellIdx, cellPara: t.cellParaIdx } }
++          : null;
++      }
++      const path = t.path as CellEntry[] | undefined;
++      if (!path || path.length !== 1 || path[0].cellIndex === VIRTUAL_CELL) return null;
++      return { section: t.sec, para: t.parentPara, offset: 0, cell: { control: path[0].controlIndex, cell: path[0].cellIndex, cellPara: path[0].cellParaIndex } };
++    },
++    set(p) {
++      if (t.kind === 'body') {
++        t.para = p.para;
++        return;
++      }
++      t.parentPara = p.para;
++      if (t.kind === 'cell') t.cellParaIdx = p.cell?.cellPara ?? t.cellParaIdx;
++      else {
++        const path = t.path as CellEntry[];
++        t.path = [{ ...path[0], cellParaIndex: p.cell?.cellPara ?? path[0].cellParaIndex }];
++      }
++    },
++  }));
++}
++
++const compact = (slots: Array<CollabUndoSlot | null>): CollabUndoSlot[] => slots.filter((s): s is CollabUndoSlot => s !== null);
++
++/** 위치 하나만 들고 있는 글자·문단 명령 */
++const POSITION_ONLY = new Set([
++  'insertLineBreak', 'insertTab', 'splitParagraph', 'mergeParagraph', 'mergeNextParagraph',
++  'splitParagraphInCell', 'mergeParagraphInCell', 'mergeNextParagraphInCell',
++]);
++
++/** 명령의 위치 자리와 저장소 의존. 표에 없으면 `null`(3.2-3). */
++export function describeCollabUndo(command: object): CollabUndoDescriptor | null {
++  const cmd = command as Rec;
++  const type = cmd.type;
++  if (typeof type !== 'string') return null;
++  if (POSITION_ONLY.has(type)) return { slots: compact([docPos(cmd, 'position')]), store: 'none' };
++  switch (type) {
++    case 'insertText': {
++      const position = docPos(cmd, 'position');
++      const fragment = Array.isArray(cmd.fragmentIds) && cmd.fragmentIds.length > 0;
++      return { slots: compact([position]), store: fragment ? 'fragment' : 'none', fragmentAnchor: fragment ? position ?? undefined : undefined };
++    }
++    case 'deleteText': {
++      const position = docPos(cmd, 'position');
++      const fragment = cmd.fragmentId !== null && cmd.fragmentId !== undefined;
++      return { slots: compact([position]), store: fragment ? 'fragment' : 'none', fragmentAnchor: fragment ? position ?? undefined : undefined };
++    }
++    case 'applyCharFormat':
++      return { slots: compact([docPos(cmd, 'start'), docPos(cmd, 'end', { bias: 'before' }), ...charFormatEntries(cmd)]), store: 'none' };
++    case 'applyParaFormat':
++      return { slots: compact([...paraTargets(cmd), docPos(cmd, 'cursorBefore', { caret: true })]), store: 'none' };
++    case 'deleteSelection': {
++      // DeleteSelectionCommand(본문이면 조각, 셀이면 스냅샷을 품음) 또는 FragmentDeleteCommand 자체
++      if ('fragment' in cmd || 'snapshot' in cmd) {
++        const selection = cmd.selection as Rec | undefined;
++        const inner = cmd.fragment as Rec | null;
++        if (!inner) return { slots: [], store: 'snapshot' };
++        const selSlots = selection ? [docPos(selection, 'start', { caret: true }), docPos(selection, 'end', { caret: true, bias: 'before' })] : [];
++        const d = describeFragmentDelete(inner);
++        return { ...d, slots: [...d.slots, ...compact(selSlots)] };
++      }
++      return describeFragmentDelete(cmd);
++    }
++    default:
++      return null;
++  }
++}
++
++function describeFragmentDelete(cmd: Rec): CollabUndoDescriptor {
++  const anchor = secPara(cmd, 'sectionIdx', 'startPara', 'endPara');
++  return {
++    slots: compact([anchor, docPos(cmd, 'cursorBefore', { caret: true }), docPos(cmd, 'cursorAfter', { caret: true })]),
++    store: 'fragment',
++    fragmentAnchor: anchor ?? undefined,
++  };
++}
 diff --git a/rhwp-studio/src/engine/history.ts b/rhwp-studio/src/engine/history.ts
-index 8610bc16..dabe590e 100644
+index 8610bc16..0554c496 100644
 --- a/rhwp-studio/src/engine/history.ts
 +++ b/rhwp-studio/src/engine/history.ts
-@@ -43,6 +43,19 @@ function snapshotIdBudget(wasm: WasmBridge): number {
+@@ -3,6 +3,7 @@ import type { DocumentPosition } from '@/core/types';
+ import { NO_TEXT_MUTATION_EFFECTS } from './command';
+ import type { EditCommand, TextMutationEffects } from './command';
+ import type { RollbackOutcome } from '../core/command-error';
++import type { CollabHistoryHook } from './collab-undo';
+ 
+ /** 스택 내 모든 명령의 discard()를 호출하여 리소스 해제 */
+ function discardAll(stack: EditCommand[], wasm: WasmBridge): void {
+@@ -43,6 +44,47 @@ function snapshotIdBudget(wasm: WasmBridge): number {
  /** Undo/Redo 히스토리 관리 */
  export class CommandHistory {
    lastFailureRecovery: RollbackOutcome = 'unknown';
@@ -152,23 +465,153 @@ index 8610bc16..dabe590e 100644
 +  }
 +
 +  isSuspended(): boolean { return this.suspended; }
++
++  /**
++   * cc-rhwp(4단계): 공동편집 되돌리기 훅. 걸면 기록을 멈추지 않고 쌓되, 경계마다 훅에 알리고 undo/redo 전에
++   * 막힘을 묻는다(docs/collab-stage4.md). 걸 때·풀 때 양 스택을 비운다(남의 편집 전 위치는 의미가 없다).
++   */
++  private collab: CollabHistoryHook | null = null;
++
++  setCollabHook(hook: CollabHistoryHook | null, wasm?: WasmBridge): void {
++    this.clear(wasm);
++    this.collab = hook;
++    if (hook) this.suspended = false;
++  }
++
++  /** cc-rhwp(4단계): 양 스택(아래→위)의 사본. */
++  collabStacks(): { undo: readonly EditCommand[]; redo: readonly EditCommand[] } {
++    return { undo: [...this.undoStack], redo: [...this.redoStack] };
++  }
++
++  /** cc-rhwp(4단계): 명령들을 스택에서 빼고 자원을 해제한다(공동편집에서 버려진 편집). */
++  collabRemove(commands: ReadonlySet<object>, wasm: WasmBridge): void {
++    const keep = (stack: EditCommand[]) => stack.filter((cmd) => {
++      if (!commands.has(cmd)) return true;
++      cmd.discard?.(wasm);
++      return false;
++    });
++    this.undoStack = keep(this.undoStack);
++    this.redoStack = keep(this.redoStack);
++  }
  
    /** 동일 엔트리·순서의 양 스택을 확인한다. counts만으로 redo 파괴를 숨기지 않는다. */
    recoveryCheckpoint(): () => boolean {
-@@ -136,6 +149,12 @@ export class CommandHistory {
-       return cursorAfter;
+@@ -123,6 +165,7 @@ export class CommandHistory {
+       this.lastFailureRecovery = command.failureRecovery?.() ?? 'unknown';
+       // 부분 변경이 남았으면 복원 정보를 보존하여 Undo로 재시도한다.
+       if (command.retainOnFailure?.()) this.recordWithoutExecute(command, wasm);
++      else this.collab?.settled();
+       throw error;
      }
- 
-+    // cc-rhwp: 기록 중지 — 쌓지 않고 자원을 해제한다.
-+    if (this.suspended) {
+     this.captureExecutionEffects(command);
+@@ -132,6 +175,13 @@ export class CommandHistory {
+     // redo 스택이 파기되며 ③스냅샷 명령이면 예산 2슬롯을 먹어 오래된 진짜 이력이
+     // 축출된다(#2328). 세 피해 모두 여기서 끊는다 — redo 스택도 그대로 둔다.
+     if (command.isNoOp?.()) {
 +      command.discard?.(wasm);
++      this.collab?.settled();
 +      return cursorAfter;
 +    }
 +
-     // 직전 명령과 병합 시도
-     if (this.undoStack.length > 0) {
-       const last = this.undoStack[this.undoStack.length - 1];
-@@ -255,6 +274,11 @@ export class CommandHistory {
++    // cc-rhwp: 기록 중지 — 쌓지 않고 자원을 해제한다.
++    if (this.suspended) {
+       command.discard?.(wasm);
+       return cursorAfter;
+     }
+@@ -145,6 +195,7 @@ export class CommandHistory {
+         // redo 스택 정리 (리소스 해제 후 비움)
+         discardAll(this.redoStack, wasm);
+         this.redoStack = [];
++        this.collab?.recorded(merged, last);
+         return cursorAfter;
+       }
+     }
+@@ -153,6 +204,7 @@ export class CommandHistory {
+     // redo 스택 정리 (새 명령 실행 시 redo 불가)
+     discardAll(this.redoStack, wasm);
+     this.redoStack = [];
++    this.collab?.recorded(command, null);
+ 
+     // 크기 제한 — eviction 시 리소스 해제
+     if (this.undoStack.length > this.maxSize) {
+@@ -189,6 +241,7 @@ export class CommandHistory {
+     const cursorAfter = command.undo(wasm);
+     this.undoStack.pop();
+     command.discard?.(wasm);
++    this.collab?.settled();
+     return cursorAfter;
+   }
+ 
+@@ -198,6 +251,15 @@ export class CommandHistory {
+     const command = this.undoStack[this.undoStack.length - 1];
+     if (!command) return null;
+ 
++    // cc-rhwp(4단계): 공동편집 중 막힌 단계는 문서를 건드리지 않고 버린다(알림은 훅이). 한 번 누름에 한 단계만.
++    const blocked = this.collab?.blocked(command, 'undo') ?? null;
++    if (blocked !== null) {
++      this.undoStack.pop();
++      command.discard?.(wasm);
++      this.collab?.rejected(command, 'undo', blocked);
++      return null;
++    }
++
+     // [Task #2328] op-우선 + 실패시-드롭 하이브리드.
+     // - 성공: 스택을 이동한다(op 전에 pop 하지 않으므로 성공 엔트리 무손실).
+     // - 실패(예: 복구 불가한 스냅샷 restore 오류): 오래동안 스택 top 에 남겨
+@@ -208,13 +270,18 @@ export class CommandHistory {
+     try {
+       cursorAfter = command.undo(wasm);
+     } catch (e) {
+-      if (command.retainOnFailure?.()) throw e;
++      if (command.retainOnFailure?.()) {
++        this.collab?.settled();
++        throw e;
++      }
+       this.undoStack.pop();
+       command.discard?.(wasm);
++      this.collab?.settled();
+       throw e;
+     }
+     this.undoStack.pop();
+     this.redoStack.push(command);
++    this.collab?.undone(command);
+     // [Task #5769] undo 가 스냅샷 id 를 늘리므로(엔트리 1 → 2) 여기서도 예산을 강제한다.
+     // 스택 이동 이후에 불러야 방금 늘어난 +1 이 계산에 포함된다.
+     if ((command.snapshotResourceCount?.() ?? 0) > 0) {
+@@ -232,6 +299,15 @@ export class CommandHistory {
+     const command = this.redoStack[this.redoStack.length - 1];
+     if (!command) return null;
+ 
++    // cc-rhwp(4단계): undo 와 같은 막힘 규칙
++    const blocked = this.collab?.blocked(command, 'redo') ?? null;
++    if (blocked !== null) {
++      this.redoStack.pop();
++      command.discard?.(wasm);
++      this.collab?.rejected(command, 'redo', blocked);
++      return null;
++    }
++
+     // [Task #2328] undo 와 동일 하이브리드 — 성공 시 이동, 실패 시 오염 엔트리 드롭.
+     let cursorAfter: DocumentPosition;
+     try {
+@@ -241,20 +317,28 @@ export class CommandHistory {
+       if (command.retainOnFailure?.()) {
+         // 부분 Redo는 이미 문서에 반영됐다. 이전 명령보다 먼저 Undo해야 한다.
+         this.undoStack.push(command);
++        this.collab?.redone(command);
+       } else {
+         command.discard?.(wasm);
++        this.collab?.settled();
+       }
+       throw e;
+     }
+     this.captureExecutionEffects(command);
+     this.redoStack.pop();
+     this.undoStack.push(command);
++    this.collab?.redone(command);
+     return cursorAfter;
+   }
+ 
    /** execute() 없이 히스토리에만 기록 (IME compositionend용 — 텍스트가 이미 문서에 있는 경우) */
    recordWithoutExecute(command: EditCommand, wasm?: WasmBridge): void {
      this.lastExecutionEffects = NO_TEXT_MUTATION_EFFECTS;
@@ -180,11 +623,35 @@ index 8610bc16..dabe590e 100644
      // 직전 명령과 병합 시도
      if (this.undoStack.length > 0) {
        const last = this.undoStack[this.undoStack.length - 1];
+@@ -265,6 +349,7 @@ export class CommandHistory {
+           discardAll(this.redoStack, wasm);
+         }
+         this.redoStack = [];
++        this.collab?.recorded(merged, last);
+         return;
+       }
+     }
+@@ -274,6 +359,7 @@ export class CommandHistory {
+       discardAll(this.redoStack, wasm);
+     }
+     this.redoStack = [];
++    this.collab?.recorded(command, null);
+ 
+     if (this.undoStack.length > this.maxSize) {
+       const evicted = this.undoStack.shift();
 diff --git a/rhwp-studio/src/engine/input-handler.ts b/rhwp-studio/src/engine/input-handler.ts
-index 7d251116..e3b68288 100644
+index 7d251116..fb99ce2b 100644
 --- a/rhwp-studio/src/engine/input-handler.ts
 +++ b/rhwp-studio/src/engine/input-handler.ts
-@@ -549,6 +549,8 @@ export class InputHandler {
+@@ -15,6 +15,7 @@ import { resolveGlyphStartRect, isCompositionBoxRepresentable } from './line-sta
+ import { FieldMarkerRenderer } from './field-marker-renderer';
+ import { SelectionRenderer } from './selection-renderer';
+ import { CommandHistory } from './history';
++import { describeCollabUndo, type CollabHistoryController, type CollabHistoryHook } from './collab-undo';
+ import { DeleteSelectionCommand, ApplyCharFormatCommand, ApplyParaFormatCommand, SnapshotCommand, SubmodeSnapshotCommand, SubmodeSelectionSnapshotCommand, SetFormValueCommand, TextMutationEffectAccumulator, IMMEDIATE_TEXT_MUTATION_EFFECTS, applyCharShapeModsToRange, cellAxisPath, cellParaIndexOf } from './command';
+ import type { OperationDescriptor, ParaFormatTarget, RefreshPolicy, TextMutationEffects, EditCommand, EditContext, HeaderFooterSelectionSnapshot, FormValueTarget } from './command';
+ import { selectCellIndicesInRange, paraFormatTargetsForCellBlock, withCellPathTarget } from './cell-block-format';
+@@ -549,6 +550,8 @@ export class InputHandler {
  
    // IME 조합 상태
    private isComposing = false;
@@ -193,7 +660,7 @@ index 7d251116..e3b68288 100644
    private compositionAnchor: DocumentPosition | null = null;
    private compositionLength = 0; // 문서에 삽입된 조합 텍스트 길이
    private compositionBodyLogical = false;
-@@ -3036,6 +3038,10 @@ export class InputHandler {
+@@ -3036,6 +3039,10 @@ export class InputHandler {
  
    /** Undo 처리 */
    private handleUndo(): void {
@@ -204,7 +671,7 @@ index 7d251116..e3b68288 100644
      this.withCommandErrorBoundary('undo', () => {
        this.flushDeferredPaginationIfNeeded('before-undo', false);
        let newPos: DocumentPosition | null;
-@@ -3058,6 +3064,10 @@ export class InputHandler {
+@@ -3058,6 +3065,10 @@ export class InputHandler {
  
    /** Redo 처리 */
    private handleRedo(): void {
@@ -215,7 +682,7 @@ index 7d251116..e3b68288 100644
      this.withCommandErrorBoundary('redo', () => {
        this.flushDeferredPaginationIfNeeded('before-redo', false);
        let newPos: DocumentPosition | null;
-@@ -3511,6 +3521,8 @@ export class InputHandler {
+@@ -3511,6 +3522,8 @@ export class InputHandler {
    /** IME 조합 완료 — 조합 텍스트를 Command로 기록 */
    private onCompositionEnd(): void {
      _text.onCompositionEnd.call(this);
@@ -224,7 +691,7 @@ index 7d251116..e3b68288 100644
    }
  
    /** 위치에서 텍스트를 읽는다 (본문/셀 자동 분기) */
-@@ -4991,6 +5003,76 @@ export class InputHandler {
+@@ -4991,6 +5004,91 @@ export class InputHandler {
      this.afterEdit();
    }
  
@@ -298,10 +765,25 @@ index 7d251116..e3b68288 100644
 +    this.history.setSuspended(message !== null, this.wasm);
 +  }
 +
++  /**
++   * cc-rhwp(4단계): 공동편집 되돌리기 훅을 건다(`null` 이면 푼다). 걸고 풀 때 히스토리를 비운다.
++   * 반환은 플러그인이 쓰는 히스토리 조작(스택 읽기·명령 빼기·비우기·위치 표).
++   */
++  setCollabHistory(hook: CollabHistoryHook | null): CollabHistoryController | null {
++    this.history.setCollabHook(hook, this.wasm);
++    if (!hook) return null;
++    return {
++      stacks: () => this.history.collabStacks(),
++      remove: (commands) => this.history.collabRemove(commands, this.wasm),
++      clear: () => this.history.clear(this.wasm),
++      describe: (command) => describeCollabUndo(command),
++    };
++  }
++
    exitPictureObjectSelectionAndAfterEdit(): void {
      this.exitPictureObjectSelectionIfNeeded();
      this.afterEdit();
-@@ -5658,10 +5740,11 @@ export class InputHandler {
+@@ -5658,10 +5756,11 @@ export class InputHandler {
    }
  
    /** Undo 가능한가? */
@@ -316,7 +798,7 @@ index 7d251116..e3b68288 100644
    /** Undo 실행 (커맨드 시스템용) */
    performUndo(): void { this.handleUndo(); }
 diff --git a/rhwp-studio/src/main.ts b/rhwp-studio/src/main.ts
-index 50b4215d..13afee55 100644
+index 50b4215d..c2221a28 100644
 --- a/rhwp-studio/src/main.ts
 +++ b/rhwp-studio/src/main.ts
 @@ -6,6 +6,7 @@ import { isPdfInput, type PdfInputSource } from './core/pdf-open';
@@ -383,7 +865,7 @@ index 50b4215d..13afee55 100644
    createBlankDocument: async (options) => {
      if (options?.confirmUnsaved && !await canReplaceCurrentDocument()) return false;
      await createNewDocument();
-@@ -376,6 +397,26 @@ const plugins = new PluginHostRegistry({
+@@ -376,6 +397,32 @@ const plugins = new PluginHostRegistry({
    },
    resolve: resolvePlugin,
    sidePanels,
@@ -399,6 +881,12 @@ index 50b4215d..13afee55 100644
 +    applyHistorySuspension();
 +    return () => { historySuspensions.delete(token); applyHistorySuspension(); };
 +  },
++  // cc-rhwp(4단계): 공동편집 되돌리기 훅 — 걸면 기록을 멈추지 않고 훅이 위치를 옮기고 막힘을 판정한다.
++  enableCollabUndo: (_pluginId, hook) => {
++    const controller = inputHandler?.setCollabHistory(hook) ?? null;
++    if (!controller) return null;
++    return { controller, release: () => { inputHandler?.setCollabHistory(null); } };
++  },
 +  // cc-rhwp(S3-1): 글꼴 정책. 걸고 풀 때 지금 문서의 글꼴 환경을 다시 준비한다(onFontPolicyChanged).
 +  setFontPolicy: (pluginId) => acquireBundledFontPolicy(pluginId),
 +  // cc-rhwp: 플러그인별 자동 저장 중지 (원장이 unload 때 재개 함수를 회수한다)
@@ -410,7 +898,7 @@ index 50b4215d..13afee55 100644
    selectTextRange: (range) => {
      if (!inputHandler) return false;
      navigateToSearchHit(inputHandler, {
-@@ -478,6 +519,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
+@@ -478,6 +525,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
  }
  
  function handleAutosaveStatus(status: AutosaveStatus): void {
@@ -420,7 +908,7 @@ index 50b4215d..13afee55 100644
    const message = document.getElementById('sb-message');
    if (!message) return;
    if (autosaveStatusRestoreTimer) {
-@@ -564,6 +608,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
+@@ -564,6 +614,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
      ? rendererSession?.getCanvasKitRenderer() ?? null
      : null;
    if (!renderer || (!fontNames?.length && !refresh)) return;
@@ -429,7 +917,7 @@ index 50b4215d..13afee55 100644
    const requestedFonts = [...(fontNames ?? [])];
    void (async () => {
      await loadStoredLocalFonts();
-@@ -693,9 +739,12 @@ async function initialize(): Promise<void> {
+@@ -693,9 +745,12 @@ async function initialize(): Promise<void> {
            try {
              // 저장된 Local Font Access 권한이 있으면 첫 replay부터 원 face의 SFNT bytes를
              // CanvasKit에 전달한다. CSS local()에서 EBDT face가 두부로 바뀌는 경로를 타지 않는다.
@@ -445,7 +933,7 @@ index 50b4215d..13afee55 100644
            } catch (error) {
              // 로컬 권한이 만료됐거나 face 읽기에 실패해도 portable bundled face로 계속 연다.
              console.warn(
-@@ -1313,8 +1362,29 @@ function setupEventListeners(): void {
+@@ -1313,8 +1368,29 @@ function setupEventListeners(): void {
      }
    });
  
@@ -475,7 +963,7 @@ index 50b4215d..13afee55 100644
      wasm.invalidateCanvasMetricFonts();
      const documentGeneration = wasm.documentGeneration;
      const hostGeneration = getHostFontState().generation;
-@@ -1343,6 +1413,7 @@ function setupEventListeners(): void {
+@@ -1343,6 +1419,7 @@ function setupEventListeners(): void {
        clearDeclaredLocalPrograms();
      }
      if (!canvasView || wasm.pageCount === 0) return;
@@ -483,7 +971,7 @@ index 50b4215d..13afee55 100644
      const state = getLocalFontState();
      const generation = `${state.detectedAt ?? 'none'}:${state.source ?? 'none'}:${state.count}`;
      if (generation === lastAppliedLocalFontGeneration) return;
-@@ -1535,11 +1606,13 @@ async function initializeDocument(
+@@ -1535,11 +1612,13 @@ async function initializeDocument(
    try {
      signal.throwIfAborted();
      // 이미 승인된 snapshot을 권한 prompt 없이 준비한 뒤 프로그램을 선택한다.
@@ -499,7 +987,7 @@ index 50b4215d..13afee55 100644
        await promptLocalFontsIfNeeded(displayName);
        signal.throwIfAborted();
      }
-@@ -1997,7 +2070,8 @@ async function renderRecentSubmenu(): Promise<void> {
+@@ -1997,7 +2076,8 @@ async function renderRecentSubmenu(): Promise<void> {
  
  function shouldSkipInitialAutosaveRecovery(): boolean {
    const params = new URLSearchParams(window.location.search);
@@ -509,7 +997,7 @@ index 50b4215d..13afee55 100644
  }
  
  async function offerAutosaveRecoveryIfIdle(): Promise<void> {
-@@ -2306,6 +2380,10 @@ void initPromise.then(() => {
+@@ -2306,6 +2386,10 @@ void initPromise.then(() => {
    if (__RHWP_AI__ && sidePanels && window.parent === window) {
      plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
    }
@@ -586,18 +1074,19 @@ index 00000000..011add1c
 +  };
 +}
 diff --git a/rhwp-studio/src/plugin/host.ts b/rhwp-studio/src/plugin/host.ts
-index 07a99843..080ea2f8 100644
+index 07a99843..fa1ca32c 100644
 --- a/rhwp-studio/src/plugin/host.ts
 +++ b/rhwp-studio/src/plugin/host.ts
-@@ -15,6 +15,7 @@ import type { StudioAutomation } from '@/automation/types';
+@@ -15,6 +15,8 @@ import type { StudioAutomation } from '@/automation/types';
  import type { WasmBridge } from '@/core/wasm-bridge';
  import type { EventBus } from '@/core/event-bus';
  import type { InputHandler } from '@/engine/input-handler';
 +import type { DocumentCallInterceptor } from './document-intercept.ts';
++import type { CollabHistoryController, CollabHistoryHook } from '@/engine/collab-undo';
  import type { DocumentPosition } from '@/core/types';
  import type { SidePanelRegistry } from '@/view/side-panel-host';
  import { readSelectionText } from './selection-text.ts';
-@@ -25,6 +26,8 @@ import {
+@@ -25,6 +27,8 @@ import {
    type PluginErrorCode,
    type PluginHost,
    type PluginCaret,
@@ -606,7 +1095,7 @@ index 07a99843..080ea2f8 100644
    type PluginLedger,
    type PluginSelectionText,
    type PluginTextRange,
-@@ -46,7 +49,7 @@ export interface PluginHostDeps {
+@@ -46,7 +50,7 @@ export interface PluginHostDeps {
    eventBus: EventBus;
    getInputHandler: () => InputHandler | null;
    /** 문서 교체 위임 — 원자 교체·세대 증가·이전 문서 해제는 studio 가 한다. */
@@ -615,7 +1104,7 @@ index 07a99843..080ea2f8 100644
    createBlankDocument: (options?: { confirmUnsaved?: boolean }) => Promise<boolean>;
    /**
     * id 로 플러그인을 가져온다. **allowlist 는 이 훅이 쥔다** — 여기서 거절하면 호스트는
-@@ -57,8 +60,30 @@ export interface PluginHostDeps {
+@@ -57,8 +61,32 @@ export interface PluginHostDeps {
    sidePanels?: SidePanelRegistry;
    /** 편집기 선택 이동. 찾기 대화상자와 같은 경로를 쓰도록 studio 가 넘긴다. */
    selectTextRange?: (range: PluginTextRange) => boolean;
@@ -633,6 +1122,8 @@ index 07a99843..080ea2f8 100644
 +  ) => () => void;
 +  /** 되돌리기 기록 중지(cc-rhwp). 반환값은 재개 함수. 없으면 중지 요청은 아무 일도 하지 않는다. */
 +  suspendHistory?: (pluginId: string, message: string) => () => void;
++  /** 공동편집 되돌리기 훅(cc-rhwp 4단계). 없거나 `null` 이면 지원하지 않는 것. */
++  enableCollabUndo?: (pluginId: string, hook: CollabHistoryHook) => { controller: CollabHistoryController; release: () => void } | null;
 +  /** 글꼴 정책(cc-rhwp S3-1). 반환값은 해제 함수. 없으면 정책 요청은 아무 일도 하지 않는다. */
 +  setFontPolicy?: (pluginId: string, policy: 'bundled-only') => () => void;
  }
@@ -646,7 +1137,7 @@ index 07a99843..080ea2f8 100644
  /** `getSelectionText` 가 한 번에 돌려주는 글자 수 상한. */
  const SELECTION_TEXT_MAX_CHARS = 20000;
  
-@@ -69,7 +94,8 @@ const UNLOAD_TX_POLL_MS = 20;
+@@ -69,7 +97,8 @@ const UNLOAD_TX_POLL_MS = 20;
  function emptyLedger(): PluginLedger {
    return {
      commands: new Set(), menuItems: new Set(),
@@ -656,7 +1147,7 @@ index 07a99843..080ea2f8 100644
    };
  }
  
-@@ -238,8 +264,8 @@ class PluginHostFacade implements PluginHost {
+@@ -238,8 +267,8 @@ class PluginHostFacade implements PluginHost {
      };
    }
  
@@ -667,7 +1158,7 @@ index 07a99843..080ea2f8 100644
    }
  
    createBlankDocument(options?: { confirmUnsaved?: boolean }): Promise<boolean> {
-@@ -290,6 +316,14 @@ class PluginHostFacade implements PluginHost {
+@@ -290,6 +319,14 @@ class PluginHostFacade implements PluginHost {
  
    events = {
      on: (name: string, cb: (payload?: unknown) => void): (() => void) => {
@@ -682,7 +1173,7 @@ index 07a99843..080ea2f8 100644
        const off = this.deps.eventBus.on(name, cb);
        this.ledger.eventUnsubs.push(off);
        return off;
-@@ -305,6 +339,137 @@ class PluginHostFacade implements PluginHost {
+@@ -305,6 +342,145 @@ class PluginHostFacade implements PluginHost {
      return off;
    }
  
@@ -714,6 +1205,14 @@ index 07a99843..080ea2f8 100644
 +  suspendHistory(message: string = HISTORY_SUSPENDED_MESSAGE): () => void {
 +    const resume = this.deps.suspendHistory?.(this.pluginId, message) ?? (() => {});
 +    return this.ledgerOnce(this.ledger.historyResumes, resume);
++  }
++
++  enableCollabUndo(hook: CollabHistoryHook): (CollabHistoryController & { release(): void }) | null {
++    const got = this.deps.enableCollabUndo?.(this.pluginId, hook) ?? null;
++    if (!got) return null;
++    // 되돌리기 기록 중지와 같은 원장 — unload 때 풀린다
++    const release = this.ledgerOnce(this.ledger.historyResumes, got.release);
++    return { ...got.controller, release };
 +  }
 +
 +  setFontPolicy(policy: 'bundled-only'): () => void {
@@ -820,7 +1319,7 @@ index 07a99843..080ea2f8 100644
    /** 문서가 교체됐음을 이 플러그인에 알린다. 호스트도 외부 교체 때 부른다. */
    notifySwap(): void {
      const lease = this.borrowDocument();
-@@ -435,6 +600,18 @@ export class PluginHostRegistry {
+@@ -435,6 +611,18 @@ export class PluginHostRegistry {
      for (const off of ledger.uiUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
@@ -839,7 +1338,7 @@ index 07a99843..080ea2f8 100644
      for (const off of ledger.swapUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
-@@ -448,6 +625,10 @@ export class PluginHostRegistry {
+@@ -448,6 +636,10 @@ export class PluginHostRegistry {
        this.deps.automation.unregisterCommand(commandId);
      }
      ledger.uiUnsubs.length = 0;
@@ -851,10 +1350,18 @@ index 07a99843..080ea2f8 100644
      ledger.eventUnsubs.length = 0;
      ledger.menuItems.clear();
 diff --git a/rhwp-studio/src/plugin/types.ts b/rhwp-studio/src/plugin/types.ts
-index 571e2b4d..a65c2ac4 100644
+index 571e2b4d..75aae724 100644
 --- a/rhwp-studio/src/plugin/types.ts
 +++ b/rhwp-studio/src/plugin/types.ts
-@@ -98,6 +98,17 @@ export interface Tx {
+@@ -9,6 +9,7 @@
+  */
+ import type { HwpDocument } from '@wasm/rhwp.js';
+ import type { StudioAutomation } from '@/automation/types';
++import type { CollabHistoryController, CollabHistoryHook } from '@/engine/collab-undo';
+ 
+ /** 현재 플러그인 API 세대. `activate` 는 이 값을 선언한 플러그인만 받는다. */
+ export const PLUGIN_API_VERSION = 1 as const;
+@@ -98,6 +99,17 @@ export interface Tx {
    deferPagination(): void;
  }
  
@@ -872,7 +1379,7 @@ index 571e2b4d..a65c2ac4 100644
  /**
   * 플러그인이 studio 에 요청할 수 있는 전부.
   *
-@@ -134,7 +145,7 @@ export interface PluginHost {
+@@ -134,7 +146,7 @@ export interface PluginHost {
     * 문서 교체 위임. 원자 교체·세대 증가·이전 문서 해제는 studio 가 한다.
     * 비동기인 이유는 studio 의 열기 경로가 저장 안 된 변경 확인·복구 흐름을 포함하기 때문이다.
     */
@@ -881,7 +1388,7 @@ index 571e2b4d..a65c2ac4 100644
    /**
     * 빈 문서로 교체한다. 끝날 때까지 기다릴 수 있다. `confirmUnsaved` 면 메뉴의 「새 문서」처럼
     * 저장 안 된 변경을 먼저 묻는다 — 사용자가 취소하면 `false` 이고 문서는 그대로다.
-@@ -173,6 +184,81 @@ export interface PluginHost {
+@@ -173,6 +185,88 @@ export interface PluginHost {
  
    /** 문서가 교체되면 새 lease 를 받는다. 반환값은 해지 함수다. */
    onDocumentSwap(cb: (lease: DocumentLease) => void): () => void;
@@ -921,6 +1428,13 @@ index 571e2b4d..a65c2ac4 100644
 +   * 원장에 담겨 unload 때 회수된다.
 +   */
 +  suspendHistory(message?: string): () => void;
++
++  /**
++   * 공동편집 되돌리기(cc-rhwp 4단계). 기록을 멈추는 대신 훅을 걸어, 플러그인이 남의 편집에 맞춰 되돌리기
++   * 스택의 위치를 옮기고 겹치면 그 단계를 막는다. 걸 때·풀 때 히스토리를 비운다. 지원하지 않으면 `null`
++   * (그때는 `suspendHistory` 를 쓴다). 반환의 `release` 는 원장에 담겨 unload 때 회수된다.
++   */
++  enableCollabUndo(hook: CollabHistoryHook): (CollabHistoryController & { release(): void }) | null;
 +
 +  /**
 +   * 글꼴 정책을 건다(cc-rhwp S3-1). `bundled-only` 동안 조판은 엔진 내장 규칙만, 표시는 내장 웹 글꼴만 쓴다 —
@@ -963,7 +1477,7 @@ index 571e2b4d..a65c2ac4 100644
  }
  
  /**
-@@ -212,6 +298,14 @@ export interface PluginLedger {
+@@ -212,6 +306,14 @@ export interface PluginLedger {
    swapUnsubs: Array<() => void>;
    /** `ui.registerSidePanel` 이 돌려준 해지 함수 */
    uiUnsubs: Array<() => void>;
@@ -1431,6 +1945,248 @@ index 00000000..877ebd9b
 +  assert.match(ih, /pluginOverlayLayer\(\)[\s\S]*#scroll-content[\s\S]*pointer-events:none[\s\S]*z-index:11/);
 +  const caret = source('src/engine/caret-renderer.ts');
 +  assert.match(caret, /toContentRect\(rect: CursorRect, zoom: number\)[\s\S]*clampCaretRect[\s\S]*calcPageLeft[\s\S]*getPageOffset/);
++});
+diff --git a/rhwp-studio/tests/plugin-collab-undo.test.ts b/rhwp-studio/tests/plugin-collab-undo.test.ts
+new file mode 100644
+index 00000000..3dd1a1fa
+--- /dev/null
++++ b/rhwp-studio/tests/plugin-collab-undo.test.ts
+@@ -0,0 +1,236 @@
++// cc-rhwp(4단계 U1): 공동편집 되돌리기 — 명령 위치 표(engine/collab-undo.ts)와 히스토리·호스트 배선.
++//
++// 명령 클래스(command.ts)와 CommandHistory 는 node 의 strip-only TS 로 실행할 수 없어(이 저장소의 undo 테스트
++// 관례) 표는 필드 이름을 가진 평범한 객체로, 배선은 소스 가드로 검증한다. 표 대조 시험은 분류표 drift 검사와
++// 같은 역할이다 — 업스트림이 명령 클래스를 더하거나 표가 읽는 필드 이름을 바꾸면 여기서 깨진다.
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++import { COLLAB_UNDO_CLASSES, describeCollabUndo, type CollabHistoryHook } from '../src/engine/collab-undo.ts';
++import { PluginHostRegistry, type PluginHostDeps } from '../src/plugin/host.ts';
++import { PLUGIN_API_VERSION, type PluginHost, type StudioPlugin } from '../src/plugin/types.ts';
++import { balancedFrom, codeOnly } from './support/source-guard.ts';
++
++const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
++const source = (rel: string): string => codeOnly(readFileSync(join(rootDir, rel), 'utf8'));
++
++// ── 표 대조 (drift) ──────────────────────────────────────────────────
++
++const commandSrc = source('src/engine/command.ts');
++/** command.ts 의 명령 클래스 → 본문 */
++const commandClasses = (() => {
++  const out = new Map<string, string>();
++  const re = /export class (\w+)(?: extends SnapshotCommand| implements EditCommand)\b/g;
++  for (let m = re.exec(commandSrc); m; m = re.exec(commandSrc)) out.set(m[1], balancedFrom(commandSrc.slice(m.index), `class ${m[1]}`, '{'));
++  return out;
++})();
++
++test('표 대조: command.ts 의 명령 클래스가 모두 표에 있고, 표에는 없는 클래스가 없다', () => {
++  assert.ok(commandClasses.size >= 37, `명령 클래스를 읽지 못함(${commandClasses.size})`);
++  const missing = [...commandClasses.keys()].filter((c) => !(c in COLLAB_UNDO_CLASSES));
++  const stale = Object.keys(COLLAB_UNDO_CLASSES).filter((c) => !commandClasses.has(c));
++  assert.deepEqual(missing, [], `표에 없는 새 명령 클래스 — 위치 필드를 표에 더하거나 strict 로 둔다: ${missing.join(', ')}`);
++  assert.deepEqual(stale, [], `command.ts 에 없는 클래스: ${stale.join(', ')}`);
++});
++
++/** 표가 읽는 필드(클래스 본문에 선언이 있어야 한다) */
++const TABLE_FIELDS: Record<string, string[]> = {
++  InsertTextCommand: ['position', 'fragmentIds'],
++  DeleteTextCommand: ['position', 'fragmentId'],
++  InsertLineBreakCommand: ['position'],
++  InsertTabCommand: ['position'],
++  SplitParagraphCommand: ['position'],
++  MergeParagraphCommand: ['position'],
++  MergeNextParagraphCommand: ['position'],
++  SplitParagraphInCellCommand: ['position'],
++  MergeParagraphInCellCommand: ['position'],
++  MergeNextParagraphInCellCommand: ['position'],
++  FragmentDeleteCommand: ['cursorBefore', 'cursorAfter', 'sectionIdx', 'startPara', 'endPara'],
++  DeleteSelectionCommand: ['fragment', 'snapshot', 'selection'],
++  ApplyCharFormatCommand: ['start', 'end', 'entries'],
++  ApplyParaFormatCommand: ['targets', 'cursorBefore'],
++};
++
++test('표 대조: 표가 다루는 클래스는 표가 읽는 필드를 모두 선언하고, type 문자열이 표의 분기와 맞는다', () => {
++  const tableClasses = Object.entries(COLLAB_UNDO_CLASSES).filter(([, v]) => v === 'table').map(([k]) => k).sort();
++  assert.deepEqual(Object.keys(TABLE_FIELDS).sort(), tableClasses);
++  for (const [cls, fields] of Object.entries(TABLE_FIELDS)) {
++    const body = commandClasses.get(cls)!;
++    for (const f of fields) assert.match(body, new RegExp(`\\b(private|readonly|public)?\\s*(readonly\\s+)?${f}\\??\\s*[:=]`), `${cls}.${f} 선언이 없음`);
++    const type = body.match(/readonly type = '([^']+)'/)?.[1];
++    assert.ok(type, `${cls} 의 type 이 없음`);
++    // 표는 type 으로 분기한다 — 그 type 의 평범한 객체가 null 이 아니어야 한다
++    assert.notEqual(describeCollabUndo({ type, position: body0(), start: body0(), end: body0(), fragment: null, snapshot: {}, sectionIdx: 0, startPara: 0, endPara: 0 }), null, `${cls}(${type}) 를 표가 모름`);
++  }
++});
++
++// ── 표 동작 (평범한 객체) ────────────────────────────────────────────
++
++function body0(para = 2, off = 3) {
++  return { sectionIndex: 0, paragraphIndex: para, charOffset: off };
++}
++function cell1(pp = 2, cp = 1, off = 3) {
++  return { sectionIndex: 0, paragraphIndex: cp, charOffset: off, parentParaIndex: pp, controlIndex: 0, cellIndex: 4, cellParaIndex: cp, cellPath: [{ controlIndex: 0, cellIndex: 4, cellParaIndex: cp }] };
++}
++
++test('본문 위치: 읽고 쓰기, 덮어쓰기 조각이 있으면 조각 의존', () => {
++  const cmd = { type: 'insertText', position: body0(), fragmentIds: [] as number[] };
++  const d = describeCollabUndo(cmd)!;
++  assert.equal(d.store, 'none');
++  assert.equal(d.slots.length, 1);
++  assert.deepEqual(d.slots[0].get(), { section: 0, para: 2, offset: 3, bias: undefined });
++  d.slots[0].set({ section: 0, para: 5, offset: 3 });
++  assert.deepEqual(cmd.position, { sectionIndex: 0, paragraphIndex: 5, charOffset: 3 });
++  cmd.fragmentIds = [7];
++  const f = describeCollabUndo(cmd)!;
++  assert.equal(f.store, 'fragment');
++  assert.equal(f.fragmentAnchor, f.slots[0]);
++  assert.equal(describeCollabUndo({ type: 'deleteText', position: body0(), fragmentId: null })!.store, 'none');
++  assert.equal(describeCollabUndo({ type: 'deleteText', position: body0(), fragmentId: 3 })!.store, 'fragment');
++});
++
++test('셀 위치: 표를 품은 문단·칸 문단을 함께 쓰고(paragraphIndex·cellPath 포함), 중첩 셀·캡션은 옮길 수 없음', () => {
++  const cmd = { type: 'splitParagraphInCell', position: cell1() };
++  const d = describeCollabUndo(cmd)!;
++  assert.deepEqual(d.slots[0].get(), { section: 0, para: 2, offset: 3, bias: undefined, cell: { control: 0, cell: 4, cellPara: 1 } });
++  d.slots[0].set({ section: 0, para: 6, offset: 3, cell: { control: 0, cell: 4, cellPara: 2 } });
++  assert.equal(cmd.position.parentParaIndex, 6);
++  assert.equal(cmd.position.cellParaIndex, 2);
++  assert.equal(cmd.position.paragraphIndex, 2);
++  assert.deepEqual(cmd.position.cellPath, [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 2 }]);
++  const nested = { ...cell1(), cellPath: [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 1 }, { controlIndex: 0, cellIndex: 0, cellParaIndex: 0 }] };
++  assert.equal(describeCollabUndo({ type: 'splitParagraphInCell', position: nested })!.slots[0].get(), null);
++  const caption = { ...cell1(), cellIndex: 65534, cellPath: [{ controlIndex: 0, cellIndex: 65534, cellParaIndex: 0 }] };
++  assert.equal(describeCollabUndo({ type: 'insertText', position: caption, fragmentIds: [] })!.slots[0].get(), null);
++});
++
++test('선택 삭제: 본문은 조각(시작 문단을 옮기면 끝 문단도 같이), 셀은 스냅샷', () => {
++  const inner = { type: 'deleteSelection', sectionIdx: 0, startPara: 3, endPara: 5, cursorBefore: body0(3, 1), cursorAfter: body0(3, 1) };
++  const cmd = { type: 'deleteSelection', fragment: inner, snapshot: null, selection: { start: body0(3, 1), end: body0(5, 2) } };
++  const d = describeCollabUndo(cmd)!;
++  assert.equal(d.store, 'fragment');
++  assert.deepEqual(d.fragmentAnchor!.get(), { section: 0, para: 3, offset: 0 });
++  d.fragmentAnchor!.set({ section: 0, para: 4, offset: 0 });
++  assert.deepEqual([inner.startPara, inner.endPara], [4, 6]);
++  assert.ok(d.slots.filter((s) => s.caret).length >= 4, '캐럿·선택 자리');
++  assert.equal(describeCollabUndo({ type: 'deleteSelection', fragment: null, snapshot: {}, selection: { start: cell1(), end: cell1() } })!.store, 'snapshot');
++  // FragmentDeleteCommand 자체
++  assert.equal(describeCollabUndo(inner)!.store, 'fragment');
++});
++
++test('글자 서식: 범위 시작·끝(끝은 before)과 문단별 기록(본문 paraIndex, 셀 cellPathJson)', () => {
++  const cmd = { type: 'applyCharFormat', start: body0(2, 1), end: body0(3, 4), entries: [{ paraIndex: 2 }, { paraIndex: 3 }] };
++  const d = describeCollabUndo(cmd)!;
++  assert.equal(d.slots.length, 4);
++  assert.equal(d.slots[1].get()!.bias, 'before');
++  d.slots[3].set({ section: 0, para: 9, offset: 0 });
++  assert.equal(cmd.entries[1].paraIndex, 9);
++  const c = { type: 'applyCharFormat', start: cell1(2, 0, 0), end: cell1(2, 0, 2), entries: [{ paraIndex: 0, cellPathJson: JSON.stringify([{ controlIndex: 0, cellIndex: 4, cellParaIndex: 0 }]) }] };
++  const cd = describeCollabUndo(c)!;
++  assert.deepEqual(cd.slots[2].get()!.cell, { control: 0, cell: 4, cellPara: 0 });
++  cd.slots[2].set({ section: 0, para: 2, offset: 0, cell: { control: 0, cell: 4, cellPara: 1 } });
++  assert.deepEqual(JSON.parse(c.entries[0].cellPathJson), [{ controlIndex: 0, cellIndex: 4, cellParaIndex: 1 }]);
++});
++
++test('문단 서식: 본문·셀·셀 경로 대상', () => {
++  const targets = [
++    { kind: 'body', sec: 0, para: 2 },
++    { kind: 'cell', sec: 0, parentPara: 4, controlIdx: 0, cellIdx: 1, cellParaIdx: 0 },
++    { kind: 'cellPath', sec: 0, parentPara: 4, path: [{ controlIndex: 0, cellIndex: 2, cellParaIndex: 1 }] },
++  ];
++  const d = describeCollabUndo({ type: 'applyParaFormat', targets, cursorBefore: body0() })!;
++  assert.equal(d.slots.length, 4);
++  d.slots[0].set({ section: 0, para: 3, offset: 0 });
++  d.slots[1].set({ section: 0, para: 5, offset: 0, cell: { control: 0, cell: 1, cellPara: 2 } });
++  d.slots[2].set({ section: 0, para: 5, offset: 0, cell: { control: 0, cell: 2, cellPara: 3 } });
++  assert.equal(targets[0].para, 3);
++  assert.deepEqual([targets[1].parentPara, targets[1].cellParaIdx], [5, 2]);
++  assert.deepEqual(targets[2].path, [{ controlIndex: 0, cellIndex: 2, cellParaIndex: 3 }]);
++});
++
++test('표에 없는 명령(스냅샷·머리말·개체·구역 등)은 null — 플러그인이 3.2-3 으로 다룬다', () => {
++  for (const type of ['snapshot:paste', 'snapshot:createTable', 'insertTextInHeaderFooter', 'moveTable', 'setSectionProps', 'setCellBorderFill', 'setFormValue', 'unknownFuture']) {
++    assert.equal(describeCollabUndo({ type }), null, type);
++  }
++});
++
++// ── 히스토리 배선 (소스 가드) ─────────────────────────────────────────
++
++test('히스토리: 경계마다 훅에 알리고, undo/redo 전에 막힘을 묻고 막히면 문서를 건드리지 않고 버린다', () => {
++  const h = source('src/engine/history.ts');
++  const execute = balancedFrom(h, 'execute(command: EditCommand, wasm: WasmBridge): DocumentPosition', '{');
++  assert.match(execute, /isNoOp\?\.\(\)\) \{[\s\S]*?this\.collab\?\.settled\(\);/);
++  assert.match(execute, /this\.undoStack\[this\.undoStack\.length - 1\] = merged;[\s\S]*?this\.collab\?\.recorded\(merged, last\);/);
++  assert.match(execute, /this\.undoStack\.push\(command\);[\s\S]*?this\.collab\?\.recorded\(command, null\);/);
++  const record = balancedFrom(h, 'recordWithoutExecute(command: EditCommand, wasm?: WasmBridge): void', '{');
++  assert.match(record, /this\.collab\?\.recorded\(merged, last\);/);
++  assert.match(record, /this\.collab\?\.recorded\(command, null\);/);
++  const undo = balancedFrom(h, 'undo(wasm: WasmBridge): DocumentPosition | null', '{');
++  const blocked = undo.indexOf("this.collab?.blocked(command, 'undo')");
++  assert.ok(blocked > 0 && blocked < undo.indexOf('command.undo(wasm)'), 'undo: 막힘 판정이 실행보다 먼저');
++  assert.match(undo, /if \(blocked !== null\) \{\s*this\.undoStack\.pop\(\);\s*command\.discard\?\.\(wasm\);\s*this\.collab\?\.rejected\(command, 'undo', blocked\);\s*return null;/);
++  assert.match(undo, /this\.redoStack\.push\(command\);\s*this\.collab\?\.undone\(command\);/);
++  const redo = balancedFrom(h, 'redo(wasm: WasmBridge): DocumentPosition | null', '{');
++  const rb = redo.indexOf("this.collab?.blocked(command, 'redo')");
++  assert.ok(rb > 0 && rb < redo.indexOf('command.execute(wasm)'), 'redo: 막힘 판정이 실행보다 먼저');
++  assert.match(redo, /this\.undoStack\.push\(command\);\s*this\.collab\?\.redone\(command\);\s*return cursorAfter;/);
++  // 훅을 걸 때 기록 중지를 풀고 스택을 비운다
++  assert.match(h, /setCollabHook\(hook: CollabHistoryHook \| null, wasm\?: WasmBridge\): void \{\s*this\.clear\(wasm\);\s*this\.collab = hook;\s*if \(hook\) this\.suspended = false;/);
++});
++
++// ── 호스트 (실행) ────────────────────────────────────────────────────
++
++function hostWith(enable: PluginHostDeps['enableCollabUndo'] | undefined) {
++  let captured: PluginHost | null = null;
++  const plugin: StudioPlugin = { id: 'probe', apiVersion: PLUGIN_API_VERSION, activate(host) { captured = host; return {}; } };
++  const deps = {
++    wasm: { borrowDocumentHandle: () => null, documentGeneration: 1 },
++    automation: { removeMenuItem: () => {}, unregisterCommand: () => {} },
++    eventBus: { on: () => () => {} },
++    getInputHandler: () => null,
++    loadDocument: async () => {},
++    createBlankDocument: async () => true,
++    resolve: async () => plugin,
++    ...(enable ? { enableCollabUndo: enable } : {}),
++  } as unknown as PluginHostDeps;
++  return { registry: new PluginHostRegistry(deps), host: () => captured! };
++}
++
++const fakeHook: CollabHistoryHook = { recorded() {}, settled() {}, blocked: () => null, rejected() {}, undone() {}, redone() {} };
++
++test('enableCollabUndo: 호스트로 넘기고 조작을 돌려주며, release 는 원장이 unload 때 한 번 회수한다', async () => {
++  const log: string[] = [];
++  const h = hostWith((id, hook) => {
++    log.push(`enable ${id} ${hook === fakeHook}`);
++    return {
++      controller: { stacks: () => ({ undo: [], redo: [] }), remove: () => {}, clear: () => log.push('clear'), describe: () => null },
++      release: () => log.push('release'),
++    };
++  });
++  await h.registry.load('probe');
++  const ctl = h.host().enableCollabUndo(fakeHook)!;
++  assert.ok(ctl);
++  ctl.clear();
++  assert.deepEqual(log, ['enable probe true', 'clear']);
++  await h.registry.unload('probe');
++  assert.deepEqual(log, ['enable probe true', 'clear', 'release']);
++  ctl.release();
++  assert.equal(log.filter((l) => l === 'release').length, 1);
++});
++
++test('enableCollabUndo: 호스트가 지원하지 않으면 null(플러그인은 suspendHistory 로 돌아간다)', async () => {
++  const h = hostWith(undefined);
++  await h.registry.load('probe');
++  assert.equal(h.host().enableCollabUndo(fakeHook), null);
++  await h.registry.unload('probe');
++});
++
++test('main.ts: enableCollabUndo 가 InputHandler 의 훅을 걸고 풀며, 입력기는 표(describeCollabUndo)를 넘긴다', () => {
++  const main = source('src/main.ts');
++  assert.match(main, /enableCollabUndo: \(_pluginId, hook\) => \{\s*const controller = inputHandler\?\.setCollabHistory\(hook\) \?\? null;[\s\S]{0,120}release: \(\) => \{ inputHandler\?\.setCollabHistory\(null\); \}/);
++  const ih = source('src/engine/input-handler.ts');
++  assert.match(balancedFrom(ih, 'setCollabHistory(hook: CollabHistoryHook | null)', '{'), /describe: \(command\) => describeCollabUndo\(command\)/);
 +});
 diff --git a/rhwp-studio/tsconfig.json b/rhwp-studio/tsconfig.json
 index 564f230e..8c680904 100644

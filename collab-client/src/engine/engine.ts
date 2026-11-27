@@ -38,6 +38,10 @@ export interface EngineDoc {
   collabLogicalToText(section: number, para: number, logical: number): string;
   collabTransform(pendingJson: string, remoteJson: string, catalogJson: string, caretJson: string): string;
   collabMapCaret(remoteJson: string, catalogJson: string, caretJson: string): string;
+  /** 4단계: 되돌리기 스택의 위치들을 기록 열 뒤로 옮긴다(순수 함수). */
+  collabMapPositions?(recsJson: string, catalogJson: string, itemsJson: string): string;
+  /** 4단계: 명령이 만든 기록 열의 발자국. */
+  collabFootprint?(entriesJson: string, catalogJson: string): string;
   collabDigest(): string;
   collabFlushLayout(): void;
   /** rhwp 배치 괄호 — 안의 편집은 쪽 배치(pagination)를 끝에 한 번만 한다(R1 감사: 쪽 소속 확정만 미룸). */
@@ -70,8 +74,28 @@ export interface ReceiveResult {
   /** 버린 기록(보정 전 원래 기록 — 충돌 지점부터, 재적용 실패면 보정된 기록) */
   droppedEntries?: Entry[];
   dropReason?: string;
+  /** 4단계: 버린 기록의 로컬 번호(`drainLocalLog` 의 `lid`). 한 기록이 보정으로 쪼개졌으면 같은 번호. */
+  droppedLids?: number[];
+  /**
+   * 4단계: 지금 문서 좌표를 새 좌표로 옮기는 지도 — 미확정이 없으면 원격 그대로, 있으면 원격을 남긴 미확정 뒤로
+   * 옮긴 열(빠른 경로면 적용한 R′). 되돌리기 스택의 위치를 이것으로 옮긴다(캐럿과 같은 지도).
+   */
+  remap?: Entry[];
   caret: TextCaret | null;
   error?: string;
+}
+
+/** 4단계: 로컬 기록 하나와 그 번호(명령 ↔ 기록 연결). */
+export interface LocalLogItem {
+  lid: number;
+  entry: Entry;
+}
+
+/** 4단계: 위치 하나(텍스트 좌표) — `collabMapPositions` 의 입력·출력. */
+export interface UndoPosition extends TextCaret {
+  bias?: 'before' | 'after';
+  /** 출력: 남의 기록이 닿았으면 첫 사유 */
+  hit?: 'touched' | 'gone' | 'structural' | 'whole' | null;
 }
 
 export interface EngineOptions {
@@ -124,6 +148,11 @@ export class CollabEngine {
   private snapshot: number | null = null;
   private acked: Entry[] = [];
   private unconfirmed: Entry[] = [];
+  /** 4단계: `unconfirmed` 와 같은 자리의 로컬 번호들(보내지 않은 state 를 새 state 가 덮으면 번호가 모인다). */
+  private lids: number[][] = [];
+  private nextLid = 1;
+  /** 4단계: 아직 호스트가 가져가지 않은 로컬 기록(명령 경계에서 `drainLocalLog`). */
+  private localLog: LocalLogItem[] = [];
   private sent = 0;
   /** 원격 적용·되감기·재생 중 — 이때의 호출은 기록하지 않는다. */
   private replaying = false;
@@ -173,6 +202,8 @@ export class CollabEngine {
     this.snapshot = null;
     this.acked = [];
     this.unconfirmed = [];
+    this.lids = [];
+    this.localLog = [];
     this.sent = 0;
   }
 
@@ -278,14 +309,25 @@ export class CollabEngine {
   }
 
   private push(entry: Entry): void {
+    const lid = this.nextLid++;
+    this.localLog.push({ lid, entry });
     // 보내지 않은 state 가 끝에 있으면 새 state 가 그것을 포함한다 — 마지막 것만 남긴다.
     const last = this.unconfirmed[this.unconfirmed.length - 1];
     if (entry.kind === 'state' && last?.kind === 'state' && this.unconfirmed.length > this.sent) {
       this.unconfirmed[this.unconfirmed.length - 1] = entry;
+      this.lids[this.lids.length - 1].push(lid);
     } else {
       this.unconfirmed.push(entry);
+      this.lids.push([lid]);
     }
     this.onLocal();
+  }
+
+  /** 4단계: 지난번 이후 생긴 로컬 기록(번호와 함께)을 가져간다. 명령 경계에서 부른다. */
+  drainLocalLog(): LocalLogItem[] {
+    const out = this.localLog;
+    this.localLog = [];
+    return out;
   }
 
   private ensureSnapshot(doc: EngineDoc): boolean {
@@ -313,6 +355,7 @@ export class CollabEngine {
   /** 서버가 내 기록 앞의 `n` 개를 확정했다. */
   ack(n: number): void {
     const done = this.unconfirmed.splice(0, Math.min(n, this.unconfirmed.length));
+    this.lids.splice(0, done.length);
     this.sent = Math.max(0, this.sent - done.length);
     this.acked.push(...done);
     if (this.unconfirmed.length === 0 && this.doc) {
@@ -381,7 +424,7 @@ export class CollabEngine {
         for (const e of remote) this.applyEntry(doc, e);
         this.ack(0); // 확정 대기열이 있으면 정리(미확정이 없으므로 지금 문서 = 확정)
         const mapped = caret ? JSON.parse(doc.collabMapCaret(JSON.stringify(remote), this.catalogFor(remote), JSON.stringify(caret))) : null;
-        return { ok: true, rebased: false, dropped: 0, caret: mapped };
+        return { ok: true, rebased: false, dropped: 0, droppedLids: [], remap: remote, caret: mapped };
       }
       if (this.snapshot === null) throw new Error('미확정이 있는데 스냅샷이 없습니다');
       const t0 = performance.now();
@@ -390,9 +433,12 @@ export class CollabEngine {
         JSON.stringify(pending), JSON.stringify(remote),
         this.catalogFor([...pending, ...remote]), JSON.stringify(caret),
       )) as {
-        pending: Entry[]; dropped: number[]; dropReasons: string[]; dropFrom: number | null; dropReason: string | null; caret: TextCaret | null;
-        fastRemote: Entry[] | null; fastBlock: string | null;
+        pending: Entry[]; origin?: number[]; dropped: number[]; dropReasons: string[]; dropFrom: number | null; dropReason: string | null; caret: TextCaret | null;
+        remoteAfter?: Entry[]; fastRemote: Entry[] | null; fastBlock: string | null;
       };
+      // 4단계: 보정된 미확정 각각의 로컬 번호(쪼개진 기록은 같은 번호)
+      const oldLids = this.lids;
+      const lidsOf = (j: number): number[] => oldLids[res.origin?.[j] ?? j] ?? [];
 
       // 빠른 경로 (R11): 지금 문서(S + 확정분 + 미확정)에 R' 를 바로 적용한다.
       if (this.fast && res.fastRemote) {
@@ -409,6 +455,7 @@ export class CollabEngine {
           const ackedBefore = this.acked;
           this.acked = [...ackedBefore, ...remote];
           this.unconfirmed = res.pending;
+          this.lids = res.pending.map((_, j) => lidsOf(j));
           this.sent = 0;
           if (this.verifyFast) this.verifyFastPath(doc, ackedBefore, remote, pending, fastRemote, res.pending, beforeDigest);
           if (this.unconfirmed.length === 0) {
@@ -418,7 +465,7 @@ export class CollabEngine {
           }
           this.fastStats.fast += 1;
           this.fastStats.fastMs += performance.now() - t0;
-          return { ok: true, rebased: true, fast: true, dropped: 0, droppedEntries: [], caret: res.caret };
+          return { ok: true, rebased: true, fast: true, dropped: 0, droppedEntries: [], droppedLids: [], remap: fastRemote, caret: res.caret };
         }
       }
       const why = res.fastBlock ?? (this.fast ? 'R′ 적용 실패' : '빠른 경로 꺼짐');
@@ -435,15 +482,19 @@ export class CollabEngine {
 
       // R13: 꼬리를 통째로 버리지 않는다 — 버린 것은 인덱스 목록이다(나머지는 res.pending 에 보정돼 있다).
       const droppedEntries: Entry[] = (res.dropped ?? []).map((i) => pending[i]);
+      const droppedLids = new Set<number>((res.dropped ?? []).flatMap((i) => oldLids[i] ?? []));
       let dropReason = res.dropReason ?? undefined;
       const kept: Entry[] = [];
+      const keptLids: number[][] = [];
       for (let i = 0; i < res.pending.length; i += 1) {
         try {
           this.applyEntry(doc, res.pending[i]);
           kept.push(res.pending[i]);
+          keptLids.push(lidsOf(i));
         } catch (error) {
           // 재적용이 실패하면 그것과 그 뒤를 버린다(뒤는 그 위에서 만들어졌다). 앞은 이미 적용됐다.
           droppedEntries.push(...res.pending.slice(i));
+          for (let j = i; j < res.pending.length; j += 1) for (const lid of lidsOf(j)) droppedLids.add(lid);
           const failed = res.pending[i];
           const what = failed.kind === 'op' ? `${failed.m}(${JSON.stringify(failed.a)})` : 'state';
           dropReason = `보정한 연산 재적용 실패: ${what}: ${error instanceof Error ? error.message : String(error)}`;
@@ -452,13 +503,14 @@ export class CollabEngine {
       }
       const dropped = droppedEntries.length;
       this.unconfirmed = kept;
+      this.lids = keptLids;
       this.sent = 0;
       if (kept.length === 0) {
         doc.collabSnapshotDiscard(this.snapshot);
         this.snapshot = null;
       }
       this.fastStats.slowMs += performance.now() - t0;
-      return { ok: true, rebased: true, dropped, droppedEntries, dropReason, caret: res.caret };
+      return { ok: true, rebased: true, dropped, droppedEntries, dropReason, droppedLids: [...droppedLids], remap: res.remoteAfter ?? remote, caret: res.caret };
     } catch (error) {
       return { ok: false, rebased: false, dropped: 0, caret, error: error instanceof Error ? error.message : String(error) };
     } finally {
@@ -515,6 +567,24 @@ export class CollabEngine {
   }
 
   /** 마지막으로 기록한 내 기록(다른 사람 커서를 옮기는 데 쓴다). */
+  /**
+   * 4단계: 위치들을 기록 열(지금 문서 좌표, 순서대로) 뒤로 옮긴다. 원격 열이면 `hit` 이 막힘 판정의 재료다.
+   * 문서가 없거나 WASM 이 이 보조를 모르면 `null`.
+   */
+  mapPositions(recs: readonly Entry[], items: readonly UndoPosition[]): UndoPosition[] | null {
+    const doc = this.doc;
+    if (!doc?.collabMapPositions) return null;
+    if (recs.length === 0 || items.length === 0) return items.map((it) => ({ ...it, hit: null }));
+    return JSON.parse(doc.collabMapPositions(JSON.stringify(recs), this.catalogFor(recs), JSON.stringify(items))) as UndoPosition[];
+  }
+
+  /** 4단계: 명령이 만든 기록 열의 발자국(기록이 끝난 문서 좌표). */
+  footprint(entries: readonly Entry[]): { items: UndoPosition[]; whole: boolean; nested: boolean } | null {
+    const doc = this.doc;
+    if (!doc?.collabFootprint) return null;
+    return JSON.parse(doc.collabFootprint(JSON.stringify(entries), this.catalogFor(entries)));
+  }
+
   get lastLocal(): Entry | null {
     return this.unconfirmed[this.unconfirmed.length - 1] ?? null;
   }

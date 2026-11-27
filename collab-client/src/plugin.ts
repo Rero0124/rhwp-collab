@@ -14,6 +14,7 @@ import { CollabEngine, type Entry, type EngineDoc, type TextCaret } from './engi
 import { CATALOG, ENGINE_FINGERPRINT } from './engine/catalog.ts';
 import { base64ToBytes, bytesToBase64 } from './engine/codec.ts';
 import { FONT_POLICY } from './engine/types.ts';
+import { CollabUndo } from './undo.ts';
 
 type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string };
 type ServerMessage =
@@ -104,6 +105,8 @@ export const collabPlugin = {
     const room = params.get('room') || 'demo';
     const name = params.get('name') || 'anon';
     const fast = params.get('collabFast') !== '0';
+    // 4단계: 공동편집 되돌리기(`&collabUndo=0` 이면 예전처럼 되돌리기를 멈춘다)
+    const undoEnabled = params.get('collabUndo') !== '0';
     /** 오래 끊김 안내 기준(시험에서 줄일 수 있다) */
     const longDisconnectMs = Number(params.get('collabLongDisconnectMs') ?? LONG_DISCONNECT_MS);
     const clientId = crypto.randomUUID();
@@ -155,7 +158,6 @@ export const collabPlugin = {
 
     // ── 숨은 기능: 자동 저장·되돌리기 중지, 기록 훅 ─────────────────────
     const resumeAutosave = host.suspendAutosave();
-    const resumeHistory = host.suspendHistory();
     // S3-1: 문서를 열기 전에 글꼴 정책을 건다 — 기기·브라우저가 달라도 같은 조판.
     const releaseFontPolicy = host.setFontPolicy(FONT_POLICY);
     let flushQueued = false;
@@ -168,6 +170,12 @@ export const collabPlugin = {
       onWarn: (m) => console.warn(`[collab ${name}] ${m}`),
       fast,
     });
+    // 4단계: 되돌리기는 내 편집만, 남이 같은 자리를 고쳤으면 막는다(docs/collab-stage4.md). studio 가 훅을 모르면
+    // (또는 꺼 두면) 예전처럼 되돌리기 기록을 멈춘다.
+    const undo = new CollabUndo(engine, (text) => notice(text, 'undo'));
+    const undoController = undoEnabled && typeof host.enableCollabUndo === 'function' ? host.enableCollabUndo(undo.hook) : null;
+    undo.attach(undoController);
+    const resumeHistory = undoController ? undoController.release : host.suspendHistory();
     const releaseIntercept = host.interceptDocumentCalls({
       methods: Object.keys(CATALOG),
       includeMutatingRegistry: true,
@@ -417,6 +425,8 @@ export const collabPlugin = {
         doc.collabLoadState(base64ToBytes(msg.base as string));
         engine.replayAll(msg.log);
       });
+      // 3.4: 문서가 통째로 바뀌었으니 되돌리기 위치는 의미가 없다
+      undo.clear();
       lastSeq = msg.seq;
       inflight = 0;
       inflightBatch = null;
@@ -516,6 +526,8 @@ export const collabPlugin = {
         requestResync(`원격 적용 실패: ${result.error}`);
         return false;
       }
+      // 4단계: 되돌리기 스택의 위치를 같은 지도로 옮기고 막힘을 판정, 버려진 편집의 명령을 뺀다
+      undo.onRemote(result);
       const caret = toPluginCaret(doc, result.caret, before);
       if (caret && before) host.setCaret(caret);
       for (const c of cursors.values()) c.caret = engine.mapCaret(msg.entries, c.caret);
@@ -710,6 +722,8 @@ export const collabPlugin = {
         fast: { enabled: fast, ...engine.fastStats, mismatches: engine.fastStats.mismatches.length },
       }),
       digest: () => handle()?.collabDigest() ?? '',
+      /** 4단계: 되돌리기 스택 상태(시험·진단용) */
+      undo: () => undo.debug(),
       /** 시험용(S3-4): 연결을 끊고 ms 동안 다시 붙지 않는다 — 그동안의 편집은 쌓였다가 다시 붙으면 보내진다. */
       simulateDisconnect: (ms = 0) => { reconnectHoldUntil = Date.now() + ms; ws?.close(); },
     };

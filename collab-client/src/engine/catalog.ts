@@ -3,7 +3,7 @@
 import type { CatalogEntry } from './types.ts';
 
 /** 엔진 지문: 업스트림 커밋-패치 해시-보정·기록 코드 해시-분류표 해시. 방의 참여자는 모두 같아야 한다. */
-export const ENGINE_FINGERPRINT = "981ce66b4183-54d21c92aa3f-2865265bc9ee-918b1ab60cc4";
+export const ENGINE_FINGERPRINT = "981ce66b4183-0c8fdd5bebd6-d6194d735d2f-1825141ec2aa";
 
 /** studio 합성 메서드(레지스트리에 있으나 export 가 아님). 내부에서 분류표의 export 를 부른다. */
 export const COMPOSED_METHODS: readonly string[] = ["setPageMargin","insertHyperlink","updateHyperlink","replaceHyperlinkText","removeHyperlink"];
@@ -3076,7 +3076,7 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
       "json"
     ],
     "section": null,
-    "why": "되돌리기 전용(명령 undo 가 테두리·배경 목록의 꼬리를 지운다) — 공동편집 중에는 되돌리기가 멈춰 studio 가 부르지 않는다. 불릴 일이 없으므로 결과 전송으로 둔다(R14)",
+    "why": "되돌리기 전용(셀 테두리·배경 명령의 undo 가 문서 전체 테두리·배경 목록의 꼬리를 개수로 지운다) — 결과 전송으로 둔다. 공동편집 되돌리기(4단계)는 이 명령을 뒤에 남의 편집이 하나라도 있으면 막는다(3.2-3, 남이 더한 테두리를 지울 수 있으므로)",
     "reviewed": true,
     "reach": "studio"
   },
@@ -3714,7 +3714,13 @@ export const CATALOG: Readonly<Record<string, CatalogEntry>> = {
       "runs_json"
     ],
     "section": 0,
-    "why": "구간 JSON 안에 본문 문단 오프셋이 있어 옮길 수 없다",
+    "roles": [
+      {
+        "kind": "anchor",
+        "arg": 1
+      }
+    ],
+    "why": "구간 JSON 안에 그 문단의 글자 오프셋이 있어 글자 단위로는 옮길 수 없다 — 문단 발자국(anchor)으로 그 문단을 고치는 편집과만 충돌하고 다른 문단 편집에는 문단 번호만 옮긴다(4단계: 글자 서식 되돌리기가 쓰는 연산)",
     "reviewed": true,
     "reach": "studio"
   },

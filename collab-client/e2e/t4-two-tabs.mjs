@@ -339,7 +339,8 @@ async function runAfter(browser) {
   record('굵게가 B 에 반영', boldB === true, `B bold=${boldB}`);
   await A.close(); await B.close();
 
-  // 12. 되돌리기 — 1단계 T5 는 복원 → desynced 였다. 2단계는 공동편집 중 되돌리기를 멈춘다(§6 suspendHistory).
+  // 12. 되돌리기 — 1단계 T5 는 복원 → desynced 였다. 2단계는 공동편집 중 되돌리기를 멈췄다(§6 suspendHistory).
+  // 4단계(docs/collab-stage4.md)부터는 내 편집만 되돌린다 — 남이 그 뒤 같은 자리를 고치지 않았으면 혼자일 때처럼.
   // 앞 탭들이 남긴 자동 저장 초안이 "문서 복구" 모달을 띄우지 않게 격리된 컨텍스트에서 연다.
   const room2 = `t4-undo-${Date.now()}`;
   const ctx = await browser.createBrowserContext();
@@ -352,13 +353,12 @@ async function runAfter(browser) {
   await selectRange(D, [0, 0], [0, 5]);
   await D.keyboard.press('Delete');
   await checkConverged([D, E], '되돌리기 대상 선택 삭제');
-  const beforeUndo = await D.evaluate(() => window.__collab.digest());
   await D.evaluate(() => window.rhwpStudio.automation.execute('edit:undo'));
-  await sleep(800);
+  await checkConverged([D, E], '되돌리기 뒤');
   const ds = await status(D);
-  const afterUndo = await D.evaluate(() => window.__collab.digest());
-  record('공동편집 중 되돌리기는 문서를 바꾸지 않고 desync 도 없음', !ds.desynced && beforeUndo === afterUndo,
-    ds.desynced ? ds.desyncReason : `digest ${beforeUndo === afterUndo ? '그대로' : '바뀜'}`);
+  const restored = await E.evaluate(() => window.__wasm.getTextRange(0, 0, 0, window.__wasm.getParagraphLength(0, 0)));
+  record('공동편집 중 되돌리기(4단계): 내 선택 삭제가 되돌려져 상대에도 반영, desync 없음', !ds.desynced && restored === 'undo target',
+    ds.desynced ? ds.desyncReason : `E 문단 0 = ${JSON.stringify(restored)}`);
   await ctx.close();
 }
 

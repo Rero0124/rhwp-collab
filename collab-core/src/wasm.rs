@@ -106,6 +106,23 @@ impl HwpDocument {
         Ok(super::ot::map_caret_through(&remote, &catalog, &caret).to_string())
     }
 
+    /// 4단계: 되돌리기 스택의 위치들을 기록 열 뒤로 옮긴다(순수 함수). 결과는 위치마다 `{…, hit}`.
+    #[wasm_bindgen(js_name = collabMapPositions)]
+    pub fn collab_map_positions(&self, recs_json: &str, catalog_json: &str, items_json: &str) -> Result<String, JsValue> {
+        let recs = parse(recs_json, "recs")?.as_array().cloned().unwrap_or_default();
+        let catalog = parse(catalog_json, "catalog")?;
+        let items = parse(items_json, "items")?.as_array().cloned().unwrap_or_default();
+        Ok(super::ot::map_positions(&recs, &catalog, &items).to_string())
+    }
+
+    /// 4단계: 명령이 만든 기록 열의 발자국 `{items, whole, nested}`(순수 함수).
+    #[wasm_bindgen(js_name = collabFootprint)]
+    pub fn collab_footprint(&self, entries_json: &str, catalog_json: &str) -> Result<String, JsValue> {
+        let entries = parse(entries_json, "entries")?.as_array().cloned().unwrap_or_default();
+        let catalog = parse(catalog_json, "catalog")?;
+        Ok(super::ot::footprint(&entries, &catalog).to_string())
+    }
+
     /// 문서 모델의 지문(hex, 캐럿 제외).
     #[wasm_bindgen(js_name = collabDigest)]
     pub fn collab_digest(&self) -> String {

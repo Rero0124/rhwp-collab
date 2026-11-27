@@ -19,11 +19,12 @@ import { CollabUndo } from './undo.ts';
 import {
   AuthSession, buildHello, editLevel,
   type ForbiddenMessage, type SessionUser, type TokenProvider, type UnauthorizedMessage, type UnauthorizedReason,
+  roundtripText, type RoundtripResult,
 } from './session/index.ts';
 
 type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string; replaced?: boolean };
 type ServerMessage =
-  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number; user?: SessionUser; allowEncrypted?: boolean; encryptedSource?: boolean }
+  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number; user?: SessionUser; allowEncrypted?: boolean; encryptedSource?: boolean; roundtrip?: RoundtripResult }
   // 6단계 S1: `replaced` 면 서버가 그 묶음의 state 를 모델에서 다시 쓴 바이트로 바꿔 기록했다(entries 가 바뀐 것)
   | { type: 'ops'; seq: number; clientId: string; entries: Entry[]; batchId?: string; replaced?: boolean }
   | { type: 'catchup'; seq: number; log: LogItem[]; maxMessageBytes?: number; cont?: boolean; user?: SessionUser }
@@ -186,6 +187,64 @@ function askDisplayName(): string {
 /** studio 의 토큰 공급자: 링크로 받은 토큰을 그대로. 링크 하나로는 새 토큰을 받을 길이 없다(만료면 다시 열어야 함). */
 const studioTokenProvider = (token: string | null): TokenProvider => ({ reason }) => (reason === 'expired' ? null : token);
 
+// ── 6단계 S3: 부품 전용 모드 (docs/collab-protocol.md §7) ───────────────────────────────────
+// 서버가 부품 전용(COLLAB_EMBED_ONLY)이면 편집기는 허용된 부모 페이지의 iframe 안에서만 쓰인다. 토큰은 주소에서 받지 않고,
+// 부모가 studio 의 embed 통로(출처가 고정된 MessagePort)로 `plugin.invoke({id:'collab', method:'setToken', args:[토큰]})` 를
+// 불러 넣는다. 토큰이 필요할 때 플러그인은 부모에게 비밀 없는 알림만 보낸다.
+const EMBED_TOKEN_TIMEOUT_TEXT = '바깥 시스템에서 접속 정보를 받지 못했습니다';
+const EMBED_TOP_LEVEL_TEXT = '이 편집기는 연결된 시스템 안에서만 열 수 있습니다';
+const EMBED_TOKEN_WAIT_MS = 30_000;
+interface EmbedInfo { embedOnly: boolean; origins: string[] }
+
+/** 공동편집 서버의 /healthz(ws 주소의 http 짝)로 부품 전용 모드와 허용 출처를 본다. 답을 못 받으면 부품 전용이 아닌 것으로 본다. */
+async function fetchEmbedInfo(wsUrl: string): Promise<EmbedInfo> {
+  try {
+    const u = new URL(wsUrl);
+    u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+    u.pathname = '/healthz';
+    u.search = '';
+    u.hash = '';
+    const body = await (await fetch(u.href, { cache: 'no-store' })).json() as { embedOnly?: unknown; embedOrigins?: unknown };
+    return {
+      embedOnly: body?.embedOnly === true,
+      origins: Array.isArray(body?.embedOrigins) ? body.embedOrigins.filter((o): o is string => typeof o === 'string') : [],
+    };
+  } catch {
+    return { embedOnly: false, origins: [] };
+  }
+}
+
+/**
+ * 부모가 넣는 토큰을 기다리는 통로. 알림(`rhwp-collab-token-request`)에는 room·reason 말고는 싣지 않는다. 대상 출처는
+ * ① location.ancestorOrigins[0] 이 허용 목록에 있으면 그것 ② 그 기능이 없고 허용 출처가 하나면 그것 ③ 그 밖에만 '*'.
+ */
+function embedTokenChannel(room: string, waitMs: number, onTimeout: () => void) {
+  let origins: string[] = [];
+  let latest: string | null = null;
+  const waiters = new Set<(token: string) => void>();
+  const target = (): string => {
+    const ancestors = (window.location as Location & { ancestorOrigins?: DOMStringList }).ancestorOrigins;
+    const first = ancestors && ancestors.length > 0 ? ancestors[0] : null;
+    if (first && origins.includes(first)) return first;
+    if (!ancestors && origins.length === 1) return origins[0];
+    return '*';
+  };
+  return {
+    setOrigins(list: string[]) { origins = list; },
+    provide(token: string) { latest = token; for (const w of [...waiters]) w(token); },
+    get(reason: 'connect' | 'reconnect' | 'expired'): Promise<string | null> {
+      if (reason !== 'expired' && latest) return Promise.resolve(latest);
+      if (reason === 'expired') latest = null;
+      try { window.parent.postMessage({ type: 'rhwp-collab-token-request', room, reason }, target()); } catch { /* 부모가 없음 */ }
+      return new Promise((resolve) => {
+        const done = (token: string) => { clearTimeout(timer); waiters.delete(done); resolve(token); };
+        const timer = setTimeout(() => { waiters.delete(done); onTimeout(); resolve(null); }, waitMs);
+        waiters.add(done);
+      });
+    },
+  };
+}
+
 /** 보안 컨텍스트가 아니면 들어가지 않고 안내만 띄운다(아무것도 중지·가로채지 않는다). */
 function insecureSurface(): PluginSurface {
   const banner = document.createElement('div');
@@ -215,7 +274,21 @@ export const collabPlugin = {
     const entry = readStudioEntry();
     const { url, room } = entry;
     let name = entry.name;
-    const auth = new AuthSession({ room, getToken: studioTokenProvider(entry.token) });
+    // 6단계 S3: 부품 전용 서버면 주소의 #token 은 쓰지 않고 부모 페이지가 setToken 으로 넣는 토큰만 쓴다.
+    let embedOnly: boolean | null = null; // 서버 답을 받기 전에는 모름
+    const embedChannel = embedTokenChannel(room, Number(params.get('collabTokenWaitMs') ?? EMBED_TOKEN_WAIT_MS), () => leave(EMBED_TOKEN_TIMEOUT_TEXT));
+    const embedInfo = fetchEmbedInfo(url).then((info) => { embedOnly = info.embedOnly; embedChannel.setOrigins(info.origins); return info; });
+    const linkProvider = studioTokenProvider(entry.token);
+    const auth = new AuthSession({
+      room,
+      getToken: async (req) => {
+        const info = await embedInfo;
+        if (!info.embedOnly) return linkProvider(req);
+        // Sec-Fetch 를 보내지 않는 브라우저를 위한 두 번째 장치(서버의 403 안내가 먼저 막는다)
+        if (window.top === window.self) { leave(EMBED_TOP_LEVEL_TEXT); return null; }
+        return embedChannel.get(req.reason);
+      },
+    });
     const fast = params.get('collabFast') !== '0';
     // 4단계: 공동편집 되돌리기(`&collabUndo=0` 이면 예전처럼 되돌리기를 멈춘다)
     const undoEnabled = params.get('collabUndo') !== '0';
@@ -581,6 +654,7 @@ export const collabPlugin = {
     const onWelcome = async (msg: Extract<ServerMessage, { type: 'welcome' }>) => {
       onAdmitted(msg.user);
       if (msg.encryptedSource) noticeEncrypted();
+      if (msg.roundtrip && !msg.roundtrip.ok) noticeRoundtrip(msg.roundtrip);
       if (typeof msg.maxMessageBytes === 'number') maxMessageBytes = msg.maxMessageBytes;
       if (typeof msg.generation === 'number') generation = msg.generation;
       // S3-4: 다시 붙었는데 서버가 따라잡기를 못 해 주면(기준점이 그 뒤로 옮겨 감) 재동기화와 같다 — 미확정을 버린다.
@@ -785,6 +859,9 @@ export const collabPlugin = {
     let encryptedNoticed = false;
     /** D5: 원래 암호 문서였다는 경고를 한 번 */
     const noticeEncrypted = () => { if (!encryptedNoticed) { encryptedNoticed = true; notice(ENCRYPTED_NOTICE, 'encrypted-source'); } };
+    /** 6단계 S2: 방을 열 때의 왕복 점검에 경고가 있던 문서 — 처음 들어올 때 한 번 */
+    let roundtripNoticed = false;
+    const noticeRoundtrip = (rt: RoundtripResult) => { if (!roundtripNoticed) { roundtripNoticed = true; notice(roundtripText(rt), 'roundtrip'); } };
     /** 방에 들어갔다: 서버가 확인한 이름·권한을 받는다(인증을 끈 서버는 user 가 없다). */
     const onAdmitted = (user: SessionUser | undefined) => {
       auth.admitted(user ?? null);
@@ -800,6 +877,7 @@ export const collabPlugin = {
     /** unauthorized: 만료면 한 번 새 토큰으로 다시 붙고(닫힘 처리의 재접속이 새 토큰을 쓴다), 아니면 멈추고 안내한다. */
     const onUnauthorized = async (reason: string) => {
       const decision = await auth.onUnauthorized(reason);
+      if (left) return; // 토큰을 기다리다 이미 나갔다(부품 전용 모드의 시간 제한) — 그 안내를 덮지 않는다
       if (decision.action !== 'give-up') { log(`인증 ${reason} → ${decision.action === 'reconnect' ? '새 토큰으로 다시 붙음' : '다시 붙음(백오프)'}`); return; }
       const unsent = engine.pendingCount;
       const text = UNAUTHORIZED_TEXT[decision.reason];
@@ -955,8 +1033,27 @@ export const collabPlugin = {
       undo: () => undo.debug(),
       /** 시험용(S3-4): 연결을 끊고 ms 동안 다시 붙지 않는다 — 그동안의 편집은 쌓였다가 다시 붙으면 보내진다. */
       simulateDisconnect: (ms = 0) => { reconnectHoldUntil = Date.now() + ms; ws?.close(); },
+      /** 6단계 S3: 부모 페이지가 embed 통로로 토큰을 넣는다(부품 전용 모드에서만 쓰인다). 넣는 방향만 있다. */
+      setToken: (token: unknown) => {
+        if (embedOnly === false || typeof token !== 'string' || !token) return false;
+        embedChannel.provide(token);
+        return true;
+      },
     };
     (window as unknown as { __collab?: typeof surface }).__collab = surface;
+    // plugin.invoke 로 부를 수 있는 표면: 부품 전용 모드에서는 setToken 만 — 토큰·사용자 정보·문서를 읽어 가는 메서드를 두지
+    // 않는다(port 가 묶이기 전의 legacy 통로는 출처 고정이 없다). 서버 답을 받기 전에도 막는다.
+    const notInEmbed = <A extends unknown[], R>(fn: (...a: A) => R) => (...a: A): R => {
+      if (embedOnly !== false) throw new Error('부품 전용 모드에서는 쓸 수 없는 메서드입니다');
+      return fn(...a);
+    };
+    const invokable = {
+      setToken: surface.setToken,
+      status: notInEmbed(surface.status),
+      digest: notInEmbed(surface.digest),
+      undo: notInEmbed(surface.undo),
+      simulateDisconnect: notInEmbed(surface.simulateDisconnect),
+    };
     teardown = () => {
       clearInterval(cursorTimer);
       for (const c of cursors.values()) c.el?.remove();
@@ -978,7 +1075,7 @@ export const collabPlugin = {
       banner?.remove();
       delete (window as unknown as { __collab?: unknown }).__collab;
     };
-    return surface;
+    return invokable;
   },
 
   deactivate() {

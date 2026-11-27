@@ -180,6 +180,10 @@ COLLAB_DATA_DIR=./data node server/server.mjs
 | `COLLAB_AUTH_SECRET` | 없음 | `hs256` 비밀키(32바이트 이상). `COLLAB_AUTH_SECRET_FILE` 로 파일에서 읽을 수도 있습니다 |
 | `COLLAB_AUTH_URL` | 없음 | `url` 방식에서 `{token, room}` 을 POST 할 주소. `{ok, sub, name, scope}` 를 돌려줘야 합니다 |
 | `COLLAB_INVITE_TTL` | `24h` | 방을 만들 때 서버가 만드는 초대 링크의 수명(`hs256` 만). `30m`, `7d`, 초 단위 숫자 |
+| `COLLAB_ROLE_MAP` | 없음 | 바깥 시스템의 역할 이름 → 권한 매핑표(JSON 파일, 예: `{"작성자":"edit","검토자":"comment","열람자":"view"}`). 표에 모르는 권한 이름이 있으면 시작하지 않습니다 |
+| `COLLAB_EMBED_ONLY` | 없음 | `1` 이면 부품 전용 모드: 편집기는 `COLLAB_EMBED_ORIGINS` 의 페이지 안(iframe)에서만 열리고, 업로드 페이지와 "공동편집 시작" 메뉴는 꺼집니다 |
+| `COLLAB_EMBED_ORIGINS` | 없음 | 편집기를 넣을 수 있는 부모 페이지 출처(쉼표로 구분, 예: `https://docs.example.com`) |
+| `COLLAB_ROUNDTRIP` | `warn` | 파일로 방을 만들 때 rhwp 가 문서의 모든 부분을 다룰 수 있는지 점검합니다. `warn` 은 결과를 알리고 방을 만들고, `block` 은 통과하지 못한 문서로 방을 만들지 않고, `off` 는 점검하지 않습니다 |
 | `COLLAB_ALLOW_ENCRYPTED` | 없음 | `1` 이면 암호 문서로도 방을 엽니다. 문서 암호는 방을 만들 때 요청 머리 `X-Collab-Document-Password` 로 한 번 받고 저장하지 않습니다. 역방향 프록시가 요청 머리를 기록하지 않게 설정하세요. 그 방의 문서는 암호가 풀린 상태로 저장되고 오갑니다(기본은 거절) |
 | `COLLAB_ALLOWED_ORIGINS` | 없음 | 쉼표로 구분한 출처 목록. 있으면 그 밖의 브라우저 출처에서 오는 WebSocket·방 만들기를 거절합니다. 같은 출처는 언제나 허용합니다 |
 | `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | 없음 | PEM 인증서와 키 파일. 둘 다 있으면 HTTPS/wss 로 뜹니다 |
@@ -221,6 +225,10 @@ location / {
 - **방 만들기:** `POST /rooms`(본문 = HWP/HWPX 파일, `create` 권한 토큰) → `{room, invite}`. 사용자에게
   `https://호스트/?collab#token=…&room=…` 링크를 줍니다.
 - **문서 받기:** `GET /rooms/<방>/document` → 최신 문서 파일.
+- **역할 그대로 쓰기:** 바깥 시스템의 역할 이름(예: 작성자·검토자·열람자)을 토큰의 `roles` 나 확인 답에 그대로 주고,
+  `COLLAB_ROLE_MAP` 매핑표로 권한을 정할 수 있습니다. 표에 없는 역할은 아무 권한도 받지 못합니다.
+- **화면 안에 넣기:** `COLLAB_EMBED_ONLY=1` 이면 편집기는 허용한 페이지의 iframe 안에서만 열리고, 토큰은 그 페이지가
+  편집기에 직접 넣습니다(주소에 싣지 않음). 부모 페이지 예시는 규약 §7 에 있습니다.
 - 메시지 형식, 이유 코드, 재접속 절차는 [공동편집 규약](docs/collab-protocol.md)에 있습니다. 네이티브 클라이언트도 이 문서를
   따릅니다.
 

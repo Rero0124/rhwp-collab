@@ -15,6 +15,7 @@
  * studio 를 import 하지 않는다 — 타입만(`plugin/types.ts`).
  */
 import type { PluginHost, PluginSurface, StudioPlugin } from '@/plugin/types';
+import { roundtripBlockedText, roundtripText, type RoundtripResult } from './session/roundtrip.ts';
 
 /** studio 개발 서버(`COLLAB_DEV_SERVER`)의 공동편집 서버 ws 주소 — 빌드·시험에서는 비거나 없다(같은 출처). */
 declare const __CC_RHWP_COLLAB_DEV_WS__: string | undefined;
@@ -38,8 +39,10 @@ export interface ServerHealth { auth: ServerAuth; encryptedAllowed: boolean }
 /** `/healthz` 답 → 서버 정보. 공동편집 서버의 답이 아니거나 모르는 인증 방식이면 `null`. */
 export function parseHealth(body: unknown): ServerHealth | null {
   if (!body || typeof body !== 'object') return null;
-  const b = body as { ok?: unknown; auth?: unknown; encryptedAllowed?: unknown };
+  const b = body as { ok?: unknown; auth?: unknown; encryptedAllowed?: unknown; embedOnly?: unknown };
   if (b.ok !== true || (b.auth !== 'none' && b.auth !== 'hs256' && b.auth !== 'url')) return null;
+  // 6단계 S3: 부품 전용 서버는 방을 바깥 시스템이 만든다 — 메뉴를 내지 않는다
+  if (b.embedOnly === true) return null;
   return { auth: b.auth, encryptedAllowed: b.encryptedAllowed === true };
 }
 
@@ -75,7 +78,7 @@ export function takeCreateToken(hash: string, store: StoreLike | null, replace: 
   try { return store?.getItem(CREATE_TOKEN_KEY) || null; } catch { return null; }
 }
 
-export interface CreatedRoom { room: string; invite?: Record<string, string>; inviteExpiresAt?: string }
+export interface CreatedRoom { room: string; invite?: Record<string, string>; inviteExpiresAt?: string; roundtrip?: RoundtripResult }
 export interface InviteLink { scope: string; label: string; hint: string; url: string }
 
 /**
@@ -99,10 +102,12 @@ export function inviteLinks(editor: string, created: CreatedRoom, wsUrl = ''): I
 }
 
 /** 방 만들기 실패를 사람이 읽는 말로(서버 답 `{error, reason, message}`). */
-export function createErrorText(status: number, body: { error?: string; reason?: string; message?: string } | null): string {
+export function createErrorText(status: number, body: { error?: string; reason?: string; message?: string; roundtrip?: RoundtripResult } | null): string {
   if (status === 401) return '방을 만들 수 있는 토큰(create)이 필요합니다';
   if (status === 403) return '이 토큰으로는 방을 만들 수 없습니다(create 권한 없음)';
   if (body?.error === 'encrypted' || body?.reason === 'encrypted') return ENCRYPTED_TEXT;
+  // 6단계 S2: COLLAB_ROUNDTRIP=block 서버는 rhwp 가 다 다루지 못하는 문서로 방을 만들지 않는다
+  if (body?.error === 'roundtrip') return roundtripBlockedText(body.roundtrip);
   if (status === 413) return '문서가 너무 커서 방을 만들 수 없습니다';
   if (status === 415 || status === 422) return '문서를 열지 못해 방을 만들 수 없습니다';
   return `방을 만들지 못했습니다(${status}${body?.message ? `: ${body.message}` : ''})`;
@@ -240,6 +245,8 @@ export const collabLauncherPlugin = {
           body.append(row);
         }
         if (created.inviteExpiresAt) body.append(el('p', { style: 'color:#666' }, `링크는 ${new Date(created.inviteExpiresAt).toLocaleString()}까지 쓸 수 있습니다.`));
+        // 6단계 S2: 왕복 점검 결과(서버에 보조가 있을 때만 온다)
+        if (created.roundtrip) body.append(el('p', { 'data-collab': 'launcher-roundtrip', style: created.roundtrip.ok ? 'color:#666' : 'color:#a60' }, roundtripText(created.roundtrip)));
         const enter = el('button', { type: 'button', 'data-collab': 'launcher-enter' }, '이 방으로 들어가기');
         const edit = links.find((l) => l.scope === 'edit') ?? links[0];
         enter.addEventListener('click', () => {

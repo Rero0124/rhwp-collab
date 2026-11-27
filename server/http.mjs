@@ -116,13 +116,14 @@ export async function resolveStatic(root, urlPath) {
 }
 
 /** 정적 파일 응답. 해시가 붙은 assets/ 는 오래 캐시하고, 그 밖(index.html 등)은 매번 확인한다. */
-function serveFile(req, res, { file, stat }, { cache } = {}) {
+function serveFile(req, res, { file, stat }, { cache, headers: extraHeaders = {} } = {}) {
   const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
   const headers = {
     'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
     'cache-control': cache ?? 'no-cache',
     etag,
     'x-content-type-options': 'nosniff',
+    ...extraHeaders,
   };
   if (req.headers['if-none-match'] === etag) {
     res.writeHead(304, headers);
@@ -140,7 +141,19 @@ function serveFile(req, res, { file, stat }, { cache } = {}) {
  *   staticDir?: string|null, maxBodyBytes: number, originAllowed(req): boolean, log(m: string): void,
  * }} opts
  */
-export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originAllowed, log, health = () => ({}) }) {
+/** 6단계 S3: 부품 전용 모드에서 최상위로 연 편집기 요청에 주는 안내 페이지 */
+const EMBED_ONLY_PAGE = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>공동편집</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:16px/1.6 system-ui,sans-serif;background:#f6f7f9;color:#1d2330}
+@media (prefers-color-scheme:dark){body{background:#14171c;color:#e6e9ef}}main{max-width:520px;padding:24px 16px;text-align:center}</style></head>
+<body><main><h1 style="font-size:20px">이 편집기는 연결된 시스템 안에서만 열 수 있습니다</h1><p>문서를 연 시스템의 화면으로 돌아가 다시 열어 주세요.</p></main></body></html>`;
+
+/**
+ * @param {object} opts
+ * @param {null | { origins: string[] }} [opts.embedOnly] 6단계 S3 부품 전용 모드: 편집기 HTML 에 CSP frame-ancestors, 최상위
+ *   탐색(Sec-Fetch-Dest: document)은 403 안내 페이지, 업로드 페이지 끔
+ */
+export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originAllowed, log, health = () => ({}), embedOnly = null }) {
+  const frameAncestors = embedOnly ? { 'content-security-policy': `frame-ancestors ${embedOnly.origins.join(' ')}` } : {};
   return async (req, res) => {
     let url;
     try { url = new URL(req.url ?? '/', 'http://x'); } catch { return sendJson(res, 400, { error: 'bad-url' }); }
@@ -171,14 +184,28 @@ export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originA
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method' }, { allow: 'GET, HEAD' });
       // 서버 상태와 설정 요약(비밀이 아닌 것만) — studio 의 공동편집 시작 메뉴가 메뉴를 보일지·토큰이 필요한지 정한다
-      if (pathname === '/healthz') return sendJson(res, 200, { ok: true, ...health() });
-      if (pathname === '/upload' || pathname === '/upload.html') {
+      // 비밀이 아니므로 다른 출처(개발용 편집기 서버 등)에서도 읽게 둔다 — 쿠키 없이, 읽기만
+      if (pathname === '/healthz') return sendJson(res, 200, { ok: true, ...health() }, { 'access-control-allow-origin': '*' });
+      if ((pathname === '/upload' || pathname === '/upload.html') && !embedOnly) {
         const stat = await fs.stat(UPLOAD_PAGE);
         return serveFile(req, res, { file: UPLOAD_PAGE, stat });
       }
       if (staticDir) {
         const found = await resolveStatic(staticDir, pathname);
-        if (found) return serveFile(req, res, found, { cache: pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache' });
+        if (found) {
+          const html = found.file.endsWith('.html');
+          // S3: 부품 전용 모드의 편집기 문서는 허용된 부모의 iframe 안에서만. 최상위로 열면 안내 페이지(Sec-Fetch 를 보내지 않는
+          // 오래된 브라우저는 frame-ancestors 와 플러그인의 최상위 창 확인이 막는다).
+          if (embedOnly && html && req.headers['sec-fetch-dest'] === 'document') {
+            const body = Buffer.from(EMBED_ONLY_PAGE);
+            res.writeHead(403, { 'content-type': 'text/html; charset=utf-8', 'content-length': body.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+            return res.end(req.method === 'HEAD' ? undefined : body);
+          }
+          return serveFile(req, res, found, {
+            cache: pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+            headers: html ? frameAncestors : {},
+          });
+        }
       }
       return sendJson(res, 404, { error: 'not-found' });
     } catch (error) {

@@ -71,3 +71,13 @@ test('판단(새 토큰 받기) 중에 다시 붙으면 hello 토큰은 판단�
   assert.deepEqual(await decision, { action: 'reconnect' });
   assert.equal(await next, 'fresh');
 });
+
+test('왕복 점검 문구(6단계 S2): 통과, 경고(종류 이름·개수, 없으면 내용 차이), block 거절', async () => {
+  const { roundtripText, roundtripBlockedText, ROUNDTRIP_OK_TEXT } = await import('../src/session/index.ts');
+  assert.equal(roundtripText({ ok: true, lost: [], irDiff: 0 }), ROUNDTRIP_OK_TEXT);
+  assert.equal(roundtripText({ ok: false, lost: [{ kind: 'ole-clsid', count: 2 }, { kind: 'mystery', count: 1 }], irDiff: 0 }),
+    '이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다: OLE 개체 2개, mystery 1개. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다');
+  assert.match(roundtripText({ ok: false, lost: [], irDiff: 4 }), /내용 차이 4곳/);
+  assert.equal(roundtripBlockedText({ ok: false, lost: [{ kind: 'record', count: 3 }], irDiff: 0 }), 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다: rhwp 가 모르는 레코드 3개');
+  assert.equal(roundtripBlockedText(null), 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다');
+});

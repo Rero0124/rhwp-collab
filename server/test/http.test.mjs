@@ -149,3 +149,41 @@ test('/healthz: 확인 방식과 암호 문서 허용 여부(비밀이 아닌 �
     await server.close();
   }
 });
+
+test('부품 전용 모드(6단계 S3): 편집기 HTML 에 frame-ancestors, 최상위 탐색은 403 안내, iframe 은 통과, 업로드 페이지 끔, healthz 에 embedOnly', async () => {
+  const { site } = fakeStudio();
+  const origins = ['https://host.example', 'http://127.0.0.1:7710'];
+  const server = startServer({ port: 0, log: () => {}, canonical: false, staticDir: site, embedOnly: true, embedOrigins: origins });
+  await server.ready;
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    let res = await fetch(`${base}/`, { headers: { 'sec-fetch-dest': 'document' } });
+    assert.equal(res.status, 403, '최상위로 열면');
+    assert.match(await res.text(), /연결된 시스템 안에서만 열 수 있습니다/);
+    res = await fetch(`${base}/?collab`, { headers: { 'sec-fetch-dest': 'iframe' } });
+    assert.equal(res.status, 200, 'iframe 안');
+    assert.equal(res.headers.get('content-security-policy'), `frame-ancestors ${origins.join(' ')}`);
+    res = await fetch(`${base}/`); // Sec-Fetch 를 보내지 않는 브라우저 — frame-ancestors 와 플러그인이 막는다
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get('content-security-policy'));
+    res = await fetch(`${base}/assets/index-abc123.js`, { headers: { 'sec-fetch-dest': 'script' } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-security-policy'), null, 'HTML 이 아닌 파일에는 싣지 않음');
+    assert.equal((await fetch(`${base}/upload`)).status, 404, '업로드 페이지 끔');
+    assert.deepEqual(await (await fetch(`${base}/healthz`)).json(), { ok: true, auth: 'none', encryptedAllowed: false, embedOnly: true, embedOrigins: origins });
+  } finally {
+    await server.close();
+  }
+  // 부품 전용이 아니면 아무것도 붙이지 않는다
+  const plain = startServer({ port: 0, log: () => {}, canonical: false, staticDir: site });
+  await plain.ready;
+  try {
+    const res = await fetch(`http://127.0.0.1:${plain.port}/`, { headers: { 'sec-fetch-dest': 'document' } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-security-policy'), null);
+  } finally {
+    await plain.close();
+  }
+  assert.throws(() => startServer({ port: 0, log: () => {}, canonical: false, embedOnly: true }), /COLLAB_EMBED_ORIGINS/);
+  assert.throws(() => startServer({ port: 0, log: () => {}, canonical: false, embedOnly: true, embedOrigins: ['https://host.example/path'] }), /출처/);
+});

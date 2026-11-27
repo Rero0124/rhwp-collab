@@ -135,7 +135,7 @@ export class LocalDocStore {
   }
 
   /** 새 기준점(방 생성·세대 전환): base 를 원자적으로 쓰고 meta 를 바꾼 뒤 기록을 비운다. 저장본 정보는 유지. */
-  async setBase(room, { baseSeq, data, engine, generation, encryptedSource }) {
+  async setBase(room, { baseSeq, data, engine, generation, encryptedSource, roundtrip }) {
     const dir = this.dir(room);
     await fs.mkdir(dir, { recursive: true });
     const baseFormat = formatOf(data);
@@ -146,7 +146,9 @@ export class LocalDocStore {
     /** @type {Meta} */
     // encryptedSource(5단계 D5): 원래 암호 문서였다 — 주지 않으면 앞 세대의 값을 잇는다(세대 전환)
     const enc = encryptedSource ?? prev?.encryptedSource ?? false;
-    const meta = { room, generation, baseSeq, engine, baseFormat, docSeq: prev?.docSeq ?? null, docFormat: prev?.docFormat ?? null, ...(enc ? { encryptedSource: true } : {}), savedAt: new Date().toISOString() };
+    // roundtrip(6단계 S2): 방을 열 때의 왕복 점검 결과 — 주지 않으면 앞 세대의 값을 잇는다
+    const rt = roundtrip ?? prev?.roundtrip ?? null;
+    const meta = { room, generation, baseSeq, engine, baseFormat, docSeq: prev?.docSeq ?? null, docFormat: prev?.docFormat ?? null, ...(enc ? { encryptedSource: true } : {}), ...(rt ? { roundtrip: rt } : {}), savedAt: new Date().toISOString() };
     await writeAtomic(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 1));
     await writeAtomic(path.join(dir, 'log.jsonl'), '');
     return meta;

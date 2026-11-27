@@ -74,11 +74,18 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 바이트에 끼워 보내면 판정을 지나 다른 참여자가 그 바이트를 그대로 읽게 되기 때문이다(한글 문서에 끼운 악성 레코드는 실제로
 쓰이는 공격 경로다). 좁은 권한의 편집은 모두 `op` 로 보낸다. 클라이언트 문(§4.8)이 `state` 가 될 호출을 막는다.
 
+**역할 매핑(`COLLAB_ROLE_MAP`, 6단계 S3).** 바깥 시스템이 자기 역할 이름을 그대로 주면 서버가 매핑표(JSON 파일,
+`{"작성자": "edit", "검토자": "comment", "열람자": "view"}` — 값은 공백 구분 문자열 또는 배열)로 권한으로 바꾼다. 토큰의
+`roles` 클레임(배열, 또는 역할 하나의 문자열)이나 url 확인 답의 `roles` 가 그 자리다. 여러 역할이면 합치고, `scope` 도 있으면
+함께 합친다. **표에 없는 역할은 아무 권한도 주지 않는다**(기본 거부). `roles` 만 있고 표가 없거나 하나도 맞지 않으면 권한이
+없다(`edit` 로 넓히지 않는다 — `scope` 도 `roles` 도 없을 때만 `edit`). 표에 모르는 권한 이름이 있으면 서버가 시작하지 않는다.
+역할 이름은 기록·로그에 남기지 않고, 최종 권한만 `welcome.user.scope` 로 알린다.
+
 ### 2.3 바깥 시스템에 맡기기 (`COLLAB_AUTH=url`)
 
 서버는 `COLLAB_AUTH_URL` 에 `POST {token, room}` 을 보낸다(방 만들기 API 는 `room: null`). 답은 다음 중 하나다.
 
-- `{ok: true, sub, name?, scope?}` — 통과. `scope` 는 위와 같은 형식이다.
+- `{ok: true, sub, name?, scope?, roles?}` — 통과. `scope` 는 위와 같은 형식이다. `roles` 는 역할 매핑표로 바꾼다(§2.2).
 - `{ok: false, reason}` — 거절. `reason` 은 §2.4 의 코드다(모르는 코드는 `invalid` 로 본다).
 
 닿지 못하거나, 5초 안에 답하지 않거나, 5xx 를 주거나, 답이 형식에 맞지 않으면 `unavailable` 이다. 서버를 직접 띄우는
@@ -145,9 +152,9 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 
 | `type` | 필드 | 설명 |
 |---|---|---|
-| `welcome` | `seq`, `base`, `log`, `maxMessageBytes`, `generation?`, `user?`, `resync?`, `encryptedSource?`, `allowEncrypted?` | 방에 들어옴. `base` = 기준점(gzip 바이트의 base64) 또는 `null`(첫 참여자 — `base` 를 보내야 함). `log` = 기준점 뒤 묶음들. `generation` 은 0 이면 없다. `user` 는 인증을 켠 서버만 `{sub, name, scope}`. `encryptedSource: true` 는 원래 암호 문서였던 방(참여자에게 한 번 알린다), `allowEncrypted: true` 는 `base: null` 일 때 서버가 암호 문서를 받는다는 뜻(§4.1). 기록이 길면 나눠 보낸다(아래) |
+| `welcome` | `seq`, `base`, `log`, `maxMessageBytes`, `generation?`, `user?`, `resync?`, `encryptedSource?`, `allowEncrypted?`, `roundtrip?` | 방에 들어옴. `base` = 기준점(gzip 바이트의 base64) 또는 `null`(첫 참여자 — `base` 를 보내야 함). `log` = 기준점 뒤 묶음들. `generation` 은 0 이면 없다. `user` 는 인증을 켠 서버만 `{sub, name, scope}`. `encryptedSource: true` 는 원래 암호 문서였던 방(참여자에게 한 번 알린다), `roundtrip` 은 방을 열 때의 왕복 점검에 경고가 있던 방의 요약(§5 — 참여자에게 한 번 알린다), `allowEncrypted: true` 는 `base: null` 일 때 서버가 암호 문서를 받는다는 뜻(§4.1). 기록이 길면 나눠 보낸다(아래) |
 | `catchup` | `seq`, `log`, `maxMessageBytes`, `user?`, `cont?` | 다시 붙은 참여자에게 끊긴 동안의 묶음만(§4.6). `cont: true` 는 나눠 보낸 `welcome` 의 이어지는 조각 |
-| `ops` | `seq`, `clientId`, `entries`, `batchId?`, `sub?` | 확정된 묶음. 모두에게 보낸다. 보낸 사람에게는 확정(ack)이다 |
+| `ops` | `seq`, `clientId`, `entries`, `batchId?`, `sub?`, `replaced?` | 확정된 묶음. 모두에게 보낸다. 보낸 사람에게는 확정(ack)이다. `replaced: true` 면 서버가 묶음 안의 `state` 를 다시 쓴 바이트로 바꿨다(§4.2) |
 | `reject` | `seq`, `batchId?` | 묶음의 `base` 가 서버 seq 와 다르다. 보낸 사람에게만 |
 | `invalid` | `what`, `reason`, `batchId?` | 서버 정본이 적용하지 못했다. `ops` 면 보낸 쪽만(재동기화), `base` 면 연결을 닫는다 |
 | `forbidden` | `what`, `reason`, `batchId?` | 권한 밖(§2.5). 연결은 둔다 |
@@ -177,8 +184,9 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 - `op` 는 rhwp 함수 `m` 을 인자 `a` 로 부른 것이다. 분류표에서 `sync: op` 인 함수만 쓸 수 있다(서버가 그 밖은 거절).
   `a` 안의 바이너리(`Uint8Array`)는 `{"$b64": "…"}` 로 감싼다. `meta` 는 글자 연산의 보정 정보(기록 시점 실측),
   `ctx` 는 그 호출이 기대는 맥락(활성 누름틀 등)이다. 형식과 의미는 `collab-stage2.md` §3 "기록 형태"가 정본이다.
-- `state` 는 결과 전송이다. 그 시점 문서 전체(원본 형식, gzip)다. `state` 는 새 기준점이다 — 보낸 쪽도 같은 바이트를
-  다시 읽는다.
+- `state` 는 결과 전송이다. 그 시점 문서 전체(원본 형식, gzip)다. `state` 는 새 기준점이다 — 모두가 같은 바이트를 다시
+  읽는다. 방에 들어가는 `state` 바이트는 **서버가 만든다**(§4.2): 기록과 방송에 남는 것은 클라이언트가 보낸 바이트가 아니라
+  서버가 다시 쓴 바이트다.
 
 ## 4. 클라이언트 동작
 
@@ -205,6 +213,17 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 - `ops.base = lastSeq`. 서버가 그 사이 다른 묶음을 확정했으면 `reject` 가 온다 → 그 묶음을 미확정 앞으로 되돌리고, 원격
   묶음을 받은 뒤 새 `base` 로 다시 보낸다.
 - 내 `clientId` 의 `ops` 가 오면 확정이다. 다음 묶음을 보낸다.
+- **서버가 다시 쓴 state (`replaced: true`).** 묶음에 `state` 가 있으면 서버 정본은 받은 바이트 C 를 읽어 판정한 뒤, 바뀐
+  부분(구역·DocInfo)만 모델에서 다시 쓴 바이트 S 를 만들어 자기도 S 를 다시 읽는다. 기록과 방송에는 C 대신 S 를 쓰고, 그
+  묶음에 `replaced: true` 를 붙인다. 보낸 사람이 받는 확정(ack)도 같은 메시지이므로 S 가 실려 온다. 보낸 사람은 자기 `state`
+  를 S 로 바꿔 다시 읽고(확정 상태 = S 를 읽은 문서), 그 뒤의 미확정은 원격 `state` 를 받은 것처럼 다시 얹는다(§4.3 의
+  되감기·재적용). 같은 모델이므로 보통은 그대로 얹힌다. 묶음 안에서 `state` 뒤의 `op` 는 모두 S 를 읽은 문서 위에 얹힌다.
+  - 이유: 판정은 rhwp 가 파싱한 모델만 본다. 그런데 rhwp 는 구역·DocInfo 의 원본 바이트를 캐시해 두었다가 저장할 때 그대로
+    쓴다. 그래서 파서가 모델에 남기지 않는 레코드를 끼운 바이트는 판정을 지나 저장본과 다른 참여자의 문서에 남는다(한글
+    문서에 끼운 악성 레코드는 실제로 쓰이는 공격 경로다). 서버가 다시 쓴 바이트에는 모델에 있는 것만 남는다. 모두가 같은
+    S 를 읽으므로 기준점 규칙(§1)도 지켜진다.
+  - 원래 업로드한 파일(`POST /rooms` 의 처음 base)과 첫 참여자의 `base` 는 방을 만든 사람이 준 것이라 그대로 쓴다.
+  - 정본을 끈 서버(`COLLAB_CANONICAL=0`)와 다시 쓰기 보조가 없는 서버는 받은 바이트를 그대로 쓰고 `replaced` 를 붙이지 않는다.
 - 보내려는 메시지가 상한을 넘으면 보내지 않고 재동기화한다.
 - IME 조합 중에는 보내지도, 원격을 적용하지도 않는다(조합이 끝나면 처리).
 
@@ -304,6 +323,13 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
   `X-Collab-Document-Password` 로 문서 암호를 주면 그 암호로 열어 **암호 없는 바이트**를 방의 처음 기준점으로 쓴다(틀리면
   `400 {reason: "wrong-password"}`). 그 방은 `encryptedSource` 를 방 메타·`welcome` 에 남긴다. 서버는 암호를 저장하거나
   기록하지 않는다.
+- **왕복 점검(6단계 S2):** rhwp 는 저장할 때 손대지 않은 부분의 원본 바이트를 그대로 쓴다. 그래서 "저장 후 비교"는 rhwp 가
+  모르는 기능이 있어도 통과하고, 문제는 그 부분을 편집해 모델에서 다시 쓸 때 생긴다. 서버는 방을 만들 때 정본으로 **모든
+  부분을 모델에서 다시 쓴 결과**를 원본과 한 번 견주고(`collabRoundtripCheck`), 결과 `roundtrip: {ok, lost: [{kind, count,
+  detail?}], irDiff}` 를 응답과 방 메타에 싣는다. `ok: false` 면 그 방의 `welcome` 에도 요약을 실어 참여자가 처음 들어올 때
+  한 번 알린다("이 부분이 있는 쪽을 편집하면 사라질 수 있습니다"). 서버 설정 `COLLAB_ROUNDTRIP`: `warn`(기본 — 알리고 방은
+  만든다) | `block`(통과하지 못하면 방을 만들지 않는다 — `422 {error: "roundtrip", reason: "roundtrip", roundtrip}`) |
+  `off`. 점검 보조가 없는 서버는 점검하지 않고 `roundtrip` 을 싣지 않는다.
 - 같은 출처가 아닌 브라우저 요청은 Origin 허용 목록을 따른다. CORS 는 열지 않는다(바깥 시스템은 서버끼리 부른다).
 
 ### `GET /rooms/{room}/document` — 최신 문서 파일
@@ -329,13 +355,69 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
 - 토큰은 주소 조각으로만 받고 읽은 뒤 지운다. 웹 클라이언트는 새로고침에 대비해 탭 저장소(sessionStorage)에 방별로 둔다.
 - `hello.name` 은 토큰에 `name` 이 없을 때만 쓰이고, 확인되지 않은 표시용이다.
 - `sub` 는 같은 방 참여자에게 보인다. 비밀이나 개인 식별 정보를 넣지 않는다.
-- **편집 권한자는 결과 전송으로 rhwp 가 해석하지 않는 레코드를 문서에 넣을 수 있다. 신뢰하는 사람에게만 편집 권한을 준다.**
-  서버는 `edit` 연결의 `state` 를 정본에 적재해 보고 받지만, 그 바이트를 모델에서 다시 쓰지 않고 그대로 모두에게 보내고
-  저장한다. 좁은 권한은 `state` 를 보낼 수 없으므로 이 경로가 없다(§2.2).
-  - 다음 단계 후보: 서버가 받은 `state` 를 정본 모델에서 다시 써서(내보내기) 모두에게 같은 바이트를 보낸다. 그러면 모델에
-    없는 레코드는 사라진다. 대가는 원본 한/글 바이트 보존이 깨지는 것과, 보낸 쪽도 서버가 다시 쓴 바이트를 다시 읽어야
-    하는 것(기준점 규칙, §1)이다.
+- **결과 전송으로 넣는 레코드:** 서버는 `edit` 연결의 `state` 를 바뀐 부분만 모델에서 다시 써서 기록·방송한다(§4.2, 6단계 S1).
+  그래서 rhwp 가 해석하지 않는 레코드를 끼운 바이트는 방에 남지 않는다. 대가는 그 `state` 가 바꾼 구역의 원본 한/글 바이트
+  보존이 깨지는 것과, 보낸 사람도 서버가 다시 쓴 바이트를 다시 읽는 것이다. 좁은 권한은 `state` 를 아예 보낼 수 없다(§2.2).
+  다시 쓰기 보조가 없는 서버에서는 편집 권한자가 그런 레코드를 넣을 수 있으므로 신뢰하는 사람에게만 편집 권한을 준다.
 - HS256 비밀키는 32바이트 이상이어야 한다(서버가 짧은 키로는 시작하지 않는다). 저장소 밖에 둔다.
 - 암호 문서는 기본으로 막는다(§4.1, §5). `COLLAB_ALLOW_ENCRYPTED=1` 로 허용하면 그런 방의 문서는 암호가 풀린 상태로 서버 디스크·
   참여자·내려받은 파일에 남는다(서버는 시작할 때 경고를 남긴다). 다음 후보: 내려받을 때 다시 암호를 건다
   (`exportHwpWithPassword` — 암호를 어디에 둘지는 바깥 시스템이 정한다).
+
+## 7. 부품 전용 모드 (6단계 S3)
+
+바깥 시스템의 페이지가 iframe 으로 편집기를 넣어 쓰는 배포에서, 편집기 주소를 직접 열거나 링크를 복사해 단독으로 쓰는 것을
+막는다. 서버 설정 `COLLAB_EMBED_ONLY=1` + `COLLAB_EMBED_ORIGINS=https://host.example[,…]`(부모 페이지 출처).
+
+- **iframe 밖에서 열기 거절:** 편집기 HTML 에 `Content-Security-Policy: frame-ancestors <허용 출처>` 를 붙인다 — 브라우저가 허용
+  출처의 iframe 에서만 띄운다. 최상위 탐색(`Sec-Fetch-Dest: document`)이면 편집기 대신 "이 편집기는 연결된 시스템 안에서만 열 수
+  있습니다" 페이지를 403 으로 준다. `Sec-Fetch-*` 를 보내지 않는 브라우저는 플러그인이 `window.top === window.self` 로 한 번 더
+  막는다. `GET /healthz` 가 `embedOnly: true, embedOrigins` 를 알린다.
+- **토큰은 부모 페이지에서만:** 이 모드에서 플러그인은 주소의 `#token` 을 쓰지 않는다. 토큰이 필요할 때(처음 `connect`, 다시
+  붙을 때 `reconnect`, 만료 `expired`) 부모에게 알림 `{type: "rhwp-collab-token-request", room, reason}` 만 보낸다(비밀 없음).
+  알림의 대상 출처는 ① `location.ancestorOrigins[0]` 이 허용 목록에 있으면 그것 ② 그 기능이 없고(Firefox) 허용 출처가 하나면
+  그것 ③ 그 밖에만 `*` 이다. 부모는 studio 의 embed 통로(출처가 고정된 MessagePort)로 `plugin.invoke` 를 불러 토큰을 넣는다.
+  제한 시간(기본 30초) 안에 토큰이 오지 않으면 "바깥 시스템에서 접속 정보를 받지 못했습니다"를 띄우고 들어가지 않는다.
+- **플러그인 표면:** 이 모드에서 `plugin.invoke` 로 부를 수 있는 메서드는 `setToken(token)` 하나다(넣는 방향만). 토큰·사용자
+  정보·문서를 읽어 가는 메서드는 두지 않는다 — port 가 묶이기 전의 legacy 통로(`window.postMessage` 의 `rhwp-request`)는 출처
+  고정이 없고, 그 경우는 `frame-ancestors` 가 부모를 허용 출처로 제한한다는 전제다.
+- **방 만들기:** 업로드 페이지(`/upload`)와 studio 의 "공동편집 시작" 메뉴는 끈다. 방은 바깥 시스템이 `POST /rooms` 로 만든다.
+- **신뢰 전제:** 허용된 부모는 embed RPC 로 편집기의 문서를 읽고(`exportHwp`·`getDocumentState` 등) 바꾸고(`loadFile`·
+  `applyTextCommand` 등) 플러그인 메서드를 부를 수 있다. 부모 페이지는 신뢰하는 바깥 시스템이어야 한다.
+- **한계:** 단독 사용과 링크 돌려쓰기를 막는 장치다. 권한 있는 사용자가 개발자 도구로 iframe 안의 토큰을 꺼내 WebSocket 을 직접
+  여는 것까지는 막지 못한다. 그 사용자는 원래 권한이 있다.
+
+부모 페이지 예시(편집기 출처 `https://editor.example`, 토큰은 바깥 시스템의 `/collab-token` 이 만들어 준다고 가정):
+
+```html
+<iframe id="editor" src="https://editor.example/?chrome=embed&collab#room=ROOM&name=%ED%99%8D%EA%B8%B8%EB%8F%99"></iframe>
+<script>
+const EDITOR = 'https://editor.example';
+const frame = document.getElementById('editor');
+const channel = new MessageChannel();
+const sessionId = crypto.randomUUID();
+let nextId = 1;
+const pending = new Map();
+channel.port1.onmessage = ({ data }) => {
+  if (data?.type === 'rhwp-response') { pending.get(data.id)?.(data); pending.delete(data.id); }
+};
+const request = (method, params) => new Promise((resolve) => {
+  const id = nextId++;
+  pending.set(id, resolve);
+  channel.port1.postMessage({ type: 'rhwp-request', version: 1, sessionId, id, method, params });
+});
+// 1. 편집기가 뜨면 embed 통로를 묶는다(처음 묶은 출처로 고정된다)
+frame.addEventListener('load', () => {
+  frame.contentWindow.postMessage(
+    { type: 'rhwp-connect', version: 1, sessionId, capabilities: ['transferable-array-buffer', 'plugin-loader-v1'] },
+    EDITOR, [channel.port2]);
+}, { once: true });
+// 2. 플러그인이 토큰을 달라고 하면(처음·다시 붙음·만료) 새 토큰을 만들어 setToken 으로 넣는다
+window.addEventListener('message', async (event) => {
+  if (event.origin !== EDITOR || event.source !== frame.contentWindow) return;
+  if (event.data?.type !== 'rhwp-collab-token-request') return;
+  const { token } = await (await fetch(`/collab-token?room=${encodeURIComponent(event.data.room)}`)).json();
+  await request('plugin.invoke', { id: 'collab', method: 'setToken', args: [token] });
+});
+</script>
+```

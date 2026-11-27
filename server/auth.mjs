@@ -50,16 +50,48 @@ export class AuthError extends Error {
 }
 
 /**
- * 확인 결과를 규약 모양으로 맞춘다. scope 는 공백으로 구분한 문자열 또는 배열, 없으면 edit.
- * 모르는 권한 이름은 버린다(앞으로 생길 권한을 옛 서버가 넓게 해석하지 않게).
+ * 6단계 S3 권한 매핑(COLLAB_ROLE_MAP): 바깥 시스템의 역할 이름 → 우리 권한 목록. 값은 공백 구분 문자열 또는 배열.
+ * 모르는 권한 이름이 있으면 서버 시작을 거부한다(표 오타로 권한이 조용히 사라지거나 넓어지지 않게).
+ * @param {Record<string, string | string[]>} table
+ * @returns {Map<string, string[]>}
  */
-export function normalizeUser({ sub, name, scope } = {}) {
-  const list = scope === undefined || scope === null ? ['edit']
-    : (Array.isArray(scope) ? scope : String(scope).split(/\s+/)).filter((s) => SCOPES.includes(s));
+export function parseRoleMap(table) {
+  if (!table || typeof table !== 'object' || Array.isArray(table)) throw new Error('COLLAB_ROLE_MAP 은 {"역할": "권한 목록"} 꼴의 JSON 객체여야 한다');
+  const map = new Map();
+  for (const [role, value] of Object.entries(table)) {
+    const list = Array.isArray(value) ? value.map(String) : String(value ?? '').split(/\s+/).filter(Boolean);
+    const unknown = list.filter((s) => !SCOPES.includes(s));
+    if (unknown.length) throw new Error(`COLLAB_ROLE_MAP 의 역할 ${JSON.stringify(role)}: 모르는 권한 ${unknown.join(', ')} (${SCOPES.join(' | ')})`);
+    map.set(role, [...new Set(list)]);
+  }
+  return map;
+}
+export function loadRoleMap(file) {
+  let table;
+  try { table = JSON.parse(readFileSync(file, 'utf8')); } catch (error) { throw new Error(`COLLAB_ROLE_MAP 파일을 읽지 못했다: ${error.message}`); }
+  return parseRoleMap(table);
+}
+
+/**
+ * 확인 결과를 규약 모양으로 맞춘다. scope 는 공백으로 구분한 문자열 또는 배열.
+ * roles(바깥 시스템의 역할 이름 — 배열, 또는 문자열 하나)는 권한 매핑표로 바꿔 scope 와 합친다. 표에 없는 역할은 아무 권한도
+ * 주지 않는다(기본 거부). scope 도 roles 도 없으면 edit. 모르는 권한 이름은 버린다(앞으로 생길 권한을 옛 서버가 넓게
+ * 해석하지 않게). 역할 이름은 결과에 남기지 않는다(기록·로그에 가지 않게 — 최종 권한만 welcome.user.scope 로 알린다).
+ * @param {Map<string, string[]> | null} [roleMap]
+ */
+export function normalizeUser({ sub, name, scope, roles } = {}, roleMap = null) {
+  const hasScope = scope !== undefined && scope !== null;
+  const hasRoles = roles !== undefined && roles !== null;
+  let list = [];
+  if (hasScope) list.push(...(Array.isArray(scope) ? scope : String(scope).split(/\s+/)));
+  if (hasRoles) {
+    for (const role of Array.isArray(roles) ? roles : [roles]) list.push(...(roleMap?.get(String(role)) ?? []));
+  }
+  if (!hasScope && !hasRoles) list = ['edit'];
   return {
     sub: typeof sub === 'string' && sub ? sub : null,
     name: typeof name === 'string' && name ? name : null,
-    scope: [...new Set(list)],
+    scope: [...new Set(list.filter((s) => SCOPES.includes(s)))],
   };
 }
 
@@ -134,15 +166,16 @@ export function noneAuth() {
 }
 
 /** HS256 공유 비밀키. `issue` 로 초대 토큰을 만들 수 있다. */
-export function hs256Auth(secret, { tolerance = CLOCK_TOLERANCE_SEC } = {}) {
+export function hs256Auth(secret, { tolerance = CLOCK_TOLERANCE_SEC, roleMap = null } = {}) {
   const key = Buffer.isBuffer(secret) ? secret : Buffer.from(String(secret ?? ''), 'utf8');
   if (key.length < MIN_SECRET_BYTES) throw new Error(`COLLAB_AUTH_SECRET 는 ${MIN_SECRET_BYTES}바이트 이상이어야 한다 (지금 ${key.length})`);
   return {
     mode: 'hs256',
+    roleMap,
     verify: async (token, room) => {
       const claims = verifyHs256(token, key, { tolerance });
       if (!roomAllowed(claims.room, room)) throw new AuthError('room', '토큰의 방이 다르다');
-      return normalizeUser(claims);
+      return normalizeUser(claims, roleMap);
     },
     /** 서명한 토큰을 만든다(초대 토큰·시험). */
     issue: (claims) => signHs256(claims, key),
@@ -153,10 +186,11 @@ export function hs256Auth(secret, { tolerance = CLOCK_TOLERANCE_SEC } = {}) {
  * 바깥 시스템에 묻는다: POST url {token, room} → {ok: true, sub, name?, scope?} | {ok: false, reason}.
  * 닿지 못하거나(네트워크·시간 초과·5xx) 답이 형식에 맞지 않으면 unavailable — 클라이언트는 다시 붙는다.
  */
-export function urlAuth(url, { timeoutMs = 5000, fetchImpl = globalThis.fetch } = {}) {
+export function urlAuth(url, { timeoutMs = 5000, fetchImpl = globalThis.fetch, roleMap = null } = {}) {
   if (!/^https?:\/\//.test(String(url ?? ''))) throw new Error(`COLLAB_AUTH_URL 이 http(s) 주소가 아니다: ${url}`);
   return {
     mode: 'url',
+    roleMap,
     verify: async (token, room) => {
       if (typeof token !== 'string' || !token) throw new AuthError('missing', '토큰이 없다');
       let res;
@@ -175,7 +209,7 @@ export function urlAuth(url, { timeoutMs = 5000, fetchImpl = globalThis.fetch } 
       if (res.status >= 500) throw new AuthError('unavailable', `인증 서버 오류 ${res.status}`);
       if (!body || typeof body !== 'object') throw new AuthError('unavailable', '인증 서버 답이 객체가 아니다');
       if (body.ok !== true) throw new AuthError(typeof body.reason === 'string' ? body.reason : 'invalid', '인증 서버가 거절함');
-      const user = normalizeUser(body);
+      const user = normalizeUser(body, roleMap);
       if (!user.sub) throw new AuthError('unavailable', '인증 서버 답에 sub 가 없다');
       return user;
     },
@@ -197,6 +231,8 @@ export function isLoopback(host) {
  */
 export function authFromEnv(env = process.env, { host = '127.0.0.1', warn = console.warn } = {}) {
   const mode = env.COLLAB_AUTH ?? '';
+  // 6단계 S3: 바깥 시스템의 역할 → 우리 권한 매핑표(JSON 파일). 표가 잘못되면 시작하지 않는다.
+  const roleMap = env.COLLAB_ROLE_MAP ? loadRoleMap(env.COLLAB_ROLE_MAP) : null;
   if (mode === '') {
     if (!isLoopback(host)) throw new Error(`HOST=${host} 는 루프백이 아니다 — COLLAB_AUTH(hs256 | url | none)를 정해야 한다`);
     return noneAuth();
@@ -209,11 +245,11 @@ export function authFromEnv(env = process.env, { host = '127.0.0.1', warn = cons
     let secret = env.COLLAB_AUTH_SECRET;
     if (!secret && env.COLLAB_AUTH_SECRET_FILE) secret = readFileSync(env.COLLAB_AUTH_SECRET_FILE, 'utf8').replace(/\r?\n$/, '');
     if (!secret) throw new Error('COLLAB_AUTH=hs256 에는 COLLAB_AUTH_SECRET 또는 COLLAB_AUTH_SECRET_FILE 이 필요하다');
-    return hs256Auth(secret);
+    return hs256Auth(secret, { roleMap });
   }
   if (mode === 'url') {
     if (!env.COLLAB_AUTH_URL) throw new Error('COLLAB_AUTH=url 에는 COLLAB_AUTH_URL 이 필요하다');
-    return urlAuth(env.COLLAB_AUTH_URL);
+    return urlAuth(env.COLLAB_AUTH_URL, { roleMap });
   }
   throw new Error(`모르는 COLLAB_AUTH: ${mode} (none | hs256 | url)`);
 }

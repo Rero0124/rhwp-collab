@@ -11,6 +11,10 @@
 //                     memoOwner(5단계 D6, comment 연결의 이름)가 있으면 setMemoText·removeMemo 의 대상 메모가
 //                     그 이름의 것인지 정본의 메모 목록으로 본다(묶음 안에서 먼저 만든 메모도 차례대로). 아니면 되돌리고
 //                     {forbidden: true, reason: 'author'}
+//                     state 항목(6단계 S1)은 받은 바이트 C 를 그대로 두지 않고, 바뀐 부분만 모델에서 다시 쓴 바이트 S 로
+//                     바꿔 정본도 S 를 다시 읽는다 → {replaced: [{index, data}]}(묶음 안 위치와 S, base64(gzip))
+//   roundtrip {}      6단계 S2: 모든 부분을 모델에서 다시 쓴 결과를 원본과 견준다(collabRoundtripCheck) →
+//                     {supported, result: {ok, lost: [{kind, count, detail}], irDiff}, ms}. 보조가 없으면 {supported: false}
 //   decrypt {data, password}  암호 문서(원본 바이트, base64)를 암호로 열어 결과 전송 형식(암호 없음, gzip)으로 → {data}.
 //                     정본은 건드리지 않는다(5단계 D5, COLLAB_ALLOW_ENCRYPTED 일 때만 부른다). 틀리면 {wrongPassword: true}
 //   replayAll {log}   기록 여러 묶음을 한 번에(복원·재생성 — 이미 받아 둔 기록이라 되돌림 없음, 쪽 배치는 끝에 한 번) → {digest}
@@ -79,6 +83,22 @@ function memoOwnerViolation(e, owner, { allowMissing = false } = {}) {
   return target.author === owner ? null : `메모 ${e.a[0]} 의 작성자가 다름`;
 }
 
+/**
+ * 6단계 S1: 받은 state 바이트 C 를 정본의 지금 문서와 견주어, 바뀐 부분(구역·DocInfo)만 모델에서 다시 쓴 바이트 S 를 만든다.
+ * 파서가 모델에 남기지 않는 레코드를 끼운 C 가 원본 바이트 캐시를 타고 저장본·다른 참여자에게 가는 길을 막는다.
+ * 보조(collab-core)의 이름·인자는 기존 코드 세션이 정한다 — 이 두 함수만 맞추면 된다.
+ *   기대하는 모양: doc.collabRewriteState(C: Uint8Array /* collabExportState 와 같은 gzip 감싸기 *\/) → S(같은 감싸기).
+ *   정본 문서는 바꾸지 않고(지금 문서와 비교만), 정본은 그 뒤 S 를 collabLoadState 로 다시 읽는다(R(S)).
+ * 보조가 없으면 null — 예전처럼 C 를 그대로 쓴다(서버가 한 번 경고).
+ */
+const REWRITE_STATE = 'collabRewriteState';
+const rewriteSupported = () => typeof doc?.[REWRITE_STATE] === 'function';
+const b64ToBytes = (s) => new Uint8Array(Buffer.from(s, 'base64'));
+function rewriteState(dataB64) {
+  if (!rewriteSupported()) return null;
+  return doc[REWRITE_STATE](b64ToBytes(dataB64));
+}
+
 /** 판정 보조가 있는지 — 없으면 적용해 보지도 않고 거절한다. */
 const confinedSupported = () => typeof doc?.collabCheckConfined === 'function';
 
@@ -138,8 +158,17 @@ parentPort.on('message', ({ id, op, ...p }) => {
         const before = confine ? doc.collabDigest() : null;
         const snap = doc.collabSnapshotSave();
         let ownerWhy = null;
+        const replaced = [];
         try {
-          if (owner !== null && p.entries.some((e) => OWNED_MEMO_OPS.has(e?.m))) {
+          if (rewriteSupported() && p.entries.some((e) => e?.kind === 'state')) {
+            // S1: 하나씩 적용하며 state 는 다시 쓴 S 로 읽는다 — 뒤의 op 는 R(S) 위에 얹힌다(다른 참여자도 S 위에 얹는다)
+            p.entries.forEach((e, index) => {
+              if (e?.kind !== 'state') return engine.replay([e]);
+              const S = rewriteState(e.data);
+              doc.collabLoadState(S);
+              replaced.push({ index, data: Buffer.from(S).toString('base64') });
+            });
+          } else if (owner !== null && p.entries.some((e) => OWNED_MEMO_OPS.has(e?.m))) {
             // 묶음 안에서 만든 메모를 바로 고치는 경우도 보려고 하나씩 적용하며 확인한다
             for (const e of p.entries) {
               ownerWhy = memoOwnerViolation(e, owner);
@@ -178,7 +207,7 @@ parentPort.on('message', ({ id, op, ...p }) => {
           }
         }
         doc.collabSnapshotDiscard(snap);
-        return reply({ ok: true, digest: doc.collabDigest() });
+        return reply({ ok: true, digest: doc.collabDigest(), ...(replaced.length ? { replaced } : {}) });
       }
       case 'replayAll': {
         if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
@@ -193,6 +222,17 @@ parentPort.on('message', ({ id, op, ...p }) => {
         return reply({ ok: true, data: Buffer.from(doc.collabExportState()).toString('base64') });
       case 'digest':
         return reply({ ok: true, digest: doc.collabDigest() });
+      case 'roundtrip': {
+        if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
+        if (typeof doc.collabRoundtripCheck !== 'function') return reply({ ok: true, supported: false });
+        const t0 = performance.now();
+        const raw = doc.collabRoundtripCheck();
+        const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return reply({ ok: true, supported: true, result, ms: Math.round(performance.now() - t0) });
+      }
+      case 'capabilities':
+        // 서버가 시작 로그·경고에 쓴다: 다시 쓰기 보조가 있는지(6단계 S1)
+        return reply({ ok: true, rewriteState: typeof wasm.HwpDocument.prototype[REWRITE_STATE] === 'function', roundtripCheck: typeof wasm.HwpDocument.prototype.collabRoundtripCheck === 'function' });
       default:
         return reply({ ok: false, reason: `모르는 op: ${op}` });
     }

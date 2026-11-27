@@ -434,3 +434,78 @@ test('검증 함수를 끼울 수 있다: startServer({ auth: { mode, verify } }
   assert.equal(res.status, 403, '끼운 함수가 create 를 주지 않음');
   await custom.close();
 });
+
+// ── 6단계 S3 권한 매핑(COLLAB_ROLE_MAP) ───────────────────────────────
+
+test('권한 매핑: 역할 → 권한, 여러 역할은 합침, scope 와도 합침, 표에 없는 역할은 아무 권한도 없음, 표 오타는 시작 거부', async () => {
+  const { parseRoleMap } = await import('../auth.mjs');
+  const map = parseRoleMap({ 작성자: 'edit', 검토자: 'comment', 열람자: ['view'], 양식담당: 'form view' });
+  assert.deepEqual(normalizeUser({ sub: 's', roles: ['검토자'] }, map).scope, ['comment']);
+  assert.deepEqual(normalizeUser({ sub: 's', roles: ['검토자', '양식담당'] }, map).scope, ['comment', 'form', 'view']);
+  assert.deepEqual(normalizeUser({ sub: 's', roles: ['열람자'], scope: 'create' }, map).scope, ['create', 'view'], 'scope 와 합침');
+  assert.deepEqual(normalizeUser({ sub: 's', roles: ['관리자'] }, map).scope, [], '표에 없는 역할 → 기본 거부');
+  assert.deepEqual(normalizeUser({ sub: 's', roles: '작성자' }, map).scope, ['edit'], '문자열 하나도 역할 하나');
+  assert.deepEqual(normalizeUser({ sub: 's', roles: ['작성자'] }, null).scope, [], '표가 없으면 역할은 권한을 주지 않음(edit 로 넓히지 않음)');
+  assert.deepEqual(normalizeUser({ sub: 's' }, map).scope, ['edit'], '둘 다 없으면 지금처럼 edit');
+  assert.equal(JSON.stringify(normalizeUser({ sub: 's', roles: ['검토자'] }, map)).includes('검토자'), false, '역할 이름은 결과에 남기지 않음');
+  assert.throws(() => parseRoleMap({ 작성자: 'edti' }), /모르는 권한 edti/);
+  assert.throws(() => parseRoleMap(['edit']), /JSON 객체/);
+  const file = path.join(tempDir(), 'roles.json');
+  writeFileSync(file, JSON.stringify({ 작성자: 'edit', 검토자: 'commnet' }));
+  assert.throws(() => authFromEnv({ COLLAB_AUTH: 'hs256', COLLAB_AUTH_SECRET: SECRET, COLLAB_ROLE_MAP: file }), /commnet/, '표 오타로 시작 거부');
+  writeFileSync(file, JSON.stringify({ 작성자: 'edit' }));
+  assert.equal(authFromEnv({ COLLAB_AUTH: 'hs256', COLLAB_AUTH_SECRET: SECRET, COLLAB_ROLE_MAP: file }).roleMap.get('작성자')[0], 'edit');
+});
+
+test('권한 매핑: hs256 토큰의 roles 로 들어오고(welcome.user.scope = 바꾼 권한), 표에 없는 역할만이면 unauthorized scope, 로그에 역할 이름 없음', async () => {
+  const { parseRoleMap } = await import('../auth.mjs');
+  const lines = [];
+  const mapped = startServer({ port: 0, log: (m) => lines.push(m), auth: hs256Auth(SECRET, { roleMap: parseRoleMap({ 작성자: 'edit', 검토자: 'comment', 열람자: 'view' }) }) });
+  await mapped.ready;
+  try {
+    const res = await fetch(`http://127.0.0.1:${mapped.port}/rooms`, { method: 'POST', body: RAW, headers: { authorization: `Bearer ${tok({ roles: ['작성자'], scope: 'create' })}` } });
+    assert.equal(res.status, 201);
+    const { room } = await res.json();
+    const hello = (claims) => new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${mapped.port}/`);
+      ws.once('error', reject);
+      ws.once('open', () => ws.send(JSON.stringify({ type: 'hello', room, clientId: `r-${randomBytes(3).toString('hex')}`, name: 'R', engine: ENGINE_FINGERPRINT, token: tok({ room, ...claims }) })));
+      ws.once('message', (d) => { ws.close(); resolve(JSON.parse(String(d))); });
+    });
+    const w = await hello({ roles: ['검토자', '열람자'] });
+    assert.equal(w.type, 'welcome');
+    assert.deepEqual(w.user.scope, ['comment', 'view'], '역할을 바꿔 합친 권한');
+    assert.deepEqual(await hello({ roles: ['관리자'] }), { type: 'unauthorized', reason: 'scope' }, '표에 없는 역할만 → 권한 없음');
+    assert.ok(!lines.some((l) => /관리자|검토자|열람자|작성자/.test(l)), '로그에 역할 이름이 없음');
+  } finally {
+    await mapped.close();
+  }
+});
+
+test('권한 매핑: url 방식 확인 서버가 roles 를 답하면 바꾸고 합치며, 표에 없는 역할은 거부', async () => {
+  const { parseRoleMap } = await import('../auth.mjs');
+  const external = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      const { token } = JSON.parse(body);
+      res.setHeader('content-type', 'application/json');
+      const answers = {
+        one: { ok: true, sub: 'u1', roles: ['검토자'] },
+        two: { ok: true, sub: 'u2', roles: ['검토자', '열람자'], scope: 'create' },
+        stranger: { ok: true, sub: 'u3', roles: ['청소부'] },
+      };
+      res.end(JSON.stringify(answers[token] ?? { ok: false, reason: 'invalid' }));
+    });
+  });
+  await new Promise((r) => external.listen(0, '127.0.0.1', r));
+  try {
+    const auth = urlAuth(`http://127.0.0.1:${external.address().port}/`, { roleMap: parseRoleMap({ 검토자: 'comment', 열람자: 'view' }) });
+    assert.deepEqual((await auth.verify('one', 'r')).scope, ['comment']);
+    assert.deepEqual((await auth.verify('two', 'r')).scope, ['create', 'comment', 'view'], '여러 역할과 scope 를 합침');
+    assert.deepEqual((await auth.verify('stranger', 'r')).scope, [], '표에 없는 역할 → 아무 권한도 없음');
+    assert.equal(Object.hasOwn(await auth.verify('one', 'r'), 'roles'), false, '역할 이름을 넘기지 않음');
+  } finally {
+    await new Promise((r) => external.close(r));
+  }
+});

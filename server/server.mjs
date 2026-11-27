@@ -82,10 +82,24 @@ function createRoom(name) {
     broken: null,
     /** 5단계 D5: 원래 암호 문서였다(COLLAB_ALLOW_ENCRYPTED 로 받음) — 방의 문서는 암호 없이 오가고 저장된다 */
     encryptedSource: false,
+    /** 6단계 S2: 방을 열 때의 왕복 점검 결과 {ok, lost, irDiff} (점검하지 않았으면 null) */
+    roundtrip: null,
   };
 }
 
 export const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * 6단계 S2: 왕복 점검 결과를 방 메타·응답·welcome 에 실을 모양으로 — {ok, lost: [{kind, count, detail}], irDiff}.
+ * 보조의 결과를 믿되 모양만 다듬는다(detail 은 짧게, 목록은 32개까지).
+ */
+function summarizeRoundtrip(r) {
+  const lost = Array.isArray(r?.lost) ? r.lost.slice(0, 32).map((l) => ({
+    kind: String(l?.kind ?? '?'), count: Number.isFinite(l?.count) ? l.count : 1, ...(l?.detail ? { detail: String(l.detail).slice(0, 200) } : {}),
+  })) : [];
+  const irDiff = Number.isFinite(r?.irDiff) ? r.irDiff : 0;
+  return { ok: r?.ok === true && lost.length === 0, lost, irDiff };
+}
 
 /** 5단계 D6: 메모를 만드는 함수와 그 작성자 인자(`json` = {author, text}) */
 const MEMO_CREATE = ['insertMemo', 'insertMemoByPath', 'insertMemoReply'];
@@ -160,16 +174,32 @@ export function startServer({
   inviteTtlSec = parseDuration(process.env.COLLAB_INVITE_TTL, 86_400),
   // 5단계 D5: 암호 문서를 받을지. 기본은 막는다(POST /rooms 400 encrypted, 플러그인은 base 를 올리지 않음)
   allowEncrypted = process.env.COLLAB_ALLOW_ENCRYPTED === '1',
+  // 6단계 S2: 파일로 방을 만들 때 왕복 점검 — warn(결과를 알림) | block(통과하지 못하면 422) | off
+  roundtripMode = process.env.COLLAB_ROUNDTRIP || 'warn',
+  // 6단계 S3 부품 전용 모드: 바깥 시스템의 iframe 안에서만 쓰인다(허용 출처 목록이 필요하다)
+  embedOnly = process.env.COLLAB_EMBED_ONLY === '1',
+  embedOrigins = process.env.COLLAB_EMBED_ORIGINS ? process.env.COLLAB_EMBED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean) : [],
 } = {}) {
   if (store && !canonical) throw new Error('영속 저장(store)에는 정본(canonical)이 필요하다');
   if (auth === 'none') auth = noneAuth();
   if (!auth || typeof auth.verify !== 'function') throw new Error('auth 에는 verify(token, room) 가 있어야 한다');
   const authOn = auth.mode !== 'none';
+  if (embedOnly) {
+    if (embedOrigins.length === 0) throw new Error('COLLAB_EMBED_ONLY=1 에는 COLLAB_EMBED_ORIGINS(허용할 부모 페이지 출처, 쉼표로 구분)가 필요하다');
+    for (const o of embedOrigins) {
+      let u;
+      try { u = new URL(o); } catch { u = null; }
+      if (!u || !/^https?:$/.test(u.protocol) || u.origin !== o) throw new Error(`COLLAB_EMBED_ORIGINS 의 값이 출처(scheme://host[:port])가 아니다: ${o}`);
+    }
+  }
+  if (!['warn', 'block', 'off'].includes(roundtripMode)) throw new Error(`COLLAB_ROUNDTRIP 은 warn | block | off 중 하나다 (지금 ${roundtripMode})`);
   if (allowEncrypted) log('경고: COLLAB_ALLOW_ENCRYPTED=1 — 암호 문서로 방을 열면 암호가 풀린 상태로 서버 디스크·모든 참여자·내려받은 파일에 남는다');
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map();
   /** 닫는 중 — 그 뒤의 연결 끊김으로 저장본·세대 전환 타이머를 새로 만들지 않는다 */
   let closed = false;
+  /** S1 보조가 없다는 경고를 한 번만 */
+  let rewriteWarned = false;
   // ws 의 하드 상한은 넉넉히 두고(넘으면 ws 가 1009 로 끊는다) 상한 판정은 메시지 처리에서 한다 — 보낸 쪽에
   // 이유를 알려 주기 위해서다. HTTP(S) 서버 하나에 붙인다(업그레이드에서 Origin 확인).
   const wss = new WebSocketServer({ noServer: true, maxPayload: Math.max(maxMessageBytes * 2, 1024 * 1024) });
@@ -213,7 +243,9 @@ export function startServer({
     const seqOf = (chunk) => chunk[chunk.length - 1].seq;
     send(ws, { type: 'welcome', seq: chunks.length > 1 ? firstSeq : room.seq, base, log: first, ...(room.generation ? { generation: room.generation } : {}), maxMessageBytes, ...userOf(ws),
       // D5: 원래 암호 문서였으면 알린다(참여자가 경고를 한 번 띄운다). base 담당(base null)에게는 암호 문서를 받는지 알린다.
-      ...(room.encryptedSource ? { encryptedSource: true } : {}), ...(base === null && allowEncrypted ? { allowEncrypted: true } : {}), ...extra });
+      ...(room.encryptedSource ? { encryptedSource: true } : {}),
+      // S2: 왕복 점검에 경고가 있는 방이면 요약을 싣는다(참여자가 처음 들어올 때 한 번 알린다)
+      ...(room.roundtrip && room.roundtrip.ok === false ? { roundtrip: room.roundtrip } : {}), ...(base === null && allowEncrypted ? { allowEncrypted: true } : {}), ...extra });
     for (const chunk of chunks.slice(1)) send(ws, { type: 'catchup', seq: seqOf(chunk), log: chunk, cont: true, maxMessageBytes });
     log(`[${room.name}] welcome${extra.resync ? '(resync)' : ''} ${who(ws)} seq=${room.seq} base=${base === null ? 'null (담당)' : `${base.length}B64`} log=${logItems.length}${chunks.length > 1 ? ` (${chunks.length}조각)` : ''} 세대 ${room.generation} 참여자=${room.clients.size}`);
   };
@@ -260,7 +292,7 @@ export function startServer({
   const authorizeHello = async (msg) => {
     const token = typeof msg.token === 'string' ? msg.token : '';
     if (!token) throw new AuthError('missing', '토큰이 없다');
-    const user = normalizeUser(await auth.verify(token, msg.room));
+    const user = normalizeUser(await auth.verify(token, msg.room), auth.roleMap ?? null);
     if (!JOIN_SCOPES.some((s) => user.scope.includes(s))) throw new AuthError('scope', `방에 들어갈 권한이 없다 (${user.scope.join(' ') || '없음'})`);
     // 방은 서버가 만든다(D3) — 인증을 켜면 없는 방에 hello 로 들어갈 수 없다. 토큰을 확인한 뒤에 본다(방이 있는지 떠보지 못하게).
     if (!rooms.has(msg.room) && !(await storeHas(msg.room))) throw new AuthError('no-room', '없는 방');
@@ -411,6 +443,7 @@ export function startServer({
       room.generation = saved.meta.generation + 1;
       room.generationSeq = lastSeq;
       room.encryptedSource = Boolean(saved.meta.encryptedSource);
+      room.roundtrip = saved.meta.roundtrip ?? null;
       room.seq = lastSeq;
       room.docSeq = saved.meta.docSeq;
       pickBasePoint(room, packed, lastSeq, []);
@@ -427,6 +460,7 @@ export function startServer({
     room.generation = saved.meta.generation;
     room.generationSeq = saved.meta.baseSeq;
     room.encryptedSource = Boolean(saved.meta.encryptedSource);
+    room.roundtrip = saved.meta.roundtrip ?? null;
     room.seq = lastSeq;
     room.docSeq = saved.meta.docSeq;
     pickBasePoint(room, base, saved.meta.baseSeq, saved.log);
@@ -590,6 +624,14 @@ export function startServer({
         }
         return;
       }
+      // 6단계 S1: 정본이 state 를 다시 쓴 바이트 S 로 바꿨으면, 기록·방송·보낸 쪽 ack 모두 C 대신 S 를 쓴다.
+      if (res.replaced?.length) {
+        const byIndex = new Map(res.replaced.map((r) => [r.index, r.data]));
+        msg = { ...msg, entries: msg.entries.map((e, i) => (byIndex.has(i) ? { kind: 'state', data: byIndex.get(i) } : e)), replaced: true };
+      } else if (msg.entries.some((e) => e?.kind === 'state') && !rewriteWarned) {
+        rewriteWarned = true;
+        log('경고: 정본에 state 다시 쓰기 보조(collabRewriteState)가 없다 — 받은 state 바이트를 그대로 기록·방송한다(6단계 S1 전)');
+      }
       if (store) {
         // 디스크에 덧붙이고 fsync 한 뒤에 방송한다. 쓰기에 실패하면 거절하고 정본을 디스크와 같은 상태로 되돌린다.
         const item = { seq: room.seq + 1, clientId: ws.meta.clientId, entries: msg.entries, ...stampOf(ws, msg) };
@@ -610,6 +652,8 @@ export function startServer({
   const stampOf = (ws, msg) => ({
     ...(typeof msg.batchId === 'string' ? { batchId: msg.batchId } : {}),
     ...(ws.meta.sub ? { sub: ws.meta.sub } : {}),
+    // 6단계 S1: 정본이 state 를 다시 쓴 묶음 — 기록 항목 자체에 남겨 실시간·catchup·welcome 기록이 모두 같은 모양이 되게
+    ...(msg.replaced ? { replaced: true } : {}),
   });
 
   const commitOps = (ws, room, msg, digest) => {
@@ -626,12 +670,13 @@ export function startServer({
       room.base = msg.entries[lastState].data;
       room.baseSeq = room.seq; // 이 묶음의 state 앞에서 끊긴 참여자는 따라잡지 못한다(state 가 기록에 없다)
       const rest = msg.entries.slice(lastState + 1);
-      room.log = rest.length > 0 ? [{ seq: room.seq, clientId: ws.meta.clientId, entries: rest, ...(ws.meta.sub ? { sub: ws.meta.sub } : {}) }] : [];
+      room.log = rest.length > 0 ? [{ seq: room.seq, clientId: ws.meta.clientId, entries: rest, ...stampOf(ws, msg) }] : [];
     } else {
       room.log.push(entry);
     }
     const kinds = msg.entries.map((e) => (e?.kind === 'state' ? 'STATE' : e?.m)).join(',');
     log(`[${room.name}] seq=${room.seq} ${who(ws)} entries=${msg.entries.length} [${kinds.length > 160 ? `${kinds.slice(0, 160)}…` : kinds}]${lastState >= 0 ? ' (새 기준점)' : ''}`);
+    // replaced(기록 항목에 있음): 정본이 state 를 다시 쓴 묶음(6단계 S1) — 보낸 쪽은 자기 state 를 이 바이트로 바꿔 다시 읽는다
     broadcast(room, { type: 'ops', ...entry });
     scheduleDocSave(room);
   };
@@ -701,7 +746,7 @@ export function startServer({
     if (!authOn) return { sub: null, name: null, scope: ['edit', 'create'] };
     const m = /^Bearer\s+(\S+)\s*$/i.exec(req.headers.authorization ?? '');
     if (!m) throw new AuthError('missing', '토큰이 없다');
-    const user = normalizeUser(await auth.verify(m[1], room));
+    const user = normalizeUser(await auth.verify(m[1], room), auth.roleMap ?? null);
     if (!scopes.some((s) => user.scope.includes(s))) throw new AuthError('scope', `권한이 없다 (${scopes.join('·')} 필요)`);
     return user;
   };
@@ -753,8 +798,23 @@ export function startServer({
       await room.canonical.terminate();
       throw new HttpError(422, 'invalid-document', `문서를 열지 못했다: ${res.reason}`);
     }
+    // S2 왕복 점검: rhwp 가 모든 부분을 모델에서 다시 쓴 결과를 원본과 견준다. 손대지 않은 부분은 원본 바이트를 그대로 쓰므로
+    // "저장 후 비교"로는 드러나지 않는 것(그 부분을 편집하면 사라질 것)을 방을 만들 때 알린다. 보조가 없으면 건너뛴다.
+    if (roundtripMode !== 'off') {
+      const rt = await room.canonical.roundtrip();
+      if (rt.ok && rt.supported) {
+        room.roundtrip = summarizeRoundtrip(rt.result);
+        log(`[${name}] 왕복 점검 ${room.roundtrip.ok ? '통과' : `경고 ${room.roundtrip.lost.map((l) => `${l.kind}×${l.count}`).join(', ') || `IR 차이 ${room.roundtrip.irDiff}`}`} (${rt.ms}ms)`);
+        if (!room.roundtrip.ok && roundtripMode === 'block') {
+          await room.canonical.terminate();
+          throw new HttpError(422, 'roundtrip', 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았다(COLLAB_ROUNDTRIP=block)', { reason: 'roundtrip', roundtrip: room.roundtrip });
+        }
+      } else if (!rt.ok) {
+        log(`[${name}] 왕복 점검 실패: ${rt.reason}`);
+      }
+    }
     try {
-      if (store) await store.setBase(name, { baseSeq: 0, data: raw, engine: serverEngine, generation: 0, encryptedSource: room.encryptedSource });
+      if (store) await store.setBase(name, { baseSeq: 0, data: raw, engine: serverEngine, generation: 0, encryptedSource: room.encryptedSource, roundtrip: room.roundtrip });
     } catch (error) {
       await room.canonical.terminate();
       throw error;
@@ -766,7 +826,7 @@ export function startServer({
     rooms.set(name, room);
     scheduleUnload(room);
     log(`[${name}] 방 생성(파일 ${raw.length}B, ${formatOf(raw)})${user.sub ? ` by ${user.sub}` : ''} 정본 ${res.digest.slice(0, 12)}${store ? ' (저장)' : ''}${room.encryptedSource ? ' — 경고: 원래 암호 문서, 암호 없이 보관' : ''}`);
-    return { room: name, ...makeInvites(name) };
+    return { room: name, ...makeInvites(name), ...(room.roundtrip ? { roundtrip: room.roundtrip } : {}) };
   };
 
   /** GET /rooms/{room}/document: 정본을 내보낸 최신 문서(원본 형식). 메모리에 없으면 저장소에서 연다. */
@@ -804,7 +864,8 @@ export function startServer({
   const onRequest = createHttpHandler({
     api: { createRoom: createRoomFromFile, download: downloadDocument },
     staticDir, maxBodyBytes: maxMessageBytes, originAllowed, log,
-    health: () => ({ auth: auth.mode, encryptedAllowed: allowEncrypted }),
+    health: () => ({ auth: auth.mode, encryptedAllowed: allowEncrypted, ...(embedOnly ? { embedOnly: true, embedOrigins } : {}) }),
+    embedOnly: embedOnly ? { origins: embedOrigins } : null,
   });
   const httpServer = tls ? https.createServer({ cert: tls.cert, key: tls.key }, onRequest) : http.createServer(onRequest);
   httpServer.on('upgrade', (req, socket, head) => {

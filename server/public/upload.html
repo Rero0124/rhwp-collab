@@ -74,6 +74,7 @@
     <label for="editor">편집기 주소</label>
     <input id="editor" type="url" spellcheck="false">
     <p class="hint">편집기를 이 서버가 함께 내주면 그대로 둡니다. 다른 곳(개발 서버 등)에 있으면 그 주소로 바꿉니다.</p>
+    <p id="roundtrip" class="hint" hidden></p>
     <div id="links"></div>
     <p id="no-invite" class="hint" hidden>이 서버는 초대 토큰을 만들지 않습니다(인증을 껐거나, 바깥 시스템이 토큰을 발급하는 방식). 인증을 켠 서버라면 링크 뒤에 <code>#token=…</code> 을 바깥 시스템이 붙여 줍니다.</p>
     <div class="row"><button id="download" type="button" class="secondary">지금 문서 내려받기</button></div>
@@ -84,6 +85,15 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const STORE_KEY = 'collab-create-token';
+  // 6단계 S2 왕복 점검 문구 — collab-client/src/session/roundtrip.ts 와 같은 규칙(바꾸면 함께 바꾼다)
+  const KIND_LABELS = { bindata: '그림·첨부 데이터', ole: 'OLE 개체', 'ole-clsid': 'OLE 개체', record: 'rhwp 가 모르는 레코드', ir: '내용', cfb: '파일 구조' };
+  const lostText = (rt) => {
+    const parts = (rt?.lost ?? []).map((l) => `${KIND_LABELS[l.kind] ?? l.kind} ${l.count}개`);
+    if (parts.length === 0 && rt?.irDiff > 0) parts.push(`내용 차이 ${rt.irDiff}곳`);
+    return parts.join(', ');
+  };
+  const roundtripText = (rt) => (rt.ok ? 'rhwp 가 이 문서를 그대로 다룰 수 있습니다'
+    : `이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다${lostText(rt) ? `: ${lostText(rt)}` : ''}. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다`);
   const LABELS = { edit: ['편집', '문서를 고칠 수 있습니다'], view: ['보기', '문서와 다른 사람 커서만 봅니다'], form: ['양식 입력', '누름틀과 양식 칸만 채웁니다'], comment: ['메모', '메모만 달 수 있습니다'] };
   const safeGet = (k) => { try { return sessionStorage.getItem(k); } catch { return null; } };
   const safeSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch { /* 저장소를 쓸 수 없음 */ } };
@@ -181,6 +191,10 @@
         status($('status'), why, 'err');
         return;
       }
+      if (body.error === 'roundtrip') {
+        status($('status'), `rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다${lostText(body.roundtrip) ? `: ${lostText(body.roundtrip)}` : ''}`, 'err');
+        return;
+      }
       if (!res.ok) {
         const why = body.reason ? `${body.error} (${body.reason})` : (body.message ?? body.error ?? res.statusText);
         throw new Error(`${res.status} ${why}`);
@@ -189,6 +203,9 @@
       $('room').textContent = created.room;
       $('expires').textContent = created.inviteExpiresAt ? ` · 링크는 ${new Date(created.inviteExpiresAt).toLocaleString()}까지 쓸 수 있습니다` : '';
       renderLinks();
+      const rt = $('roundtrip');
+      rt.hidden = !created.roundtrip;
+      if (created.roundtrip) { rt.textContent = roundtripText(created.roundtrip); rt.style.color = created.roundtrip.ok ? '' : 'var(--err)'; }
       $('result').hidden = false;
       status($('status'), `방을 만들었습니다: ${file.name}`, 'ok');
     } catch (error) {

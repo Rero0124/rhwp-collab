@@ -21,7 +21,8 @@ die() { echo "build-studio: $*" >&2; exit 1; }
 cd "${studio}"
 # 타입 검사(플러그인 포함 — tsconfig paths 가 collab-client 를 가리킨다)
 node_modules/.bin/tsc --noEmit -p .
-node_modules/.bin/vite build --outDir "${out}" --emptyOutDir
+# 서버가 같은 출처로 내주는 빌드라 "공동편집 시작" 메뉴(collab-launcher)를 묶는다(5단계 D3)
+CC_RHWP_COLLAB_LAUNCHER=1 node_modules/.bin/vite build --outDir "${out}" --emptyOutDir
 
 [ -f "${out}/index.html" ] || die "산출물에 index.html 이 없습니다: ${out}"
 

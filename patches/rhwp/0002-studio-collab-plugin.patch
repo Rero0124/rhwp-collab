@@ -1009,7 +1009,7 @@ index 7d251116..fb99ce2b 100644
    /** Undo 실행 (커맨드 시스템용) */
    performUndo(): void { this.handleUndo(); }
 diff --git a/rhwp-studio/src/main.ts b/rhwp-studio/src/main.ts
-index 50b4215d..b0a8e990 100644
+index 50b4215d..49283930 100644
 --- a/rhwp-studio/src/main.ts
 +++ b/rhwp-studio/src/main.ts
 @@ -6,6 +6,7 @@ import { isPdfInput, type PdfInputSource } from './core/pdf-open';
@@ -1053,7 +1053,7 @@ index 50b4215d..b0a8e990 100644
    protectDraft: async draft => {
      if (!wasm.requiresPasswordForSave) return draft;
      const cipher = wasm.recoveryCipher;
-@@ -348,6 +362,10 @@ async function resolvePlugin(id: string): Promise<StudioPlugin> {
+@@ -348,6 +362,14 @@ async function resolvePlugin(id: string): Promise<StudioPlugin> {
    if (import.meta.env.DEV && id === 'dev-probe') {
      return (await import('@/plugin/dev-probe-plugin')).devProbePlugin;
    }
@@ -1061,10 +1061,14 @@ index 50b4215d..b0a8e990 100644
 +  if (id === 'collab') {
 +    return (await import('@cc-rhwp/collab-plugin')).collabPlugin;
 +  }
++  // cc-rhwp(5단계 D3): "공동편집 시작" 메뉴 — 지금 문서로 방을 만들고 링크를 보여 준다
++  if (__CC_RHWP_COLLAB_LAUNCHER__ && id === 'collab-launcher') {
++    return (await import('@cc-rhwp/collab-launcher')).collabLauncherPlugin;
++  }
    throw new Error(`허용되지 않은 플러그인: ${id}`);
  }
  
-@@ -368,7 +386,10 @@ const plugins = new PluginHostRegistry({
+@@ -368,7 +390,10 @@ const plugins = new PluginHostRegistry({
    automation,
    eventBus,
    getInputHandler: () => inputHandler,
@@ -1076,7 +1080,7 @@ index 50b4215d..b0a8e990 100644
    createBlankDocument: async (options) => {
      if (options?.confirmUnsaved && !await canReplaceCurrentDocument()) return false;
      await createNewDocument();
-@@ -376,6 +397,34 @@ const plugins = new PluginHostRegistry({
+@@ -376,6 +401,36 @@ const plugins = new PluginHostRegistry({
    },
    resolve: resolvePlugin,
    sidePanels,
@@ -1094,6 +1098,8 @@ index 50b4215d..b0a8e990 100644
 +  },
 +  // cc-rhwp: 공동편집 중 이탈 확인 — studio 의 저장 안 한 변경 확인 대신 플러그인 판정(보내지 못한 편집이 있을 때만)
 +  guardUnload: (_pluginId, check) => documentState.guardUnload(check),
++  // cc-rhwp(5단계 D3·D5): 지금 문서의 보호 상태 — 암호를 풀고 연 문서는 공동편집 방으로 올리지 않는다
++  documentProtection: () => ({ requiresPasswordForSave: wasm.requiresPasswordForSave }),
 +  // cc-rhwp(4단계): 공동편집 되돌리기 훅 — 걸면 기록을 멈추지 않고 훅이 위치를 옮기고 막힘을 판정한다.
 +  enableCollabUndo: (_pluginId, hook) => {
 +    const controller = inputHandler?.setCollabHistory(hook) ?? null;
@@ -1111,7 +1117,7 @@ index 50b4215d..b0a8e990 100644
    selectTextRange: (range) => {
      if (!inputHandler) return false;
      navigateToSearchHit(inputHandler, {
-@@ -478,6 +527,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
+@@ -478,6 +533,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
  }
  
  function handleAutosaveStatus(status: AutosaveStatus): void {
@@ -1121,7 +1127,7 @@ index 50b4215d..b0a8e990 100644
    const message = document.getElementById('sb-message');
    if (!message) return;
    if (autosaveStatusRestoreTimer) {
-@@ -564,6 +616,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
+@@ -564,6 +622,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
      ? rendererSession?.getCanvasKitRenderer() ?? null
      : null;
    if (!renderer || (!fontNames?.length && !refresh)) return;
@@ -1130,7 +1136,7 @@ index 50b4215d..b0a8e990 100644
    const requestedFonts = [...(fontNames ?? [])];
    void (async () => {
      await loadStoredLocalFonts();
-@@ -693,9 +747,12 @@ async function initialize(): Promise<void> {
+@@ -693,9 +753,12 @@ async function initialize(): Promise<void> {
            try {
              // 저장된 Local Font Access 권한이 있으면 첫 replay부터 원 face의 SFNT bytes를
              // CanvasKit에 전달한다. CSS local()에서 EBDT face가 두부로 바뀌는 경로를 타지 않는다.
@@ -1146,7 +1152,7 @@ index 50b4215d..b0a8e990 100644
            } catch (error) {
              // 로컬 권한이 만료됐거나 face 읽기에 실패해도 portable bundled face로 계속 연다.
              console.warn(
-@@ -1313,8 +1370,29 @@ function setupEventListeners(): void {
+@@ -1313,8 +1376,29 @@ function setupEventListeners(): void {
      }
    });
  
@@ -1176,7 +1182,7 @@ index 50b4215d..b0a8e990 100644
      wasm.invalidateCanvasMetricFonts();
      const documentGeneration = wasm.documentGeneration;
      const hostGeneration = getHostFontState().generation;
-@@ -1343,6 +1421,7 @@ function setupEventListeners(): void {
+@@ -1343,6 +1427,7 @@ function setupEventListeners(): void {
        clearDeclaredLocalPrograms();
      }
      if (!canvasView || wasm.pageCount === 0) return;
@@ -1184,7 +1190,7 @@ index 50b4215d..b0a8e990 100644
      const state = getLocalFontState();
      const generation = `${state.detectedAt ?? 'none'}:${state.source ?? 'none'}:${state.count}`;
      if (generation === lastAppliedLocalFontGeneration) return;
-@@ -1535,11 +1614,13 @@ async function initializeDocument(
+@@ -1535,11 +1620,13 @@ async function initializeDocument(
    try {
      signal.throwIfAborted();
      // 이미 승인된 snapshot을 권한 prompt 없이 준비한 뒤 프로그램을 선택한다.
@@ -1200,7 +1206,7 @@ index 50b4215d..b0a8e990 100644
        await promptLocalFontsIfNeeded(displayName);
        signal.throwIfAborted();
      }
-@@ -1995,9 +2076,20 @@ async function renderRecentSubmenu(): Promise<void> {
+@@ -1995,9 +2082,20 @@ async function renderRecentSubmenu(): Promise<void> {
    panel.closest('.md-sub')?.classList.toggle('disabled', recents.length === 0);
  }
  
@@ -1222,13 +1228,17 @@ index 50b4215d..b0a8e990 100644
  }
  
  async function offerAutosaveRecoveryIfIdle(): Promise<void> {
-@@ -2306,6 +2398,10 @@ void initPromise.then(() => {
+@@ -2306,6 +2404,14 @@ void initPromise.then(() => {
    if (__RHWP_AI__ && sidePanels && window.parent === window) {
      plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
    }
 +  // cc-rhwp: ?collab=ws://…&room=…&name=… 또는 #token=…&room=… 이면 공동편집 플러그인을 올린다.
 +  if (isCollabLaunch()) {
 +    plugins.load('collab').catch((error) => console.error('[main] 공동편집 로드 실패', error));
++  } else if (__CC_RHWP_COLLAB_LAUNCHER__ && window.parent === window && chromeMode !== 'embed') {
++    // cc-rhwp(5단계 D3): 공동편집 서버와 같은 출처로 낸 빌드의 최상위 창에서만 "공동편집 시작" 메뉴. 서버가 없거나
++    // 바깥 시스템이 방을 만드는 방식(url)이면 아무 흔적도 남기지 않는다(메뉴·콘솔 모두).
++    plugins.load('collab-launcher').catch(() => {});
 +  }
  });
  
@@ -1299,7 +1309,7 @@ index 00000000..011add1c
 +  };
 +}
 diff --git a/rhwp-studio/src/plugin/host.ts b/rhwp-studio/src/plugin/host.ts
-index 07a99843..5bfa06a9 100644
+index 07a99843..fd2e0d42 100644
 --- a/rhwp-studio/src/plugin/host.ts
 +++ b/rhwp-studio/src/plugin/host.ts
 @@ -15,6 +15,8 @@ import type { StudioAutomation } from '@/automation/types';
@@ -1329,7 +1339,7 @@ index 07a99843..5bfa06a9 100644
    createBlankDocument: (options?: { confirmUnsaved?: boolean }) => Promise<boolean>;
    /**
     * id 로 플러그인을 가져온다. **allowlist 는 이 훅이 쥔다** — 여기서 거절하면 호스트는
-@@ -57,8 +61,34 @@ export interface PluginHostDeps {
+@@ -57,8 +61,36 @@ export interface PluginHostDeps {
    sidePanels?: SidePanelRegistry;
    /** 편집기 선택 이동. 찾기 대화상자와 같은 경로를 쓰도록 studio 가 넘긴다. */
    selectTextRange?: (range: PluginTextRange) => boolean;
@@ -1349,6 +1359,8 @@ index 07a99843..5bfa06a9 100644
 +  suspendHistory?: (pluginId: string, message: string) => () => void;
 +  /** 이탈 확인 판정(cc-rhwp). 반환값은 해제 함수. 없으면 판정 요청은 아무 일도 하지 않는다(studio 기본 확인 그대로). */
 +  guardUnload?: (pluginId: string, check: () => boolean) => () => void;
++  /** 지금 문서의 보호 상태(cc-rhwp 5단계 D3·D5). 없으면 보호 없음으로 본다. */
++  documentProtection?: () => { requiresPasswordForSave: boolean };
 +  /** 공동편집 되돌리기 훅(cc-rhwp 4단계). 없거나 `null` 이면 지원하지 않는 것. */
 +  enableCollabUndo?: (pluginId: string, hook: CollabHistoryHook) => { controller: CollabHistoryController; release: () => void } | null;
 +  /** 글꼴 정책(cc-rhwp S3-1). 반환값은 해제 함수. 없으면 정책 요청은 아무 일도 하지 않는다. */
@@ -1364,7 +1376,7 @@ index 07a99843..5bfa06a9 100644
  /** `getSelectionText` 가 한 번에 돌려주는 글자 수 상한. */
  const SELECTION_TEXT_MAX_CHARS = 20000;
  
-@@ -69,7 +99,8 @@ const UNLOAD_TX_POLL_MS = 20;
+@@ -69,7 +101,8 @@ const UNLOAD_TX_POLL_MS = 20;
  function emptyLedger(): PluginLedger {
    return {
      commands: new Set(), menuItems: new Set(),
@@ -1374,7 +1386,7 @@ index 07a99843..5bfa06a9 100644
    };
  }
  
-@@ -238,8 +269,8 @@ class PluginHostFacade implements PluginHost {
+@@ -238,8 +271,8 @@ class PluginHostFacade implements PluginHost {
      };
    }
  
@@ -1385,7 +1397,7 @@ index 07a99843..5bfa06a9 100644
    }
  
    createBlankDocument(options?: { confirmUnsaved?: boolean }): Promise<boolean> {
-@@ -290,6 +321,14 @@ class PluginHostFacade implements PluginHost {
+@@ -290,6 +323,14 @@ class PluginHostFacade implements PluginHost {
  
    events = {
      on: (name: string, cb: (payload?: unknown) => void): (() => void) => {
@@ -1400,7 +1412,7 @@ index 07a99843..5bfa06a9 100644
        const off = this.deps.eventBus.on(name, cb);
        this.ledger.eventUnsubs.push(off);
        return off;
-@@ -305,6 +344,151 @@ class PluginHostFacade implements PluginHost {
+@@ -305,6 +346,155 @@ class PluginHostFacade implements PluginHost {
      return off;
    }
  
@@ -1446,6 +1458,10 @@ index 07a99843..5bfa06a9 100644
 +    // 되돌리기 기록 중지와 같은 원장 — unload 때 풀린다
 +    const release = this.ledgerOnce(this.ledger.historyResumes, got.release);
 +    return { ...got.controller, release };
++  }
++
++  documentProtection(): { requiresPasswordForSave: boolean } {
++    return { requiresPasswordForSave: this.deps.documentProtection?.().requiresPasswordForSave === true };
 +  }
 +
 +  setFontPolicy(policy: 'bundled-only'): () => void {
@@ -1552,7 +1568,7 @@ index 07a99843..5bfa06a9 100644
    /** 문서가 교체됐음을 이 플러그인에 알린다. 호스트도 외부 교체 때 부른다. */
    notifySwap(): void {
      const lease = this.borrowDocument();
-@@ -435,6 +619,18 @@ export class PluginHostRegistry {
+@@ -435,6 +625,18 @@ export class PluginHostRegistry {
      for (const off of ledger.uiUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
@@ -1571,7 +1587,7 @@ index 07a99843..5bfa06a9 100644
      for (const off of ledger.swapUnsubs.reverse()) {
        try { off(); } catch { /* noop */ }
      }
-@@ -448,6 +644,10 @@ export class PluginHostRegistry {
+@@ -448,6 +650,10 @@ export class PluginHostRegistry {
        this.deps.automation.unregisterCommand(commandId);
      }
      ledger.uiUnsubs.length = 0;
@@ -1583,7 +1599,7 @@ index 07a99843..5bfa06a9 100644
      ledger.eventUnsubs.length = 0;
      ledger.menuItems.clear();
 diff --git a/rhwp-studio/src/plugin/types.ts b/rhwp-studio/src/plugin/types.ts
-index 571e2b4d..3bec5fd4 100644
+index 571e2b4d..72ea3a6a 100644
 --- a/rhwp-studio/src/plugin/types.ts
 +++ b/rhwp-studio/src/plugin/types.ts
 @@ -9,6 +9,7 @@
@@ -1621,7 +1637,7 @@ index 571e2b4d..3bec5fd4 100644
    /**
     * 빈 문서로 교체한다. 끝날 때까지 기다릴 수 있다. `confirmUnsaved` 면 메뉴의 「새 문서」처럼
     * 저장 안 된 변경을 먼저 묻는다 — 사용자가 취소하면 `false` 이고 문서는 그대로다.
-@@ -173,6 +185,94 @@ export interface PluginHost {
+@@ -173,6 +185,99 @@ export interface PluginHost {
  
    /** 문서가 교체되면 새 lease 를 받는다. 반환값은 해지 함수다. */
    onDocumentSwap(cb: (lease: DocumentLease) => void): () => void;
@@ -1682,6 +1698,11 @@ index 571e2b4d..3bec5fd4 100644
 +   * 원장에 담겨 unload 때 회수된다.
 +   */
 +  setFontPolicy(policy: 'bundled-only'): () => void;
++  /**
++   * 지금 문서의 보호 상태(cc-rhwp 5단계 D3·D5, 읽기만). `requiresPasswordForSave` 는 암호를 풀고 연 문서라 저장할 때
++   * 암호를 다시 걸어야 한다는 뜻이다 — 공동편집은 암호 없는 바이트로 오가므로 이런 문서를 방으로 올리지 않는다.
++   */
++  documentProtection(): { requiresPasswordForSave: boolean };
 +
 +  /**
 +   * 캐럿을 옮긴다(선택은 접는다). 문서는 바꾸지 않는다. 문단·글자 번호가 범위 밖이면 가장 가까운 유효
@@ -1716,7 +1737,7 @@ index 571e2b4d..3bec5fd4 100644
  }
  
  /**
-@@ -212,6 +312,14 @@ export interface PluginLedger {
+@@ -212,6 +317,14 @@ export interface PluginLedger {
    swapUnsubs: Array<() => void>;
    /** `ui.registerSidePanel` 이 돌려준 해지 함수 */
    uiUnsubs: Array<() => void>;
@@ -1731,6 +1752,19 @@ index 571e2b4d..3bec5fd4 100644
    /** 진행 중인 트랜잭션 수. 0 이 될 때까지 unload 는 기다린다. */
    activeTx: number;
  }
+diff --git a/rhwp-studio/src/vite-env.d.ts b/rhwp-studio/src/vite-env.d.ts
+index cc5860ac..870d1a52 100644
+--- a/rhwp-studio/src/vite-env.d.ts
++++ b/rhwp-studio/src/vite-env.d.ts
+@@ -6,3 +6,8 @@ declare const __RHWP_DISABLE_EXTERNAL_WEBFONTS__: boolean;
+ declare const __RHWP_HWPCTRL__: boolean;
+ /** AI 도우미 플러그인을 이 빌드에 포함하는가 (`RHWP_WITHOUT_AI=1` 이면 false). */
+ declare const __RHWP_AI__: boolean;
++/**
++ * cc-rhwp: "공동편집 시작" 메뉴(collab-launcher)를 이 빌드에 묶는가 — 공동편집 서버가 같은 출처로 내주는 빌드
++ * (`CC_RHWP_COLLAB_LAUNCHER=1`, scripts/build-studio.sh)와 `COLLAB_DEV_SERVER` 를 준 개발 서버만 true.
++ */
++declare const __CC_RHWP_COLLAB_LAUNCHER__: boolean;
 diff --git a/rhwp-studio/tests/plugin-autosave-suspend.test.ts b/rhwp-studio/tests/plugin-autosave-suspend.test.ts
 new file mode 100644
 index 00000000..5052f728
@@ -2187,10 +2221,10 @@ index 00000000..877ebd9b
 +});
 diff --git a/rhwp-studio/tests/plugin-collab-undo.test.ts b/rhwp-studio/tests/plugin-collab-undo.test.ts
 new file mode 100644
-index 00000000..3817769c
+index 00000000..5b839d0e
 --- /dev/null
 +++ b/rhwp-studio/tests/plugin-collab-undo.test.ts
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,465 @@
 +// cc-rhwp(4단계 U1·U2): 공동편집 되돌리기 — 명령 위치 표(engine/collab-undo.ts)와 히스토리·호스트 배선.
 +//
 +// 명령 클래스(command.ts)와 CommandHistory 는 node 의 strip-only TS 로 실행할 수 없어(이 저장소의 undo 테스트
@@ -2622,34 +2656,123 @@ index 00000000..3817769c
 +  assert.match(main, /if \(isCollabLaunch\(\)\) \{\s*plugins\.load\('collab'\)/);
 +  assert.match(main, /guardUnload: \(_pluginId, check\) => documentState\.guardUnload\(check\)/);
 +});
++
++// ── 5단계 D3·D5: 문서 보호 상태, "공동편집 시작" 메뉴(collab-launcher) ─────────────────
++
++test('documentProtection: studio 의 판정을 읽기만으로 넘긴다(없거나 참이 아니면 보호 없음)', async () => {
++  for (const [dep, want] of [
++    [() => ({ requiresPasswordForSave: true }), true],
++    [() => ({ requiresPasswordForSave: false }), false],
++    [undefined, false],
++    [() => ({ requiresPasswordForSave: 'yes' as unknown as boolean }), false],
++  ] as const) {
++    const { registry, host } = hostWith(undefined, dep ? { documentProtection: dep } : {});
++    await registry.load('probe');
++    assert.deepEqual(host().documentProtection(), { requiresPasswordForSave: want });
++  }
++});
++
++test('main.ts: 문서 보호 상태는 WasmBridge 의 requiresPasswordForSave(암호를 풀고 연 문서 — HWP·HWPX 모두)', () => {
++  const main = source('src/main.ts');
++  assert.match(main, /documentProtection: \(\) => \(\{ requiresPasswordForSave: wasm\.requiresPasswordForSave \}\)/);
++  // 암호를 풀고 연 경로가 형식과 상관없이 표시를 켠다(HWPX 는 문서 정보의 encrypted 가 false 라 그것으로는 못 가린다)
++  assert.match(main, /wasm\.requiresPasswordForSave = true/);
++});
++
++test('main.ts: "공동편집 시작" 메뉴는 그 빌드(__CC_RHWP_COLLAB_LAUNCHER__)의 공동편집으로 열지 않은 최상위 창에서만, 실패는 조용히', () => {
++  const main = source('src/main.ts');
++  assert.match(main, /if \(__CC_RHWP_COLLAB_LAUNCHER__ && id === 'collab-launcher'\) \{\s*return \(await import\('@cc-rhwp\/collab-launcher'\)\)\.collabLauncherPlugin;/);
++  assert.match(main, /\} else if \(__CC_RHWP_COLLAB_LAUNCHER__ && window\.parent === window && chromeMode !== 'embed'\) \{[\s\S]*?plugins\.load\('collab-launcher'\)\.catch\(\(\) => \{\}\);/);
++  const config = source('vite.config.ts');
++  assert.match(config, /__CC_RHWP_COLLAB_LAUNCHER__: JSON\.stringify\(withCollabLauncher\)/);
++  assert.match(config, /const withCollabLauncher = process\.env\.CC_RHWP_COLLAB_LAUNCHER === '1' \|\| collabDevServer !== '';/);
++  // 개발 서버 프록시는 COLLAB_DEV_SERVER 가 있을 때만(빌드에는 영향 없음 — server 설정)
++  assert.match(config, /\.\.\.\(collabDevServer \? \{ '\/rooms': \{ target: collabDevServer \}, '\/healthz': \{ target: collabDevServer \} \} : \{\}\)/);
++  assert.match(config, /'@cc-rhwp\/collab-launcher': resolve\(/);
++});
 diff --git a/rhwp-studio/tsconfig.json b/rhwp-studio/tsconfig.json
-index 564f230e..8c680904 100644
+index 564f230e..cadde804 100644
 --- a/rhwp-studio/tsconfig.json
 +++ b/rhwp-studio/tsconfig.json
-@@ -16,7 +16,8 @@
+@@ -16,7 +16,9 @@
      "paths": {
        "@/*": ["./src/*"],
        "@wasm/*": ["../pkg/*"],
 -      "@rhwp/hwpctrl/studio-plugin": ["./types/rhwp-hwpctrl-plugin.d.ts"]
 +      "@rhwp/hwpctrl/studio-plugin": ["./types/rhwp-hwpctrl-plugin.d.ts"],
-+      "@cc-rhwp/collab-plugin": ["../../../collab-client/src/plugin.ts"]
++      "@cc-rhwp/collab-plugin": ["../../../collab-client/src/plugin.ts"],
++      "@cc-rhwp/collab-launcher": ["../../../collab-client/src/launcher.ts"]
      }
    },
    "include": ["src"]
 diff --git a/rhwp-studio/vite.config.ts b/rhwp-studio/vite.config.ts
-index 58c83bdd..421d2542 100644
+index 58c83bdd..11b9f48d 100644
 --- a/rhwp-studio/vite.config.ts
 +++ b/rhwp-studio/vite.config.ts
-@@ -47,6 +47,8 @@ export default defineConfig({
+@@ -25,6 +25,13 @@ const withHwpctrl = process.env.RHWP_WITHOUT_HWPCTRL !== '1';
+  * AI 청크와 제공자 SDK 가 산출물에 남지 않는다.
+  */
+ const withAi = process.env.RHWP_WITHOUT_AI !== '1';
++/**
++ * cc-rhwp: 개발 중 공동편집 서버(예: `COLLAB_DEV_SERVER=http://127.0.0.1:8787`). 주면 개발 서버가 `/rooms`·`/healthz` 를
++ * 그 서버로 넘겨 같은 출처처럼 쓴다(서버에 CORS 가 없다). 개발 서버 전용 — 빌드 산출물에는 영향이 없다.
++ */
++const collabDevServer = process.env.COLLAB_DEV_SERVER ?? '';
++/** cc-rhwp: "공동편집 시작" 메뉴를 묶는가 — 서버가 같은 출처로 내주는 빌드(build-studio)와 위 개발 서버만. */
++const withCollabLauncher = process.env.CC_RHWP_COLLAB_LAUNCHER === '1' || collabDevServer !== '';
+ 
+ export default defineConfig({
+   define: {
+@@ -36,6 +43,10 @@ export default defineConfig({
+     ),
+     __RHWP_HWPCTRL__: JSON.stringify(withHwpctrl),
+     __RHWP_AI__: JSON.stringify(withAi),
++    __CC_RHWP_COLLAB_LAUNCHER__: JSON.stringify(withCollabLauncher),
++    // cc-rhwp: 개발 서버에서만 — 편집기(7700)와 공동편집 서버가 다른 출처라 링크에 서버의 ws 주소를 싣는다(빌드는 빈 값 =
++    // 같은 출처 wss). 개발 서버는 HMR 이 같은 출처 웹소켓을 쓰므로 ws 를 넘기지 않는다.
++    __CC_RHWP_COLLAB_DEV_WS__: JSON.stringify(collabDevServer ? `${collabDevServer.replace(/^http/, 'ws').replace(/\/+$/, '')}/` : ''),
+   },
+   resolve: {
+     alias: {
+@@ -47,6 +58,10 @@ export default defineConfig({
        // 플러그인 패키지 — 동적 import 로만 들어오므로 별도 청크가 된다.
        // 올리지 않으면 코드도 로드되지 않는다(플러그인 없는 studio 의 초기 비용 0).
        '@rhwp/hwpctrl/studio-plugin': resolve(configDir, '..', 'npm', 'hwpctrl-ocx', 'src', 'studio-plugin.mjs'),
 +      // cc-rhwp: 공동편집 플러그인 (다운스트림 패치, collab-client/ 참고)
 +      '@cc-rhwp/collab-plugin': resolve(configDir, '..', '..', '..', 'collab-client', 'src', 'plugin.ts'),
++      // cc-rhwp: "공동편집 시작" 메뉴 — 평소 studio 에서 올라가므로 엔진·분류표 없이 가볍게 따로 둔다
++      '@cc-rhwp/collab-launcher': resolve(configDir, '..', '..', '..', 'collab-client', 'src', 'launcher.ts'),
      },
    },
    // AI SDK 는 질문할 때 동적 import 로만 들어온다. 개발 서버가 그때 처음 발견하면 의존성을
-@@ -75,6 +77,8 @@ export default defineConfig({
+@@ -57,14 +72,18 @@ export default defineConfig({
+   server: {
+     host: '127.0.0.1',
+     port: 7700,
+-    proxy: useSubsecondWasm ? {
+-      '/_dioxus': {
+-        target: 'http://127.0.0.1:7711',
+-        ws: true,
+-      },
+-      '/wasm': {
+-        target: 'http://127.0.0.1:7711',
+-      },
++    proxy: useSubsecondWasm || collabDevServer ? {
++      ...(useSubsecondWasm ? {
++        '/_dioxus': {
++          target: 'http://127.0.0.1:7711',
++          ws: true,
++        },
++        '/wasm': {
++          target: 'http://127.0.0.1:7711',
++        },
++      } : {}),
++      // cc-rhwp: 공동편집 서버의 HTTP API(방 만들기·서버 확인)
++      ...(collabDevServer ? { '/rooms': { target: collabDevServer }, '/healthz': { target: collabDevServer } } : {}),
+     } : undefined,
+     fs: {
+       // [Task #741 후속] 외부 file path 그림 영역 영역 samples/ dir 영역 영역 fetch 가능 영역.
+@@ -75,6 +94,8 @@ export default defineConfig({
          subsecondWasmDir,
          resolve(configDir, '..', 'samples'),
          resolve(configDir, '..', 'npm', 'editor'),

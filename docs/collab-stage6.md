@@ -88,6 +88,33 @@
 - 시험: 허용 출처의 페이지 안 iframe 은 동작한다. 최상위로 열면 403 페이지가 뜬다. 허용되지 않은 출처의 iframe 은
   브라우저가 막는다. 주소에 토큰을 붙여 열어도 들어오지 않는다. 부모가 토큰을 갱신해 준다.
 
+## N1 네이티브 준비: 연결 상태 기계를 플랫폼 중립 세션으로 (사용자 결정, 2026-11-27)
+
+지금 `collab-client/src/plugin.ts`(약 1,100줄)에 studio 연결과 공동편집 연결 처리가 섞여 있다. 나중에 네이티브
+클라이언트로 넓힐 때 다시 쓸 수 있도록, 연결 처리를 DOM·studio 에 의존하지 않는 세션 계층으로 옮긴다(5단계 D0 에서
+미뤄 둔 일).
+
+- **옮길 것 → `collab-client/src/session/` 의 `CollabSession`:**
+  - 연결, hello, welcome·catchup 처리, 재접속·백오프, 세대·lastSeq
+  - 보내기 묶음과 inflight·batchId, reject·invalid·forbidden·unauthorized·too-large 처리, 재동기화
+  - digest 보고, 커서 주고받기, replaced 확정, 권한·이름(welcome.user)
+- **세션이 바깥에서 받는 것(인터페이스):**
+  - `Transport`: 열기·보내기·닫기·받기. 브라우저는 WebSocket 구현이다.
+  - `Host`: base 바이트로 문서 열기, 원격 state 반영, 캐럿 읽기·쓰기, 조합 중 여부, 이탈 확인, 되돌리기 훅, 안내 표시
+    (문구는 세션이 이유 코드로 넘기고 문구는 호스트가 정함).
+  - `TokenProvider`(5단계 D0 그대로), 시계·타이머(시험에서 바꿔 끼움).
+  - 편집 기록 엔진(`CollabEngine`)은 지금처럼 TS 에 있다. 네이티브에서는 이 엔진을 옮기거나 같은 규약을 따로 구현해야
+    한다. 엔진의 조율 부분을 Rust(`collab-core`)로 옮기는 일은 네이티브 계획이 구체화되면 정한다(범위 밖).
+- **`plugin.ts` 는 studio 어댑터로 남는다:** WebSocket Transport, studio Host(문서 열기·applyExternal·캐럿·overlay·
+  안내 DOM), studio 쪽 접속 정보(주소·#token·부품 전용 토큰 통로), launcher 와의 공용 부분.
+- **조건: 동작이 바뀌지 않는다.** 기존 브라우저 시험(R7·R8·R10·T4·S3-4·s5-deploy·s6-embed·u1-undo·d3-launcher·
+  s1-rewrite)이 고치지 않고 통과해야 한다. 엔진 지문은 바뀌지 않아야 한다(plugin·session 은 코드 해시 대상이 아님).
+- **새 시험:** `CollabSession` 을 가짜 Transport·Host 로 Node 에서 돌린다. 지금까지 브라우저로만 보던 재접속·reject·
+  replaced·unauthorized·세대 전환 경로를 단위 시험으로 덮는다.
+- **문서:** 규약 문서에 "다른 플랫폼에서 클라이언트 만들기" 절을 둔다. 세션이 요구하는 Host·Transport 목록과, 엔진이
+  TS 에 있다는 현재 한계를 적는다.
+- 순서: 먼저 인터페이스 초안(타입 선언)을 설계 세션에 보내고, 승인 뒤 옮긴다.
+
 ## 분담
 
 | 일 | 기존 코드 세션(3b) | 배포 세션(68) |

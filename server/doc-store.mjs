@@ -9,7 +9,7 @@
 //                         다시 읽으므로 결과가 같다. welcome 의 기준점은 메모리에서 고른다.)
 //   doc.hwp | doc.hwpx    사용자 저장본("원본 파일에 저장"). 정본을 내보낸 것. 재생 기준으로 쓰지 않는다
 //                         (엔진 업그레이드 때 마지막 seq 까지 덮고 있으면 새 기준점으로만).
-//   meta.json             {room, generation, baseSeq, engine, baseFormat, docSeq, docFormat, savedAt}
+//   meta.json             {room, generation, baseSeq, engine, baseFormat, docSeq, docFormat, encryptedSource?, savedAt}
 //
 // 쓰기 규칙: 기록은 매 묶음 덧붙이고 fsync 한 뒤에 돌아온다(방송은 그다음). 파일은 임시 파일에 쓰고 fsync →
 // rename(원자적) → 디렉터리 fsync. 세대 전환은 base → meta → 기록 비우기 순서라, 어느 단계에서 죽어도 다시 열면
@@ -21,7 +21,7 @@ import path from 'node:path';
 /**
  * @typedef {{ seq: number, clientId: string, entries: unknown[], batchId?: string }} LogItem
  * @typedef {{ room: string, generation: number, baseSeq: number, engine: string, baseFormat: 'hwp'|'hwpx',
- *   docSeq: number|null, docFormat: 'hwp'|'hwpx'|null, savedAt: string }} Meta
+ *   docSeq: number|null, docFormat: 'hwp'|'hwpx'|null, encryptedSource?: true, savedAt: string }} Meta
  * @typedef {{ meta: Meta, base: Buffer, log: LogItem[], doc: Buffer|null }} Saved
  *
  * @typedef {object} DocStore
@@ -32,10 +32,13 @@ import path from 'node:path';
  * @property {() => Promise<string[]>} rooms
  */
 
-/** 원본 바이트로 형식을 가린다 — HWPX 는 ZIP(PK), HWP 는 CFB. */
+const HWP3_SIGNATURE = Buffer.from('HWP Document File');
+
+/** 원본 바이트로 형식을 가린다 — HWPX 는 ZIP(PK), HWP 는 CFB, HWP3 는 "HWP Document File" 머리(HWP 계열로 둔다). */
 export function formatOf(raw) {
   if (raw.length >= 4 && raw[0] === 0x50 && raw[1] === 0x4b) return 'hwpx';
   if (raw.length >= 8 && raw.readUInt32BE(0) === 0xd0cf11e0) return 'hwp';
+  if (raw.length >= HWP3_SIGNATURE.length && Buffer.from(raw.buffer, raw.byteOffset, HWP3_SIGNATURE.length).equals(HWP3_SIGNATURE)) return 'hwp';
   throw new Error('HWP·HWPX 가 아니다');
 }
 
@@ -132,7 +135,7 @@ export class LocalDocStore {
   }
 
   /** 새 기준점(방 생성·세대 전환): base 를 원자적으로 쓰고 meta 를 바꾼 뒤 기록을 비운다. 저장본 정보는 유지. */
-  async setBase(room, { baseSeq, data, engine, generation }) {
+  async setBase(room, { baseSeq, data, engine, generation, encryptedSource }) {
     const dir = this.dir(room);
     await fs.mkdir(dir, { recursive: true });
     const baseFormat = formatOf(data);
@@ -141,7 +144,9 @@ export class LocalDocStore {
     let prev = null;
     try { prev = await this.readMeta(room); } catch { /* 새 방 */ }
     /** @type {Meta} */
-    const meta = { room, generation, baseSeq, engine, baseFormat, docSeq: prev?.docSeq ?? null, docFormat: prev?.docFormat ?? null, savedAt: new Date().toISOString() };
+    // encryptedSource(5단계 D5): 원래 암호 문서였다 — 주지 않으면 앞 세대의 값을 잇는다(세대 전환)
+    const enc = encryptedSource ?? prev?.encryptedSource ?? false;
+    const meta = { room, generation, baseSeq, engine, baseFormat, docSeq: prev?.docSeq ?? null, docFormat: prev?.docFormat ?? null, ...(enc ? { encryptedSource: true } : {}), savedAt: new Date().toISOString() };
     await writeAtomic(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 1));
     await writeAtomic(path.join(dir, 'log.jsonl'), '');
     return meta;

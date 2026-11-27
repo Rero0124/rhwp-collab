@@ -281,9 +281,13 @@ try {
   const [sv, sa] = await Promise.all([status(V), status(A)]);
   const vNotices = await noticeTexts(V);
   const [dv, da] = await Promise.all([digest(V), digest(A)]);
-  record('7. view: 편집은 forbidden → 제자리 재동기화로 서버 문서로 되돌림, 다른 참여자·seq 그대로',
-    sa.lastSeq === seqBefore && dv === da && sv.resyncCount >= 1 && vNotices.some((t) => t.includes('보기 전용')),
-    `seq ${seqBefore}→${sa.lastSeq}, V resync ${sv.resyncCount}, 안내 ${JSON.stringify(vNotices.filter((t) => /보기|권한/.test(t)))}, 서버 forbidden ${serverLog.filter((l) => l.includes('forbidden')).length}`);
+  // 클라이언트 문(4단계 뒤 기존 코드 세션)이 있으면 입력이 core 에 닿기 전에 막히고(재동기화 0, 서버 forbidden 0), 없으면
+  // 서버가 forbidden(scope) → 제자리 재동기화로 되돌린다. 어느 쪽이든 문서·seq 는 그대로여야 한다.
+  const forbiddenCount = serverLog.filter((l) => l.includes('forbidden')).length;
+  const path7 = sv.resyncCount === 0 && forbiddenCount === 0 ? '클라이언트 문에서 막힘' : '서버 forbidden → 재동기화';
+  record(`7. view: 편집이 문서에 남지 않음(${path7}), 다른 참여자·seq 그대로`,
+    sa.lastSeq === seqBefore && dv === da && vNotices.some((t) => t.includes('보기')) && (path7 === '클라이언트 문에서 막힘' || sv.resyncCount >= 1),
+    `seq ${seqBefore}→${sa.lastSeq}, V resync ${sv.resyncCount}, 안내 ${JSON.stringify(vNotices.filter((t) => /보기|권한/.test(t)))}, 서버 forbidden ${forbiddenCount}`);
   await V.close();
 
   // ── 8. 다시 붙을 때 만료 → 다시 붙기를 멈추고 안내, 보내지 못한 편집 수 ──

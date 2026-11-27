@@ -210,7 +210,7 @@ test('form: 누름틀 값·누름틀 안 입력은 통과하고 다른 참여자
   W.close(); F.close();
 });
 
-test('form: 우회(함수 이름·state 바이트 위조, 기존 글자 모양 고치기)는 forbidden(confined), seq·정본 그대로, 방송 없음', async () => {
+test('form: 우회(함수 이름·state 바이트 위조, 기존 글자 모양 고치기)는 forbidden — op 는 confined, state 는 scope. seq·정본 그대로, 방송 없음', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const F = await client(room, 'F', 'form');
@@ -221,15 +221,15 @@ test('form: 우회(함수 이름·state 바이트 위조, 기존 글자 모양 �
   const ci = FORM.activeField.control;
   await rejected(room, F, W, [op('setFormValue', [0, 0, ci, JSON.stringify({ text: '본문을 고침' })]), op('insertText', [0, 0, 0, 'X'], { meta: { len: 1 } })], 'confined', 'setFormValue 뒤에 본문 입력을 섞은 묶음');
   // state 바이트 위조: 본문을 바꾼 문서를 state 로
-  await rejected(room, F, W, [stateAfter(F, (d) => d.insertText(0, 0, 0, '위조 '))], 'confined', 'state 로 본문 바꾸기');
+  await rejected(room, F, W, [stateAfter(F, (d) => d.insertText(0, 0, 0, '위조 '))], 'scope', 'state 로 본문 바꾸기');
   // state 로 누름틀 값과 본문을 함께(값만 바꾼 척)
-  await rejected(room, F, W, [stateAfter(F, (d) => { d.setFieldValueByName('name', '척'); d.insertText(0, 0, 0, '덤 '); })], 'confined', 'state 로 누름틀 값 + 본문');
+  await rejected(room, F, W, [stateAfter(F, (d) => { d.setFieldValueByName('name', '척'); d.insertText(0, 0, 0, '덤 '); })], 'scope', 'state 로 누름틀 값 + 본문');
   // 기존 글자 모양 고치기: 스타일의 글자 모양 정의를 바꿔 본문 모양을 바꾼다(op), 본문 글자를 다른 기존 모양으로(op)
   await rejected(room, F, W, [op('updateStyleShapes', [0, JSON.stringify({ bold: true, fontSize: 2000 }), '{}'])], 'confined', '스타일 글자 모양 정의 고치기(updateStyleShapes)');
   await rejected(room, F, W, [op('applyCharFormat', [0, 0, 0, 2, JSON.stringify({ bold: true })])], 'confined', '본문 글자 모양 바꾸기(applyCharFormat)');
-  await rejected(room, F, W, [stateAfter(F, (d) => d.applyCharFormat(0, 0, 0, 2, JSON.stringify({ italic: true })))], 'confined', 'state 로 본문 글자 모양');
+  await rejected(room, F, W, [stateAfter(F, (d) => d.applyCharFormat(0, 0, 0, 2, JSON.stringify({ italic: true })))], 'scope', 'state 로 본문 글자 모양');
   // form 으로 메모
-  await rejected(room, F, W, [stateAfter(F, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'F', text: '메모' })))], 'confined', 'form 으로 메모 넣기');
+  await rejected(room, F, W, [stateAfter(F, (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'F', text: '메모' })))], 'scope', 'form 으로 메모 넣기(state)');
   await rejected(room, F, W, [memoOp(F, [0, 0, 0, 2], '메모')], 'confined', 'form 으로 메모 넣기(op)');
   // 거절 뒤에도 통과 사례는 그대로 된다
   await accepted(room, F, W, [op('setFieldValueByName', ['name', '거절 뒤'])], '거절 뒤 누름틀 값');
@@ -241,13 +241,13 @@ test('form: 우회(함수 이름·state 바이트 위조, 기존 글자 모양 �
 const MEMO_TIME = '134000000000000000';
 const memoOp = (c, a, text) => op('insertMemo', [...a, JSON.stringify({ author: c.name, text })], { ctx: { memoTime: MEMO_TIME } });
 
-test('comment: 본문·누름틀·메모에 본문을 섞은 state 는 forbidden(confined)', async () => {
+test('comment: 본문·누름틀은 forbidden(confined), 메모에 본문을 섞은 state 는 forbidden(scope)', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const C = await client(room, 'C', 'comment');
   await rejected(room, C, W, [op('insertText', [0, 0, 0, '본문'], { meta: { len: 2 } })], 'confined', 'comment 로 본문 입력');
   await rejected(room, C, W, [op('setFieldValueByName', ['name', 'x'])], 'confined', 'comment 로 누름틀 값');
-  await rejected(room, C, W, [stateAfter(C, (d) => { d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'C', text: '메모' })); d.insertText(0, 0, 0, '덤 '); })], 'confined', 'state 로 메모 + 본문');
+  await rejected(room, C, W, [stateAfter(C, (d) => { d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'C', text: '메모' })); d.insertText(0, 0, 0, '덤 '); })], 'scope', 'state 로 메모 + 본문');
   W.close(); C.close();
 });
 
@@ -266,17 +266,17 @@ test('comment: 메모 넣기·답글·자기 메모 고치기(op)는 통과하�
   } finally { W.close(); C.close(); }
 });
 
-test('comment: 메모가 든 문서에서 state 로 스크립트 스트림을 바꾸면 forbidden(confined)', async () => {
+test('comment: 메모가 든 문서에서 state 로 스크립트 스트림을 바꾸려 해도 state 는 정본에 닿지 않는다 — forbidden(scope)', async () => {
   const { room } = await makeRoom();
   const W = await client(room, 'W');
   const C = await client(room, 'C', 'comment');
   try {
     await accepted(room, C, W, [memoOp(C, [0, 0, 0, 2], '첫 메모')], '메모 넣기(op)');
-    // 정상 메모 하나 + 기본 스크립트 스트림을 바꾼 바이트(부속 스트림 비교는 파생 스트림 하나만 뺀다)
-    const memo = (d) => d.insertMemo(0, 0, 7, 9, JSON.stringify({ author: 'C', text: '둘째 메모' }));
-    await rejected(room, C, W, [forgedState(C, memo, 'DefaultJScript', 'evil();')], 'confined', 'state 로 메모 + 스크립트 바꾸기');
-    // 거절 뒤에도 같은 메모는 그대로 통과
-    await accepted(room, C, W, [stateAfter(C, memo)], '거절 뒤 메모(state)');
+    // 정상 메모 하나 + 기본 스크립트 스트림을 바꾼 바이트 — 좁은 권한은 state 를 보낼 수 없다(판정이 모델만 보므로)
+    const memo = (d) => d.insertMemo(0, 0, 7, 9, JSON.stringify({ author: C.name, text: '둘째 메모' }));
+    await rejected(room, C, W, [forgedState(C, memo, 'DefaultJScript', 'evil();')], 'scope', 'state 로 메모 + 스크립트 바꾸기');
+    // 거절 뒤에도 같은 메모는 op 로 그대로 통과
+    await accepted(room, C, W, [memoOp(C, [0, 0, 7, 9], '둘째 메모')], '거절 뒤 메모(op)');
   } finally { W.close(); C.close(); }
 });
 
@@ -296,6 +296,27 @@ test('view: 모든 편집이 forbidden(scope) — 정본에 닿지 않는다', a
   W.close(); V.close();
 });
 
+// 좁은 권한(form·comment)은 결과 전송(state)을 보낼 수 없다(5단계 D4 보강): 판정은 파싱한 모델만 보므로, rhwp 가 모델에
+// 남기지 않는 레코드를 끼운 바이트가 판정을 지나 다른 참여자에게 그대로 갈 수 있다. 서버는 state 가 든 묶음을 정본에 닿기
+// 전에 forbidden(scope)로 거절한다 — 정본이 열 수 없는 바이트여도 invalid 가 아니라 scope 인 것이 "닿기 전"의 증거다.
+test('form·comment·form comment 의 state 는 정본에 닿기 전에 forbidden(scope) — seq·정본 그대로, 방송 없음', async () => {
+  const { room } = await makeRoom();
+  const W = await client(room, 'W');
+  const F = await client(room, 'F', 'form');
+  const C = await client(room, 'C', 'comment');
+  const FC = await client(room, 'FC', 'form comment');
+  const memo = (d) => d.insertMemo(0, 0, 0, 2, JSON.stringify({ author: 'x', text: '메모' }));
+  await rejected(room, F, W, [stateAfter(F, () => {})], 'scope', 'form: 편집 없는 state');
+  await rejected(room, F, W, [stateAfter(F, (d) => d.setFieldValueByName('name', '값'))], 'scope', 'form: 누름틀 값만 바꾼 state');
+  await rejected(room, C, W, [stateAfter(C, memo)], 'scope', 'comment: 메모만 넣은 state');
+  await rejected(room, C, W, [forgedState(C, memo, 'DefaultJScript', 'evil();')], 'scope', 'comment: 메모 + 스크립트 스트림을 바꾼 state');
+  await rejected(room, FC, W, [op('setFieldValueByName', ['name', '섞음']), stateAfter(FC, memo)], 'scope', 'form comment: op 다음 state');
+  await rejected(room, F, W, [{ kind: 'state', data: 'bm90IGEgZG9jdW1lbnQ=' }], 'scope', 'form: 정본이 열 수 없는 바이트(닿았다면 invalid)');
+  // 같은 연결의 op 는 그대로 판정된다
+  await accepted(room, F, W, [op('setFieldValueByName', ['name', 'state 거절 뒤'])], 'form: state 거절 뒤 op');
+  W.close(); F.close(); C.close(); FC.close();
+});
+
 /** 정상 클라이언트의 섞인 묶음: 누름틀 값 다음 메모(둘 다 op) */
 const mixed = (c) => [op('setFieldValueByName', ['name', '섞음']), memoOp(c, [0, 0, 0, 2], '섞음 메모')];
 
@@ -305,7 +326,7 @@ test('form comment 권한이어도 본문 입력이 끼면, form 만이면 메�
   const FC = await client(room, 'FC', 'form comment');
   const F = await client(room, 'F', 'form');
   assert.deepEqual(FC.user.scope, ['form', 'comment']);
-  await rejected(room, F, W, mixed(F), 'confined', 'form 만으로 누름틀 + 메모');
+  await rejected(room, F, W, mixed(F), 'confined', 'form 만으로 누름틀 + 메모(op)');
   await rejected(room, FC, W, [op('setFieldValueByName', ['name', '또']), op('insertText', [0, 0, 0, '덤'], { meta: { len: 1 } })], 'confined', 'form comment 묶음에 본문 입력이 끼면');
   await accepted(room, FC, W, [op('setFieldValueByName', ['name', '값만'])], 'form comment 로 누름틀 값만');
   W.close(); FC.close(); F.close();

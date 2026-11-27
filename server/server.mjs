@@ -10,7 +10,8 @@
 //   GET  /healthz      {ok: true}
 //   GET  그 밖          COLLAB_STATIC_DIR 의 정적 파일(빌드한 studio)
 // 접속 인증(5단계 D1)은 hello 에서 `auth.verify(token, room)`(server/auth.mjs)로 하고, 실패하면 unauthorized 후 닫는다.
-// 권한(scope)이 view 인 연결은 편집(ops·base)을 보낼 수 없다 — forbidden 으로 거절하고 연결은 둔다.
+// 권한(scope)이 view 인 연결은 편집(ops·base)을 보낼 수 없다 — forbidden 으로 거절하고 연결은 둔다. form·comment 연결은
+// base 와 결과 전송(state 가 든 묶음)을 보낼 수 없고(forbidden scope), op 묶음은 정본이 결과로 판정한다(D4).
 //
 // S3-2 서버 정본(docs/collab-stage3.md): 방마다 워커(`canonical.mjs`)에 같은 엔진으로 정본 문서를 두고, base·ops 를
 // 기록하기 전에 정본에 먼저 적용해 본다. rhwp 가 오류를 내면 거절(invalid), 패닉(WASM trap)하면 거절하고 워커를
@@ -36,7 +37,7 @@ import { LocalDocStore, formatOf } from './doc-store.mjs';
 import { Canonical, DEFAULT_PKG } from './canonical.mjs';
 import { AuthError, JOIN_SCOPES, authFromEnv, editPermission, noneAuth, normalizeUser, parseDuration } from './auth.mjs';
 import { createHttpHandler, HttpError } from './http.mjs';
-import { ENGINE_FINGERPRINT } from '../collab-client/src/engine/catalog.ts';
+import { CATALOG, ENGINE_FINGERPRINT } from '../collab-client/src/engine/catalog.ts';
 
 /** digest 를 보관하는 최근 seq 수 (§5 digest 규칙) */
 const DIGEST_WINDOW = 64;
@@ -79,13 +80,51 @@ function createRoom(name) {
     generationSeq: 0,
     /** 쓸 수 없는 방(복원 실패·업그레이드 절차 위반)의 사유 */
     broken: null,
+    /** 5단계 D5: 원래 암호 문서였다(COLLAB_ALLOW_ENCRYPTED 로 받음) — 방의 문서는 암호 없이 오가고 저장된다 */
+    encryptedSource: false,
   };
 }
 
 export const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
-/** 표시 이름(확인하지 않은 값): 제어 문자를 빼고 64자까지 */
-const cleanName = (name) => (typeof name === 'string' ? name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64) : '');
+/** 5단계 D6: 메모를 만드는 함수와 그 작성자 인자(`json` = {author, text}) */
+const MEMO_CREATE = ['insertMemo', 'insertMemoByPath', 'insertMemoReply'];
+const memoJsonIndex = (m) => { const i = CATALOG[m]?.params?.indexOf('json') ?? -1; return i >= 0 ? i : { insertMemo: 4, insertMemoByPath: 5, insertMemoReply: 1 }[m]; };
+/** 묶음의 메모 만들기 op 중 작성자가 name 과 다른 것이 있으면 그 까닭. 작성자를 읽을 수 없어도 거절한다. */
+function memoAuthorViolation(entries, name) {
+  for (const e of entries) {
+    if (e?.kind !== 'op' || !MEMO_CREATE.includes(e.m) || !Array.isArray(e.a)) continue;
+    let author;
+    try { author = JSON.parse(e.a[memoJsonIndex(e.m)])?.author; } catch { author = undefined; }
+    if (author !== name) return `${e.m} 의 작성자 ${JSON.stringify(author ?? null)} ≠ 연결의 이름 ${JSON.stringify(name)}`;
+  }
+  return null;
+}
+
+/**
+ * 5단계 입장 이름: hello 때 한 번 정한다(토큰의 name, 없으면 hello 의 이름). rhwp 가 메모 작성자를 저장할 때 쓰는 규칙
+ * (`sanitize_author`: 앞뒤 공백 자르기 → `/`·`\`·`;`·제어 문자(Cc) 빼기, 64 UTF-16 단위가 넘으면 실패)과 같게 다듬고
+ * 64 단위로 자른다(서로게이트 쌍은 가르지 않는다). 자르기 뒤 앞뒤 공백이 다시 생길 수 있어 바뀌지 않을 때까지 되풀이한다 —
+ * 그래서 이 이름은 rhwp 규칙의 고정점이고, 메모 작성자로 넣으면 그대로 저장된다. 비면 "손님".
+ * 이 이름을 welcome.user.name 으로 알려 주고, 메모 작성자 비교·자기 메모 확인·커서 이름에 쓴다.
+ */
+export const ENTRY_NAME_MAX_UNITS = 64;
+const RUST_WHITESPACE = /^[\s\u0085]+|[\s\u0085]+$/g;
+const NOT_IN_AUTHOR = /[\/\\;\u0000-\u001f\u007f-\u009f]/g;
+export function entryName(raw) {
+  let name = typeof raw === 'string' ? raw : '';
+  for (;;) {
+    let next = name.replace(RUST_WHITESPACE, '').replace(NOT_IN_AUTHOR, '');
+    if (next.length > ENTRY_NAME_MAX_UNITS) {
+      next = next.slice(0, ENTRY_NAME_MAX_UNITS);
+      const last = next.charCodeAt(next.length - 1);
+      if (last >= 0xd800 && last <= 0xdbff) next = next.slice(0, -1);
+    }
+    if (next === name) break;
+    name = next;
+  }
+  return name || '손님';
+}
 
 /** COLLAB_TLS_CERT·COLLAB_TLS_KEY(PEM 파일 경로) → { cert, key } | null. 하나만 있으면 시작을 거부한다. */
 function tlsFromEnv(env) {
@@ -119,11 +158,14 @@ export function startServer({
   tls = tlsFromEnv(process.env),
   // 5단계 D3: POST /rooms 가 만드는 초대 토큰의 수명(초)
   inviteTtlSec = parseDuration(process.env.COLLAB_INVITE_TTL, 86_400),
+  // 5단계 D5: 암호 문서를 받을지. 기본은 막는다(POST /rooms 400 encrypted, 플러그인은 base 를 올리지 않음)
+  allowEncrypted = process.env.COLLAB_ALLOW_ENCRYPTED === '1',
 } = {}) {
   if (store && !canonical) throw new Error('영속 저장(store)에는 정본(canonical)이 필요하다');
   if (auth === 'none') auth = noneAuth();
   if (!auth || typeof auth.verify !== 'function') throw new Error('auth 에는 verify(token, room) 가 있어야 한다');
   const authOn = auth.mode !== 'none';
+  if (allowEncrypted) log('경고: COLLAB_ALLOW_ENCRYPTED=1 — 암호 문서로 방을 열면 암호가 풀린 상태로 서버 디스크·모든 참여자·내려받은 파일에 남는다');
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map();
   /** 닫는 중 — 그 뒤의 연결 끊김으로 저장본·세대 전환 타이머를 새로 만들지 않는다 */
@@ -169,7 +211,9 @@ export function startServer({
     const first = chunks[0];
     const firstSeq = first.length ? first[first.length - 1].seq : (base === null ? room.seq : room.baseSeq);
     const seqOf = (chunk) => chunk[chunk.length - 1].seq;
-    send(ws, { type: 'welcome', seq: chunks.length > 1 ? firstSeq : room.seq, base, log: first, ...(room.generation ? { generation: room.generation } : {}), maxMessageBytes, ...userOf(ws), ...extra });
+    send(ws, { type: 'welcome', seq: chunks.length > 1 ? firstSeq : room.seq, base, log: first, ...(room.generation ? { generation: room.generation } : {}), maxMessageBytes, ...userOf(ws),
+      // D5: 원래 암호 문서였으면 알린다(참여자가 경고를 한 번 띄운다). base 담당(base null)에게는 암호 문서를 받는지 알린다.
+      ...(room.encryptedSource ? { encryptedSource: true } : {}), ...(base === null && allowEncrypted ? { allowEncrypted: true } : {}), ...extra });
     for (const chunk of chunks.slice(1)) send(ws, { type: 'catchup', seq: seqOf(chunk), log: chunk, cont: true, maxMessageBytes });
     log(`[${room.name}] welcome${extra.resync ? '(resync)' : ''} ${who(ws)} seq=${room.seq} base=${base === null ? 'null (담당)' : `${base.length}B64`} log=${logItems.length}${chunks.length > 1 ? ` (${chunks.length}조각)` : ''} 세대 ${room.generation} 참여자=${room.clients.size}`);
   };
@@ -183,7 +227,7 @@ export function startServer({
   };
 
   /** 인증을 켠 서버는 welcome·catchup 에 확인된 사용자(sub·표시 이름·권한)를 싣는다. */
-  const userOf = (ws) => (authOn && ws.meta?.user ? { user: ws.meta.user } : {});
+  const userOf = (ws) => ((authOn || ws.meta?.announce) && ws.meta?.user ? { user: ws.meta.user } : {});
 
   /** 방을 메모리에 연다(저장소가 있으면 복원을 사슬에 건다). */
   const openRoom = (name) => {
@@ -221,9 +265,11 @@ export function startServer({
     // 방은 서버가 만든다(D3) — 인증을 켜면 없는 방에 hello 로 들어갈 수 없다. 토큰을 확인한 뒤에 본다(방이 있는지 떠보지 못하게).
     if (!rooms.has(msg.room) && !(await storeHas(msg.room))) throw new AuthError('no-room', '없는 방');
     if (!user.name) {
-      user.name = cleanName(msg.name) || '손님';
+      // 여럿이 나눠 쓰는 토큰(초대 토큰): 표시 이름은 hello 의 이름(확인되지 않은 값), sub 에는 연결마다 다른 꼬리
+      user.name = typeof msg.name === 'string' ? msg.name : '';
       user.sub = `${user.sub ?? 'anonymous'}~${randomBytes(4).toString('hex')}`;
     }
+    user.name = entryName(user.name);
     return user;
   };
 
@@ -233,7 +279,12 @@ export function startServer({
       return send(ws, { type: 'error', error: 'hello 에 room·clientId 가 필요하다' });
     }
     ws.helloRoom = msg.room;
-    if (!authOn) return joinRoom(ws, msg, { sub: null, name: typeof msg.name === 'string' ? msg.name : '', scope: ['edit'] });
+    if (!authOn) {
+      const raw = typeof msg.name === 'string' ? msg.name : '';
+      const name = entryName(raw);
+      // 인증을 끈 서버는 welcome.user 를 싣지 않는다 — 다만 입장 이름이 hello 의 이름과 다르면 알려 준다
+      return joinRoom(ws, msg, { sub: null, name, scope: ['edit'], announce: name !== raw });
+    }
     authorizeHello(msg).then(
       (user) => { if (ws.readyState === ws.OPEN && !closed) joinRoom(ws, msg, user); },
       (error) => {
@@ -261,6 +312,7 @@ export function startServer({
       sub: user.sub,
       perm: editPermission(user.scope),
       user: { sub: user.sub, name: user.name, scope: user.scope },
+      announce: user.announce === true,
     };
     if (authOn) log(`[${room.name}] 인증 ${who(ws)} sub=${user.sub} scope=${user.scope.join(' ')}`);
     ws.resumeFrom = Number.isInteger(msg.lastSeq) && msg.lastSeq >= 0 ? msg.lastSeq : null;
@@ -358,6 +410,7 @@ export function startServer({
       await store.setBase(room.name, { baseSeq: lastSeq, data: next, engine: serverEngine, generation: saved.meta.generation + 1 });
       room.generation = saved.meta.generation + 1;
       room.generationSeq = lastSeq;
+      room.encryptedSource = Boolean(saved.meta.encryptedSource);
       room.seq = lastSeq;
       room.docSeq = saved.meta.docSeq;
       pickBasePoint(room, packed, lastSeq, []);
@@ -373,6 +426,7 @@ export function startServer({
     }
     room.generation = saved.meta.generation;
     room.generationSeq = saved.meta.baseSeq;
+    room.encryptedSource = Boolean(saved.meta.encryptedSource);
     room.seq = lastSeq;
     room.docSeq = saved.meta.docSeq;
     pickBasePoint(room, base, saved.meta.baseSeq, saved.log);
@@ -462,7 +516,15 @@ export function startServer({
     if (typeof msg.data !== 'string' || !msg.data) {
       return send(ws, { type: 'error', error: 'base.data 가 비었다' });
     }
-    if (!room.canonical) return commitBase(ws, room, msg.data, null);
+    // D5: 플러그인이 "원래 암호 문서"라고 알린 base. 서버는 바이트만으로는 알 수 없다(암호 없는 바이트) — 플러그인 확인은
+    // 실수로 공유하는 것을 막는 장치다.
+    if (msg.encryptedSource === true && !allowEncrypted) {
+      log(`[${room.name}] base 거절 ${who(ws)}: 암호 문서(서버가 받지 않음)`);
+      send(ws, { type: 'invalid', what: 'base', reason: 'encrypted' });
+      setTimeout(() => ws.close(), delayMs + 50);
+      return;
+    }
+    if (!room.canonical) return commitBase(ws, room, msg.data, null, msg.encryptedSource === true);
     enqueue(room, async () => {
       if (room.base !== null || room.baseOwner !== ws) return;
       const res = await room.canonical.load(msg.data);
@@ -476,16 +538,17 @@ export function startServer({
       if (store) {
         // 첫 방 생성: 첫 참여자의 base 가 0세대 기준점(seq 0). 0세대는 welcome 에 싣지 않는다 — base 담당은 base 를
         // 정하기 전에 welcome 을 받으므로, 세대를 따로 알려 주지 않아도 0 으로 맞는다.
-        await store.setBase(room.name, { baseSeq: room.seq, data: gunzipSync(Buffer.from(msg.data, 'base64')), engine: serverEngine, generation: 0 });
+        await store.setBase(room.name, { baseSeq: room.seq, data: gunzipSync(Buffer.from(msg.data, 'base64')), engine: serverEngine, generation: 0, encryptedSource: msg.encryptedSource === true });
         room.generation = 0;
         room.generationSeq = room.seq;
       }
-      commitBase(ws, room, msg.data, res.digest);
+      commitBase(ws, room, msg.data, res.digest, msg.encryptedSource === true);
     });
   };
 
-  const commitBase = (ws, room, data, digest) => {
+  const commitBase = (ws, room, data, digest, encryptedSource = false) => {
     room.base = data;
+    room.encryptedSource = encryptedSource;
     room.baseSeq = room.seq;
     if (digest) keepCanonDigest(room, room.seq, digest);
     room.baseOwner = null;
@@ -502,12 +565,20 @@ export function startServer({
     // D0·D4 권한: view 는 편집을 보낼 수 없다. form·comment 는 정본이 결과로 확인한다(정본이 없으면 판정할 수 없다).
     const { perm } = ws.meta;
     if (perm.level === 'none') return forbidden(ws, room, 'ops', 'scope', msg);
+    // 좁은 권한(form·comment)은 결과 전송(state)을 보낼 수 없다 — 정본에 닿기 전에 거절한다. 판정은 파싱한 모델만 보므로,
+    // rhwp 가 모델에 남기지 않는 레코드를 끼운 바이트가 판정을 지나 다른 참여자에게 그대로 갈 수 있기 때문이다.
+    if (perm.level === 'confined' && msg.entries.some((e) => e?.kind === 'state')) return forbidden(ws, room, 'ops', 'scope', msg, '좁은 권한의 state');
+    // D6: 메모 작성자는 그 연결의 이름(토큰의 name, 없으면 hello 의 표시 이름)이어야 한다 — 모든 권한
+    const authorWhy = memoAuthorViolation(msg.entries, ws.meta.name);
+    if (authorWhy) return forbidden(ws, room, 'ops', 'author', msg, authorWhy);
     if (perm.level === 'confined' && !room.canonical) return forbidden(ws, room, 'ops', 'unsupported', msg, '정본이 꺼져 있음');
     if (!room.canonical) return commitOps(ws, room, msg, null);
     enqueue(room, async () => {
       if (!room.clients.has(ws)) return;
       if (room.base === null || msg.base !== room.seq) return commitOps(ws, room, msg, null); // reject 경로
-      const res = await room.canonical.apply(msg.entries, perm.level === 'confined' ? { confine: perm.kinds } : {});
+      // D6: comment 권한(편집 권한 없음)은 자기 메모만 고치고 지운다 — 정본의 메모 목록으로 확인
+      const res = await room.canonical.apply(msg.entries, perm.level === 'confined'
+        ? { confine: perm.kinds, ...(perm.kinds.includes('comment') ? { memoOwner: ws.meta.name } : {}) } : {});
       if (!res.ok && res.forbidden) return forbidden(ws, room, 'ops', res.reason, msg, res.detail ?? '');
       if (!res.ok) {
         log(`[${room.name}] invalid ${who(ws)} base=${msg.base}: ${res.reason}${res.panic ? ' (패닉 — 정본 재생성)' : ''}`);
@@ -651,20 +722,39 @@ export function startServer({
     if (!canonical) throw new HttpError(501, 'no-canonical', '정본(COLLAB_CANONICAL)이 꺼져 있어 파일을 검사할 수 없다');
     if (closed) throw new HttpError(503, 'closing', '서버를 닫는 중이다');
     try { formatOf(raw); } catch { throw new HttpError(415, 'not-hwp', 'HWP·HWPX 파일이 아니다'); }
-    const packed = gzipSync(raw).toString('base64');
+    let packed = gzipSync(raw).toString('base64');
     // WebSocket base 와 같은 규칙: welcome 에 실을 수 있어야 한다.
-    if (packed.length + 64 > maxMessageBytes) throw new HttpError(413, 'too-large', `문서가 메시지 상한 ${maxMessageBytes}바이트를 넘는다`, { limit: maxMessageBytes });
+    const fits = (b64) => b64.length + 64 <= maxMessageBytes;
+    if (!fits(packed)) throw new HttpError(413, 'too-large', `문서가 메시지 상한 ${maxMessageBytes}바이트를 넘는다`, { limit: maxMessageBytes });
     const name = randomBytes(16).toString('base64url');
     const room = createRoom(name);
     room.canonical = new Canonical({ pkg, timeoutMs: canonicalTimeoutMs, log: (m) => log(`[${name}] ${m}`) });
     room.engine = serverEngine;
-    const res = await room.canonical.load(packed);
+    let res = await room.canonical.load(packed);
+    if (!res.ok && res.encrypted) {
+      // 5단계 D5: 암호 문서는 기본으로 막는다. 허용(COLLAB_ALLOW_ENCRYPTED=1)이면 X-Collab-Document-Password 로 받은 암호로
+      // 열어 암호 없는 바이트를 기준점으로 쓴다(방의 문서는 암호 없이 오간다 — encryptedSource 로 알린다).
+      const fail = async (status, reason, message, extra = {}) => {
+        await room.canonical.terminate();
+        return new HttpError(status, reason, message, { reason, ...extra });
+      };
+      if (!allowEncrypted) throw await fail(400, 'encrypted', '암호가 걸린 문서는 공동편집할 수 없다(서버 설정 COLLAB_ALLOW_ENCRYPTED)', { allowed: false });
+      const password = req.headers['x-collab-document-password'];
+      if (typeof password !== 'string' || !password) throw await fail(400, 'encrypted', '암호가 걸린 문서다 — X-Collab-Document-Password 로 문서 암호를 준다', { allowed: true });
+      const dec = await room.canonical.decrypt(raw, password);
+      if (!dec.ok) throw await fail(400, dec.wrongPassword ? 'wrong-password' : 'encrypted', dec.wrongPassword ? '문서 암호가 맞지 않다' : `암호 문서를 열지 못했다: ${dec.reason}`, { allowed: true });
+      packed = dec.data;
+      raw = gunzipSync(Buffer.from(packed, 'base64'));
+      if (!fits(packed)) throw await fail(413, 'too-large', `문서가 메시지 상한 ${maxMessageBytes}바이트를 넘는다`, { limit: maxMessageBytes });
+      room.encryptedSource = true;
+      res = await room.canonical.load(packed);
+    }
     if (!res.ok) {
       await room.canonical.terminate();
       throw new HttpError(422, 'invalid-document', `문서를 열지 못했다: ${res.reason}`);
     }
     try {
-      if (store) await store.setBase(name, { baseSeq: 0, data: raw, engine: serverEngine, generation: 0 });
+      if (store) await store.setBase(name, { baseSeq: 0, data: raw, engine: serverEngine, generation: 0, encryptedSource: room.encryptedSource });
     } catch (error) {
       await room.canonical.terminate();
       throw error;
@@ -675,7 +765,7 @@ export function startServer({
     keepCanonDigest(room, 0, res.digest);
     rooms.set(name, room);
     scheduleUnload(room);
-    log(`[${name}] 방 생성(파일 ${raw.length}B, ${formatOf(raw)})${user.sub ? ` by ${user.sub}` : ''} 정본 ${res.digest.slice(0, 12)}${store ? ' (저장)' : ''}`);
+    log(`[${name}] 방 생성(파일 ${raw.length}B, ${formatOf(raw)})${user.sub ? ` by ${user.sub}` : ''} 정본 ${res.digest.slice(0, 12)}${store ? ' (저장)' : ''}${room.encryptedSource ? ' — 경고: 원래 암호 문서, 암호 없이 보관' : ''}`);
     return { room: name, ...makeInvites(name) };
   };
 

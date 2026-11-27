@@ -59,6 +59,11 @@
     </div>
     <label for="file">문서 파일</label>
     <input id="file" type="file" accept=".hwp,.hwpx">
+    <div id="password-box" hidden>
+      <label for="doc-password">문서 암호</label>
+      <input id="doc-password" type="password" autocomplete="off">
+      <p class="hint">암호가 걸린 문서입니다. 이 서버는 암호 문서를 받도록 설정되어 있습니다. 공동편집 중에는 암호가 풀린 상태로 서버에 저장되고, 참여자와 내려받은 파일에도 암호가 없습니다.</p>
+    </div>
     <div class="row"><button id="create" type="button" disabled>방 만들기</button></div>
     <div id="status" class="status" role="status" aria-live="polite"></div>
   </section>
@@ -96,7 +101,7 @@
 
   const status = (el, text, kind = '') => { el.textContent = text; el.className = `status ${kind}`; };
   const fileInput = $('file');
-  fileInput.addEventListener('change', () => { $('create').disabled = !fileInput.files?.length; });
+  fileInput.addEventListener('change', () => { $('create').disabled = !fileInput.files?.length; $('password-box').hidden = true; $('doc-password').value = ''; });
 
   let created = null;
 
@@ -157,12 +162,25 @@
     $('create').disabled = true;
     status($('status'), `올리는 중… (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
     try {
+      const docPassword = $('password-box').hidden ? '' : $('doc-password').value;
       const res = await fetch('/rooms', {
         method: 'POST',
-        headers: { 'content-type': 'application/octet-stream', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        headers: {
+          'content-type': 'application/octet-stream',
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...(docPassword ? { 'x-collab-document-password': docPassword } : {}),
+        },
         body: file,
       });
       const body = await res.json().catch(() => ({}));
+      // 암호 문서: 서버가 허용하면 암호 칸을 보이고, 아니면 받지 않는다고 알린다
+      if (body.reason === 'encrypted' || body.reason === 'wrong-password') {
+        $('password-box').hidden = !body.allowed;
+        const why = !body.allowed ? '암호가 걸린 문서는 공동편집할 수 없습니다'
+          : body.reason === 'wrong-password' ? '문서 암호가 맞지 않습니다' : '암호가 걸린 문서입니다. 문서 암호를 넣고 다시 만드세요';
+        status($('status'), why, 'err');
+        return;
+      }
       if (!res.ok) {
         const why = body.reason ? `${body.error} (${body.reason})` : (body.message ?? body.error ?? res.statusText);
         throw new Error(`${res.status} ${why}`);

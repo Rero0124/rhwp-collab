@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>공동편집 방 만들기</title>
+<!--
+  rhwp-collab 업로드 페이지 (5단계 D3, 규약 docs/collab-protocol.md §5). 서버가 /upload 로 내준다.
+  #token=<만들기(create) 토큰> 으로 연다. 파일을 올리면 POST /rooms 로 방을 만들고, 서버가 돌려준 초대 토큰으로
+  권한별 링크를 보여 준다. 만들기 토큰은 이 페이지(업로더)에만 남고 링크에는 싣지 않는다.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #5d6677; --line: #d9dee7;
+    --accent: #2f6fdb; --accent-text: #fff; --ok: #1f7a4d; --err: #b3261e; --code: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #9aa3b2; --line: #2e3440;
+      --accent: #6a9cf0; --accent-text: #0e1116; --ok: #5cc28f; --err: #f2867d; --code: #252a33; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 system-ui, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 24px; color: var(--muted); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  label { display: block; font-weight: 600; margin: 10px 0 4px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+  input[type=text], input[type=password], input[type=url] { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  input[type=file] { font: inherit; max-width: 100%; }
+  button { font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text); cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .status { margin-top: 10px; min-height: 1.6em; }
+  .status.err { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .link { border-top: 1px solid var(--line); padding: 12px 0 4px; }
+  .link:first-of-type { border-top: 0; padding-top: 0; }
+  .link b { display: block; }
+  .link code { display: block; overflow-wrap: anywhere; background: var(--code); padding: 6px 8px; border-radius: 6px; font-size: 12px; margin: 6px 0; }
+  .room { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>공동편집 방 만들기</h1>
+  <p class="lead">한글 파일(HWP·HWPX)을 올리면 그 문서로 공동편집 방을 만들고, 함께 편집할 사람에게 줄 링크를 만듭니다.</p>
+
+  <section>
+    <h2>1. 파일 올리기</h2>
+    <div id="token-box">
+      <label for="token">만들기 토큰</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="scope 에 create 가 있는 토큰">
+      <p class="hint">이 페이지를 <code>/upload#token=…</code> 로 열면 자동으로 채워집니다. 인증을 끈 서버라면 비워 둡니다.</p>
+    </div>
+    <label for="file">문서 파일</label>
+    <input id="file" type="file" accept=".hwp,.hwpx">
+    <div class="row"><button id="create" type="button" disabled>방 만들기</button></div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </section>
+
+  <section id="result" hidden>
+    <h2>2. 링크 나누기</h2>
+    <p class="hint">방 <span id="room" class="room"></span><span id="expires"></span></p>
+    <label for="editor">편집기 주소</label>
+    <input id="editor" type="url" spellcheck="false">
+    <p class="hint">편집기를 이 서버가 함께 내주면 그대로 둡니다. 다른 곳(개발 서버 등)에 있으면 그 주소로 바꿉니다.</p>
+    <div id="links"></div>
+    <p id="no-invite" class="hint" hidden>이 서버는 초대 토큰을 만들지 않습니다(인증을 껐거나, 바깥 시스템이 토큰을 발급하는 방식). 인증을 켠 서버라면 링크 뒤에 <code>#token=…</code> 을 바깥 시스템이 붙여 줍니다.</p>
+    <div class="row"><button id="download" type="button" class="secondary">지금 문서 내려받기</button></div>
+    <div id="dl-status" class="status" role="status" aria-live="polite"></div>
+  </section>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const STORE_KEY = 'collab-create-token';
+  const LABELS = { edit: ['편집', '문서를 고칠 수 있습니다'], view: ['보기', '문서와 다른 사람 커서만 봅니다'], form: ['양식 입력', '누름틀과 양식 칸만 채웁니다'], comment: ['메모', '메모만 달 수 있습니다'] };
+  const safeGet = (k) => { try { return sessionStorage.getItem(k); } catch { return null; } };
+  const safeSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch { /* 저장소를 쓸 수 없음 */ } };
+
+  // 만들기 토큰은 주소의 조각(#token=)으로 받고 바로 지운다. 새로고침에 대비해 이 탭에만 남긴다.
+  const hash = new URLSearchParams(location.hash.slice(1));
+  if (hash.has('token')) {
+    safeSet(STORE_KEY, hash.get('token'));
+    hash.delete('token');
+    history.replaceState(null, '', location.pathname + location.search + (hash.toString() ? `#${hash}` : ''));
+  }
+  $('token').value = safeGet(STORE_KEY) ?? '';
+  $('token').addEventListener('change', () => safeSet(STORE_KEY, $('token').value.trim()));
+  $('editor').value = `${location.origin}/`;
+
+  const status = (el, text, kind = '') => { el.textContent = text; el.className = `status ${kind}`; };
+  const fileInput = $('file');
+  fileInput.addEventListener('change', () => { $('create').disabled = !fileInput.files?.length; });
+
+  let created = null;
+
+  /** 편집기 링크: 같은 출처면 ?collab(빈 값 = 같은 출처 wss), 아니면 이 서버의 ws 주소를 싣는다. */
+  const linkFor = (token) => {
+    let editor;
+    try { editor = new URL($('editor').value || `${location.origin}/`); } catch { editor = new URL(`${location.origin}/`); }
+    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/`;
+    const collab = editor.origin === location.origin ? 'collab' : `collab=${encodeURIComponent(wsUrl)}`;
+    const frag = new URLSearchParams();
+    if (token) frag.set('token', token);
+    frag.set('room', created.room);
+    return `${editor.origin}${editor.pathname}?${collab}#${frag}`;
+  };
+
+  const copy = async (text, button) => {
+    try { await navigator.clipboard.writeText(text); button.textContent = '복사함'; }
+    catch { button.textContent = '직접 복사하세요'; }
+    setTimeout(() => { button.textContent = '복사'; }, 1500);
+  };
+
+  const renderLinks = () => {
+    const box = $('links');
+    box.replaceChildren();
+    const invites = created.invite ?? null;
+    $('no-invite').hidden = Boolean(invites);
+    const entries = invites ? Object.keys(LABELS).filter((k) => invites[k]).map((k) => [k, invites[k]]) : [['edit', null]];
+    for (const [scope, token] of entries) {
+      const url = linkFor(token);
+      const div = document.createElement('div');
+      div.className = 'link';
+      const title = document.createElement('b');
+      title.textContent = invites ? `${LABELS[scope][0]} 링크` : '편집기 링크';
+      const hint = document.createElement('span');
+      hint.className = 'hint';
+      hint.textContent = invites ? LABELS[scope][1] : '';
+      const code = document.createElement('code');
+      code.textContent = url;
+      const row = document.createElement('div');
+      row.className = 'row';
+      const c = document.createElement('button');
+      c.type = 'button'; c.className = 'secondary'; c.textContent = '복사';
+      c.addEventListener('click', () => copy(url, c));
+      const open = document.createElement('a');
+      open.href = url; open.target = '_blank'; open.rel = 'noopener noreferrer'; open.textContent = '새 탭에서 열기';
+      row.append(c, open);
+      div.append(title, hint, code, row);
+      box.append(div);
+    }
+  };
+  $('editor').addEventListener('input', () => { if (created) renderLinks(); });
+
+  $('create').addEventListener('click', async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    const token = $('token').value.trim();
+    if (token) safeSet(STORE_KEY, token);
+    $('create').disabled = true;
+    status($('status'), `올리는 중… (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
+    try {
+      const res = await fetch('/rooms', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        body: file,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const why = body.reason ? `${body.error} (${body.reason})` : (body.message ?? body.error ?? res.statusText);
+        throw new Error(`${res.status} ${why}`);
+      }
+      created = body;
+      $('room').textContent = created.room;
+      $('expires').textContent = created.inviteExpiresAt ? ` · 링크는 ${new Date(created.inviteExpiresAt).toLocaleString()}까지 쓸 수 있습니다` : '';
+      renderLinks();
+      $('result').hidden = false;
+      status($('status'), `방을 만들었습니다: ${file.name}`, 'ok');
+    } catch (error) {
+      status($('status'), `방을 만들지 못했습니다: ${error.message}`, 'err');
+    } finally {
+      $('create').disabled = !fileInput.files?.length;
+    }
+  });
+
+  // 내려받기는 참여 권한 토큰이 필요하다(만들기 토큰으로는 못 한다) — 초대 토큰 중 편집(없으면 보기)을 쓴다.
+  $('download').addEventListener('click', async () => {
+    if (!created) return;
+    const token = created.invite?.edit ?? created.invite?.view ?? null;
+    status($('dl-status'), '내려받는 중…');
+    try {
+      const res = await fetch(`/rooms/${encodeURIComponent(created.room)}/document`, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(`${res.status} ${body.reason ?? body.error ?? res.statusText}`);
+      }
+      const blob = await res.blob();
+      const name = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') ?? '')?.[1] ?? 'document.hwp';
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+      status($('dl-status'), `내려받았습니다 (seq ${res.headers.get('x-collab-seq') ?? '?'})`, 'ok');
+    } catch (error) {
+      status($('dl-status'), `내려받지 못했습니다: ${error.message}`, 'err');
+    }
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,27 +1,16 @@
-// cc-rhwp 공동편집 중계 서버. 프로토콜은 docs/collab-design.md §5 + docs/collab-stage2.md §7.
+// cc-rhwp 공동편집 서버. **규약(메시지 형식·토큰·이유 코드·재접속 절차)은 docs/collab-protocol.md 가 정본이다.**
+// 메시지를 바꾸면 그 문서를 함께 고친다.
 //
-// 서버는 순서만 정한다. 문서를 해석하지 않고, 방(room)은 메모리에만 둔다.
-//
-//   C→S hello    {type, room, clientId, name, engine, lastSeq?}   engine = 엔진 지문(방의 첫 참여자와 같아야 함)
-//                                                      lastSeq = 다시 붙는 참여자가 마지막으로 받은 seq (S3-4)
-//   S→C catchup  {type, seq, log: [{seq, clientId, entries, batchId?}]}   lastSeq 가 기준점 + 기록 범위 안이면 그 뒤
-//                                                      묶음만(S3-4). 범위 밖이면 일반 welcome
-//   S→C welcome  {type, seq, base: base64|null, log: [{seq, clientId, entries}], resync?: true}
-//   S→C incompatible {type, engine}                    지문이 다르면 거절하고 연결을 닫는다
-//   C→S base     {type, data: base64}                  welcome.base 가 null 이었던 참여자만
-//   C→S ops      {type, base: lastSeq, entries, batchId?}   entries = 기록 열(op·state), batchId = clientId:순번(S3-4)
-//   S→C ops      {type, seq, clientId, entries, batchId?}   모두에게 (보낸 사람에게는 ack). batchId 는 기록에도 남는다
-//   S→C reject   {type, seq, batchId?}                 base !== room.seq 일 때 보낸 사람에게만(그 묶음의 batchId)
-//   C→S resync   {type}                                → welcome (+resync: true)
-//   C→S digest   {type, seq, digest}
-//   S→C diverged {type, seq}                           같은 seq 에 다른 digest 가 오면 모두에게
-//   C→S cursor   {type, seq, caret}                    내 캐럿(텍스트 좌표, seq 시점) — 저장하지 않고 다른 참여자에게만
-//   S→C cursor   {type, clientId, name, seq, caret}    (참여자마다 초당 20회까지, 넘치면 버림) R10
-//   S→C cursor-leave {type, clientId}                 참여자가 나가면
-//   S→C too-large {type, what, bytes, limit}           메시지가 상한(COLLAB_MAX_MESSAGE_BYTES, 기본 64MB)을
-//                                                      넘음 — 그 메시지는 버린다. base 였으면 연결을 닫는다
-//   S→C invalid  {type, what, reason}                  S3-2 정본이 거절함(what = 'ops' | 'base'). ops 면 기록·방송하지
-//                                                      않고 보낸 쪽에만 알린다(보낸 쪽은 재동기화). base 면 연결을 닫는다
+// 서버는 순서를 정하고(seq), 정본으로 먼저 검사하고(S3-2), 기록을 디스크에 남긴다(S3-3).
+// 한 포트에서 HTTP(S) 와 WebSocket 을 함께 받는다(5단계 D2·D3):
+//   WebSocket          공동편집 규약(아무 경로나)
+//   POST /rooms        파일로 방 만들기 (scope create)
+//   GET  /rooms/{room}/document   방의 최신 문서 파일 (room 이 맞는 토큰)
+//   GET  /upload       업로드 페이지(server/public/upload.html)
+//   GET  /healthz      {ok: true}
+//   GET  그 밖          COLLAB_STATIC_DIR 의 정적 파일(빌드한 studio)
+// 접속 인증(5단계 D1)은 hello 에서 `auth.verify(token, room)`(server/auth.mjs)로 하고, 실패하면 unauthorized 후 닫는다.
+// 권한(scope)이 view 인 연결은 편집(ops·base)을 보낼 수 없다 — forbidden 으로 거절하고 연결은 둔다.
 //
 // S3-2 서버 정본(docs/collab-stage3.md): 방마다 워커(`canonical.mjs`)에 같은 엔진으로 정본 문서를 두고, base·ops 를
 // 기록하기 전에 정본에 먼저 적용해 본다. rhwp 가 오류를 내면 거절(invalid), 패닉(WASM trap)하면 거절하고 워커를
@@ -37,10 +26,16 @@
 // 엔진 업그레이드: 방의 지문이 다르면 세대 전환으로 시작한다(저장본이 마지막 seq 까지 덮으면 그것을, 아니면 남은
 // 기록을 새 엔진으로 재생해 보고 경고).
 import { WebSocketServer } from 'ws';
+import http from 'node:http';
+import https from 'node:https';
+import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { LocalDocStore } from './doc-store.mjs';
+import { LocalDocStore, formatOf } from './doc-store.mjs';
 import { Canonical, DEFAULT_PKG } from './canonical.mjs';
+import { AuthError, JOIN_SCOPES, authFromEnv, editPermission, noneAuth, normalizeUser, parseDuration } from './auth.mjs';
+import { createHttpHandler, HttpError } from './http.mjs';
 import { ENGINE_FINGERPRINT } from '../collab-client/src/engine/catalog.ts';
 
 /** digest 를 보관하는 최근 seq 수 (§5 digest 규칙) */
@@ -80,12 +75,25 @@ function createRoom(name) {
     generationTimer: null,
     /** S3-4: base 가 나타내는 seq — 기록(log)은 이 seq 뒤의 묶음이다. 이 seq 이상에서 끊긴 참여자는 따라잡기 가능 */
     baseSeq: 0,
+    /** 이 세대의 기준점(저장소 base)이 덮는 seq — 그 뒤로 편집이 없으면 빈 방이 되어도 세대를 바꾸지 않는다 */
+    generationSeq: 0,
     /** 쓸 수 없는 방(복원 실패·업그레이드 절차 위반)의 사유 */
     broken: null,
   };
 }
 
 export const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+/** 표시 이름(확인하지 않은 값): 제어 문자를 빼고 64자까지 */
+const cleanName = (name) => (typeof name === 'string' ? name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64) : '');
+
+/** COLLAB_TLS_CERT·COLLAB_TLS_KEY(PEM 파일 경로) → { cert, key } | null. 하나만 있으면 시작을 거부한다. */
+function tlsFromEnv(env) {
+  const { COLLAB_TLS_CERT: cert, COLLAB_TLS_KEY: key } = env;
+  if (!cert && !key) return null;
+  if (!cert || !key) throw new Error('COLLAB_TLS_CERT 와 COLLAB_TLS_KEY 는 함께 정해야 한다');
+  return { cert: readFileSync(cert), key: readFileSync(key) };
+}
 
 export function startServer({
   port = 8787, host = '127.0.0.1', log = console.log,
@@ -100,15 +108,29 @@ export function startServer({
   store = process.env.COLLAB_DATA_DIR ? new LocalDocStore(process.env.COLLAB_DATA_DIR) : null,
   docSaveIdleMs = Number(process.env.COLLAB_DOC_SAVE_IDLE_MS ?? 5000),
   generationIdleMs = Number(process.env.COLLAB_GENERATION_IDLE_MS ?? 600_000),
+  // 5단계 D1 접속 인증: { mode, verify(token, room), issue? } (server/auth.mjs). 기본은 환경 변수(COLLAB_AUTH 등) —
+  // HOST 가 루프백이면 none, 아니면 설정이 없을 때 시작을 거부한다. 'none' 문자열도 받는다.
+  auth = authFromEnv(process.env, { host, warn: log }),
+  // WebSocket 업그레이드(와 POST /rooms)의 Origin 허용 목록. 같은 출처(Origin 의 호스트 = Host 헤더)는 언제나 허용.
+  allowedOrigins = process.env.COLLAB_ALLOWED_ORIGINS ? process.env.COLLAB_ALLOWED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean) : null,
+  // 5단계 D2: 빌드한 studio 를 같은 출처로 내준다
+  staticDir = process.env.COLLAB_STATIC_DIR || null,
+  // 5단계 D2: { cert, key } (PEM 바이트 또는 문자열) 이면 HTTPS/wss 로 뜬다
+  tls = tlsFromEnv(process.env),
+  // 5단계 D3: POST /rooms 가 만드는 초대 토큰의 수명(초)
+  inviteTtlSec = parseDuration(process.env.COLLAB_INVITE_TTL, 86_400),
 } = {}) {
   if (store && !canonical) throw new Error('영속 저장(store)에는 정본(canonical)이 필요하다');
+  if (auth === 'none') auth = noneAuth();
+  if (!auth || typeof auth.verify !== 'function') throw new Error('auth 에는 verify(token, room) 가 있어야 한다');
+  const authOn = auth.mode !== 'none';
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map();
   /** 닫는 중 — 그 뒤의 연결 끊김으로 저장본·세대 전환 타이머를 새로 만들지 않는다 */
   let closed = false;
   // ws 의 하드 상한은 넉넉히 두고(넘으면 ws 가 1009 로 끊는다) 상한 판정은 메시지 처리에서 한다 — 보낸 쪽에
-  // 이유를 알려 주기 위해서다.
-  const wss = new WebSocketServer({ port, host, maxPayload: Math.max(maxMessageBytes * 2, 1024 * 1024) });
+  // 이유를 알려 주기 위해서다. HTTP(S) 서버 하나에 붙인다(업그레이드에서 Origin 확인).
+  const wss = new WebSocketServer({ noServer: true, maxPayload: Math.max(maxMessageBytes * 2, 1024 * 1024) });
 
   // 연결마다 모든 송신이 같은 경로(같은 지연)를 지나므로 순서가 지켜진다.
   const sendRaw = (ws, data) => {
@@ -147,7 +169,7 @@ export function startServer({
     const first = chunks[0];
     const firstSeq = first.length ? first[first.length - 1].seq : (base === null ? room.seq : room.baseSeq);
     const seqOf = (chunk) => chunk[chunk.length - 1].seq;
-    send(ws, { type: 'welcome', seq: chunks.length > 1 ? firstSeq : room.seq, base, log: first, ...(room.generation ? { generation: room.generation } : {}), maxMessageBytes, ...extra });
+    send(ws, { type: 'welcome', seq: chunks.length > 1 ? firstSeq : room.seq, base, log: first, ...(room.generation ? { generation: room.generation } : {}), maxMessageBytes, ...userOf(ws), ...extra });
     for (const chunk of chunks.slice(1)) send(ws, { type: 'catchup', seq: seqOf(chunk), log: chunk, cont: true, maxMessageBytes });
     log(`[${room.name}] welcome${extra.resync ? '(resync)' : ''} ${who(ws)} seq=${room.seq} base=${base === null ? 'null (담당)' : `${base.length}B64`} log=${logItems.length}${chunks.length > 1 ? ` (${chunks.length}조각)` : ''} 세대 ${room.generation} 참여자=${room.clients.size}`);
   };
@@ -156,24 +178,73 @@ export function startServer({
   const catchup = (room, ws, from) => {
     room.clients.add(ws);
     const missing = room.log.filter((item) => item.seq > from);
-    send(ws, { type: 'catchup', seq: room.seq, log: missing, maxMessageBytes });
+    send(ws, { type: 'catchup', seq: room.seq, log: missing, maxMessageBytes, ...userOf(ws) });
     log(`[${room.name}] catchup ${who(ws)} ${from} → ${room.seq} (${missing.length}건) 참여자=${room.clients.size}`);
   };
 
+  /** 인증을 켠 서버는 welcome·catchup 에 확인된 사용자(sub·표시 이름·권한)를 싣는다. */
+  const userOf = (ws) => (authOn && ws.meta?.user ? { user: ws.meta.user } : {});
+
+  /** 방을 메모리에 연다(저장소가 있으면 복원을 사슬에 건다). */
+  const openRoom = (name) => {
+    const room = createRoom(name);
+    if (canonical) room.canonical = new Canonical({ pkg, timeoutMs: canonicalTimeoutMs, log: (m) => log(`[${name}] ${m}`) });
+    rooms.set(name, room);
+    log(`[${room.name}] 방 생성${canonical ? ' (정본)' : ''}${store ? ' (저장)' : ''}`);
+    if (store) enqueue(room, () => restoreRoom(room));
+    return room;
+  };
+
+  /** 저장소에 방이 있는지(인증을 켜면 hello 로 방을 새로 만들 수 없다). */
+  const storeHas = async (name) => {
+    if (!store) return false;
+    if (typeof store.has === 'function') return store.has(name);
+    return (await store.load(name)) !== null;
+  };
+
+  /** D1: unauthorized 를 보내고 닫는다(닫는 코드 4401). */
+  const unauthorized = (ws, reason, detail = '') => {
+    log(`[${ws.helloRoom ?? '-'}] unauthorized ${reason}${detail ? ` (${detail})` : ''}`);
+    send(ws, { type: 'unauthorized', reason });
+    setTimeout(() => { if (ws.readyState === ws.OPEN) ws.close(4401, reason); }, delayMs + 50);
+  };
+
+  /**
+   * D1: hello 의 토큰을 확인한다 → {sub, name, scope}. 토큰에 name 이 없으면(초대 토큰처럼 여럿이 나눠 쓰는 토큰)
+   * 표시 이름은 hello.name(확인하지 않은 값)이고, sub 에는 연결마다 다른 꼬리를 붙여 구분한다.
+   */
+  const authorizeHello = async (msg) => {
+    const token = typeof msg.token === 'string' ? msg.token : '';
+    if (!token) throw new AuthError('missing', '토큰이 없다');
+    const user = normalizeUser(await auth.verify(token, msg.room));
+    if (!JOIN_SCOPES.some((s) => user.scope.includes(s))) throw new AuthError('scope', `방에 들어갈 권한이 없다 (${user.scope.join(' ') || '없음'})`);
+    // 방은 서버가 만든다(D3) — 인증을 켜면 없는 방에 hello 로 들어갈 수 없다. 토큰을 확인한 뒤에 본다(방이 있는지 떠보지 못하게).
+    if (!rooms.has(msg.room) && !(await storeHas(msg.room))) throw new AuthError('no-room', '없는 방');
+    if (!user.name) {
+      user.name = cleanName(msg.name) || '손님';
+      user.sub = `${user.sub ?? 'anonymous'}~${randomBytes(4).toString('hex')}`;
+    }
+    return user;
+  };
+
   const handleHello = (ws, msg) => {
-    if (ws.meta) return send(ws, { type: 'error', error: 'hello 는 한 번만 보낸다' });
+    if (ws.meta || ws.helloRoom) return send(ws, { type: 'error', error: 'hello 는 한 번만 보낸다' });
     if (typeof msg.room !== 'string' || !msg.room || typeof msg.clientId !== 'string' || !msg.clientId) {
       return send(ws, { type: 'error', error: 'hello 에 room·clientId 가 필요하다' });
     }
-    let room = rooms.get(msg.room);
-    if (!room) {
-      room = createRoom(msg.room);
-      if (canonical) room.canonical = new Canonical({ pkg, timeoutMs: canonicalTimeoutMs, log: (m) => log(`[${msg.room}] ${m}`) });
-      rooms.set(msg.room, room);
-      log(`[${room.name}] 방 생성${canonical ? ' (정본)' : ''}${store ? ' (저장)' : ''}`);
-      const created = room;
-      if (store) enqueue(room, () => restoreRoom(created));
-    }
+    ws.helloRoom = msg.room;
+    if (!authOn) return joinRoom(ws, msg, { sub: null, name: typeof msg.name === 'string' ? msg.name : '', scope: ['edit'] });
+    authorizeHello(msg).then(
+      (user) => { if (ws.readyState === ws.OPEN && !closed) joinRoom(ws, msg, user); },
+      (error) => {
+        if (error instanceof AuthError) return unauthorized(ws, error.reason, error.message);
+        unauthorized(ws, 'unavailable', `검증 함수 오류: ${error?.message ?? error}`);
+      },
+    );
+  };
+
+  const joinRoom = (ws, msg, user) => {
+    const room = rooms.get(msg.room) ?? openRoom(msg.room);
     const engine = typeof msg.engine === 'string' ? msg.engine : '';
     if (room.engine === undefined) {
       room.engine = room.canonical ? serverEngine : engine;
@@ -184,7 +255,14 @@ export function startServer({
       setTimeout(() => ws.close(), delayMs + 50);
       return;
     }
-    ws.meta = { room: msg.room, clientId: msg.clientId, name: typeof msg.name === 'string' ? msg.name : '' };
+    ws.meta = {
+      room: msg.room, clientId: msg.clientId, name: user.name ?? '',
+      /** 기록 항목에 서버가 찍는 사용자 식별자(인증을 끄면 없음) — 클라이언트가 보낸 값은 쓰지 않는다 */
+      sub: user.sub,
+      perm: editPermission(user.scope),
+      user: { sub: user.sub, name: user.name, scope: user.scope },
+    };
+    if (authOn) log(`[${room.name}] 인증 ${who(ws)} sub=${user.sub} scope=${user.scope.join(' ')}`);
     ws.resumeFrom = Number.isInteger(msg.lastSeq) && msg.lastSeq >= 0 ? msg.lastSeq : null;
     ws.resumeGeneration = Number.isInteger(msg.generation) ? msg.generation : 0;
     // 저장소가 있으면 복원(앞선 처리)이 끝난 뒤에 들인다.
@@ -207,7 +285,8 @@ export function startServer({
       if (from !== null && ws.resumeGeneration === room.generation && from >= room.baseSeq && from <= room.seq) return catchup(room, ws, from);
       return welcome(room, ws, room.base);
     }
-    if (room.baseOwner === null) {
+    // base 담당은 편집 권한(edit)이 있는 참여자만 — 보기·양식·메모 권한은 기다린다.
+    if (room.baseOwner === null && ws.meta.perm.level === 'edit') {
       room.baseOwner = ws;
       return welcome(room, ws, null);
     }
@@ -278,6 +357,7 @@ export function startServer({
       if (!loaded.ok) { room.broken = `새 기준점을 열지 못함: ${loaded.reason}`; return; }
       await store.setBase(room.name, { baseSeq: lastSeq, data: next, engine: serverEngine, generation: saved.meta.generation + 1 });
       room.generation = saved.meta.generation + 1;
+      room.generationSeq = lastSeq;
       room.seq = lastSeq;
       room.docSeq = saved.meta.docSeq;
       pickBasePoint(room, packed, lastSeq, []);
@@ -292,6 +372,7 @@ export function startServer({
       return;
     }
     room.generation = saved.meta.generation;
+    room.generationSeq = saved.meta.baseSeq;
     room.seq = lastSeq;
     room.docSeq = saved.meta.docSeq;
     pickBasePoint(room, base, saved.meta.baseSeq, saved.log);
@@ -334,6 +415,7 @@ export function startServer({
     const reread = await room.canonical.load(ex.data);
     if (!reread.ok) { room.broken = `세대 전환 base 를 다시 읽지 못함: ${reread.reason}`; return; }
     room.generation = generation;
+    room.generationSeq = room.seq;
     pickBasePoint(room, ex.data, room.seq, []);
     room.canonDigests.clear();
     keepCanonDigest(room, room.seq, reread.digest);
@@ -344,11 +426,18 @@ export function startServer({
   const onRoomEmpty = (room) => {
     if (closed) return; // 서버를 닫는 중(close 가 저장본을 쓴다)
     enqueue(room, () => saveDoc(room, '마지막 참여자 나감'));
+    scheduleUnload(room);
+  };
+
+  /** 빈 방을 10분 뒤 세대 전환하고 메모리에서 내린다(참여자가 오면 admit 이 타이머를 지운다). */
+  const scheduleUnload = (room) => {
+    if (!store || closed) return;
     clearTimeout(room.generationTimer);
     room.generationTimer = setTimeout(() => enqueue(room, async () => {
       room.generationTimer = null;
       if (room.clients.size > 0 || room.waiting.length > 0 || rooms.get(room.name) !== room) return;
-      await changeGeneration(room, `방이 ${Math.round(generationIdleMs / 1000)}초 빔`);
+      // 이 세대의 기준점 뒤로 편집이 없으면(내려받기만 했거나 방을 만들기만 함) 세대를 바꾸지 않는다.
+      if (room.seq !== room.generationSeq) await changeGeneration(room, `방이 ${Math.round(generationIdleMs / 1000)}초 빔`);
       if (room.clients.size > 0 || room.waiting.length > 0) return;
       clearTimeout(room.docTimer);
       await room.canonical?.terminate();
@@ -358,7 +447,14 @@ export function startServer({
     room.generationTimer.unref?.();
   };
 
+  /** 권한이 모자란 메시지: 연결은 두고 그 메시지만 거절한다(D0·D4). reason = scope | unsupported | confined */
+  const forbidden = (ws, room, what, reason, msg = {}, detail = '') => {
+    log(`[${room.name}] forbidden ${who(ws)} ${what} ${reason}${detail ? ` (${detail})` : ''}`);
+    send(ws, { type: 'forbidden', what, reason, ...(typeof msg.batchId === 'string' ? { batchId: msg.batchId } : {}) });
+  };
+
   const handleBase = (ws, room, msg) => {
+    if (ws.meta.perm.level !== 'edit') return forbidden(ws, room, 'base', 'scope');
     if (room.base !== null || room.baseOwner !== ws) {
       log(`[${room.name}] base 무시: ${who(ws)} 는 담당이 아니거나 이미 정해짐`);
       return send(ws, { type: 'error', error: 'base 를 보낼 차례가 아니다' });
@@ -382,6 +478,7 @@ export function startServer({
         // 정하기 전에 welcome 을 받으므로, 세대를 따로 알려 주지 않아도 0 으로 맞는다.
         await store.setBase(room.name, { baseSeq: room.seq, data: gunzipSync(Buffer.from(msg.data, 'base64')), engine: serverEngine, generation: 0 });
         room.generation = 0;
+        room.generationSeq = room.seq;
       }
       commitBase(ws, room, msg.data, res.digest);
     });
@@ -402,11 +499,16 @@ export function startServer({
     if (!Array.isArray(msg.entries) || msg.entries.length === 0) {
       return send(ws, { type: 'error', error: 'entries 는 비어 있지 않은 배열이어야 한다' });
     }
+    // D0·D4 권한: view 는 편집을 보낼 수 없다. form·comment 는 정본이 결과로 확인한다(정본이 없으면 판정할 수 없다).
+    const { perm } = ws.meta;
+    if (perm.level === 'none') return forbidden(ws, room, 'ops', 'scope', msg);
+    if (perm.level === 'confined' && !room.canonical) return forbidden(ws, room, 'ops', 'unsupported', msg, '정본이 꺼져 있음');
     if (!room.canonical) return commitOps(ws, room, msg, null);
     enqueue(room, async () => {
       if (!room.clients.has(ws)) return;
       if (room.base === null || msg.base !== room.seq) return commitOps(ws, room, msg, null); // reject 경로
-      const res = await room.canonical.apply(msg.entries);
+      const res = await room.canonical.apply(msg.entries, perm.level === 'confined' ? { confine: perm.kinds } : {});
+      if (!res.ok && res.forbidden) return forbidden(ws, room, 'ops', res.reason, msg, res.detail ?? '');
       if (!res.ok) {
         log(`[${room.name}] invalid ${who(ws)} base=${msg.base}: ${res.reason}${res.panic ? ' (패닉 — 정본 재생성)' : ''}`);
         send(ws, { type: 'invalid', what: 'ops', reason: res.reason, ...(typeof msg.batchId === 'string' ? { batchId: msg.batchId } : {}) });
@@ -419,7 +521,7 @@ export function startServer({
       }
       if (store) {
         // 디스크에 덧붙이고 fsync 한 뒤에 방송한다. 쓰기에 실패하면 거절하고 정본을 디스크와 같은 상태로 되돌린다.
-        const item = { seq: room.seq + 1, clientId: ws.meta.clientId, entries: msg.entries, ...(typeof msg.batchId === 'string' ? { batchId: msg.batchId } : {}) };
+        const item = { seq: room.seq + 1, clientId: ws.meta.clientId, entries: msg.entries, ...stampOf(ws, msg) };
         try {
           await store.append(room.name, item);
         } catch (error) {
@@ -433,6 +535,12 @@ export function startServer({
     });
   };
 
+  /** 기록 항목의 덧붙임: 묶음 이름(클라이언트 값)과 sub(서버가 찍는 값 — 클라이언트가 보낸 sub 는 쓰지 않는다). */
+  const stampOf = (ws, msg) => ({
+    ...(typeof msg.batchId === 'string' ? { batchId: msg.batchId } : {}),
+    ...(ws.meta.sub ? { sub: ws.meta.sub } : {}),
+  });
+
   const commitOps = (ws, room, msg, digest) => {
     if (room.base === null || msg.base !== room.seq) {
       log(`[${room.name}] reject ${who(ws)} base=${msg.base} room.seq=${room.seq}${room.base === null ? ' (base 없음)' : ''}`);
@@ -440,14 +548,14 @@ export function startServer({
     }
     room.seq += 1;
     if (digest) keepCanonDigest(room, room.seq, digest);
-    const entry = { seq: room.seq, clientId: ws.meta.clientId, entries: msg.entries, ...(typeof msg.batchId === 'string' ? { batchId: msg.batchId } : {}) };
+    const entry = { seq: room.seq, clientId: ws.meta.clientId, entries: msg.entries, ...stampOf(ws, msg) };
     // state 기록은 새 기준점 — 그 앞의 로그는 늦은 참여·재동기화에 더 필요 없다.
     const lastState = msg.entries.findLastIndex((e) => e?.kind === 'state' && typeof e.data === 'string');
     if (lastState >= 0) {
       room.base = msg.entries[lastState].data;
       room.baseSeq = room.seq; // 이 묶음의 state 앞에서 끊긴 참여자는 따라잡지 못한다(state 가 기록에 없다)
       const rest = msg.entries.slice(lastState + 1);
-      room.log = rest.length > 0 ? [{ seq: room.seq, clientId: ws.meta.clientId, entries: rest }] : [];
+      room.log = rest.length > 0 ? [{ seq: room.seq, clientId: ws.meta.clientId, entries: rest, ...(ws.meta.sub ? { sub: ws.meta.sub } : {}) }] : [];
     } else {
       room.log.push(entry);
     }
@@ -475,6 +583,8 @@ export function startServer({
       log(`[${room.name}] DIVERGED seq=${seq} ${who(ws)} ${digest.slice(0, 12)} ≠ 정본 ${canon.slice(0, 12)}`);
       return send(ws, { type: 'diverged', seq });
     }
+    // 정본이 없으면 처음 보고가 기준이 되어 방 전체를 재동기화시킬 수 있다 — 편집 권한(edit)이 없는 연결의 보고는 쓰지 않는다.
+    if (ws.meta.perm.level !== 'edit') return;
     const first = room.digests.get(seq);
     if (!first) {
       room.digests.set(seq, { digest, clientId: ws.meta.clientId });
@@ -503,14 +613,123 @@ export function startServer({
     if (room.baseOwner === ws) {
       // base 를 보내기 전에 나갔다. 기다리던 다음 참여자에게 담당을 넘긴다.
       room.baseOwner = null;
-      const next = room.waiting.shift();
-      if (next) {
+      const k = room.waiting.findIndex((w) => w.meta.perm.level === 'edit');
+      if (k >= 0) {
+        const [next] = room.waiting.splice(k, 1);
         room.baseOwner = next;
         welcome(room, next, null);
       }
     }
     if (store && room.clients.size === 0 && room.waiting.length === 0) onRoomEmpty(room);
   };
+
+  // ── 5단계 D3: 파일로 방 열기 (HTTP API, server/http.mjs) ───────────────
+
+  /** HTTP 요청의 `Authorization: Bearer` 토큰을 확인한다. scopes 중 하나가 있어야 한다. 인증을 끄면 누구나. */
+  const authorizeHttp = async (req, room, scopes) => {
+    if (!authOn) return { sub: null, name: null, scope: ['edit', 'create'] };
+    const m = /^Bearer\s+(\S+)\s*$/i.exec(req.headers.authorization ?? '');
+    if (!m) throw new AuthError('missing', '토큰이 없다');
+    const user = normalizeUser(await auth.verify(m[1], room));
+    if (!scopes.some((s) => user.scope.includes(s))) throw new AuthError('scope', `권한이 없다 (${scopes.join('·')} 필요)`);
+    return user;
+  };
+
+  /** hs256 처럼 서버가 토큰을 만들 수 있으면 새 방의 초대 토큰(권한마다 하나, name 없음)을 만든다. */
+  const makeInvites = (room) => {
+    if (typeof auth.issue !== 'function') return {};
+    const iat = Math.floor(Date.now() / 1000);
+    const exp = iat + inviteTtlSec;
+    const invite = {};
+    for (const scope of JOIN_SCOPES) invite[scope] = auth.issue({ sub: 'invite', room, scope, iat, exp });
+    return { invite, inviteExpiresAt: new Date(exp * 1000).toISOString() };
+  };
+
+  /** POST /rooms: 정본으로 열어 검사한 뒤 새 방(0세대 기준점 = 올린 바이트 그대로)을 만든다. */
+  const createRoomFromFile = async (req, raw) => {
+    const user = await authorizeHttp(req, null, ['create']);
+    if (!canonical) throw new HttpError(501, 'no-canonical', '정본(COLLAB_CANONICAL)이 꺼져 있어 파일을 검사할 수 없다');
+    if (closed) throw new HttpError(503, 'closing', '서버를 닫는 중이다');
+    try { formatOf(raw); } catch { throw new HttpError(415, 'not-hwp', 'HWP·HWPX 파일이 아니다'); }
+    const packed = gzipSync(raw).toString('base64');
+    // WebSocket base 와 같은 규칙: welcome 에 실을 수 있어야 한다.
+    if (packed.length + 64 > maxMessageBytes) throw new HttpError(413, 'too-large', `문서가 메시지 상한 ${maxMessageBytes}바이트를 넘는다`, { limit: maxMessageBytes });
+    const name = randomBytes(16).toString('base64url');
+    const room = createRoom(name);
+    room.canonical = new Canonical({ pkg, timeoutMs: canonicalTimeoutMs, log: (m) => log(`[${name}] ${m}`) });
+    room.engine = serverEngine;
+    const res = await room.canonical.load(packed);
+    if (!res.ok) {
+      await room.canonical.terminate();
+      throw new HttpError(422, 'invalid-document', `문서를 열지 못했다: ${res.reason}`);
+    }
+    try {
+      if (store) await store.setBase(name, { baseSeq: 0, data: raw, engine: serverEngine, generation: 0 });
+    } catch (error) {
+      await room.canonical.terminate();
+      throw error;
+    }
+    room.base = packed;
+    room.baseSeq = 0;
+    room.generationSeq = 0;
+    keepCanonDigest(room, 0, res.digest);
+    rooms.set(name, room);
+    scheduleUnload(room);
+    log(`[${name}] 방 생성(파일 ${raw.length}B, ${formatOf(raw)})${user.sub ? ` by ${user.sub}` : ''} 정본 ${res.digest.slice(0, 12)}${store ? ' (저장)' : ''}`);
+    return { room: name, ...makeInvites(name) };
+  };
+
+  /** GET /rooms/{room}/document: 정본을 내보낸 최신 문서(원본 형식). 메모리에 없으면 저장소에서 연다. */
+  const downloadDocument = async (req, name) => {
+    await authorizeHttp(req, name, JOIN_SCOPES);
+    let room = rooms.get(name);
+    if (!room) {
+      if (!(await storeHas(name))) throw new HttpError(404, 'no-room', '없는 방');
+      room = rooms.get(name) ?? openRoom(name);
+    }
+    if (!room.canonical) throw new HttpError(501, 'no-canonical', '정본(COLLAB_CANONICAL)이 꺼져 있어 내보낼 수 없다');
+    let out = null;
+    await enqueue(room, async () => {
+      if (room.broken) { out = new HttpError(409, 'broken', `이 방을 열 수 없다: ${room.broken}`); return; }
+      if (room.base === null) { out = new HttpError(404, 'no-document', '아직 문서가 없다'); return; }
+      const ex = await room.canonical.export();
+      if (!ex.ok) { out = new HttpError(500, 'export-failed', `내보내지 못했다: ${ex.reason}`); return; }
+      out = { raw: gunzipSync(Buffer.from(ex.data, 'base64')), seq: room.seq };
+    });
+    if (room.clients.size === 0 && room.waiting.length === 0) scheduleUnload(room);
+    if (out === null) throw new HttpError(500, 'export-failed', '내보내지 못했다');
+    if (out instanceof HttpError) throw out;
+    log(`[${name}] 문서 내려받기 seq ${out.seq} (${out.raw.length}B)`);
+    return { ...out, format: formatOf(out.raw) };
+  };
+
+  /** Origin 확인: 목록이 없으면 통과. 같은 출처(Origin 의 호스트 = Host 헤더)와 Origin 이 없는 요청(브라우저 밖)도 통과. */
+  const originAllowed = (req) => {
+    const origin = req.headers.origin;
+    if (!allowedOrigins || !origin) return true;
+    if (allowedOrigins.includes(origin)) return true;
+    try { return new URL(origin).host === req.headers.host; } catch { return false; }
+  };
+
+  const onRequest = createHttpHandler({
+    api: { createRoom: createRoomFromFile, download: downloadDocument },
+    staticDir, maxBodyBytes: maxMessageBytes, originAllowed, log,
+  });
+  const httpServer = tls ? https.createServer({ cert: tls.cert, key: tls.key }, onRequest) : http.createServer(onRequest);
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (closed || !originAllowed(req)) {
+      log(`업그레이드 거절: Origin ${req.headers.origin ?? '-'}${closed ? ' (닫는 중)' : ''}`);
+      socket.end(`HTTP/1.1 ${closed ? '503 Service Unavailable' : '403 Forbidden'}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+  const ready = new Promise((resolve, reject) => {
+    httpServer.once('listening', resolve);
+    httpServer.once('error', reject);
+  });
+  ready.catch(() => {}); // 실패는 ready 를 기다리는 쪽이 받는다
+  httpServer.listen(port, host);
 
   wss.on('connection', (ws) => {
     ws.on('message', (data) => {
@@ -558,13 +777,15 @@ export function startServer({
 
   return {
     wss,
+    httpServer,
     rooms,
+    /** 확인 방식 이름(none | hs256 | url | 끼운 함수의 이름) */
+    authMode: auth.mode,
+    /** HTTPS/wss 로 떴는지 */
+    secure: Boolean(tls),
     /** 실제로 열린 포트 (port: 0 으로 띄웠을 때) */
-    get port() { return wss.address().port; },
-    ready: new Promise((resolve, reject) => {
-      wss.once('listening', resolve);
-      wss.once('error', reject);
-    }),
+    get port() { return httpServer.address().port; },
+    ready,
     /** 서버를 닫는다. 저장소가 있으면 모든 방의 저장본을 쓴 뒤 닫는다(기록은 비우지 않는다 — 다시 붙는 참여자의 계보). */
     close: async () => {
       closed = true;
@@ -572,6 +793,11 @@ export function startServer({
       if (store) await Promise.all([...rooms.values()].map((room) => enqueue(room, () => saveDoc(room, '서버 종료'))));
       for (const room of rooms.values()) { clearTimeout(room.docTimer); clearTimeout(room.generationTimer); await room.canonical?.terminate(); }
       await new Promise((resolve) => wss.close(() => resolve()));
+      if (httpServer.listening) {
+        const done = new Promise((resolve) => httpServer.close(() => resolve()));
+        httpServer.closeAllConnections?.();
+        await done;
+      }
     },
     /** 시험용: 방의 처리 사슬이 빌 때까지 */
     settle: (name) => rooms.get(name)?.queue ?? Promise.resolve(),
@@ -584,9 +810,21 @@ export function startServer({
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const port = Number(process.env.PORT ?? 8787);
-  const server = startServer({ port, host: process.env.HOST ?? '127.0.0.1' });
+  const host = process.env.HOST ?? '127.0.0.1';
+  let server;
+  try {
+    server = startServer({ port, host });
+  } catch (error) {
+    // 설정 오류(루프백이 아닌데 인증 설정이 없음 등)는 시작을 거부한다.
+    console.error(`시작하지 않음: ${error.message}`);
+    process.exit(1);
+  }
   server.ready.then(
-    () => console.log(`cc-rhwp collab server: ws://${process.env.HOST ?? '127.0.0.1'}:${server.port}`),
+    () => {
+      const shown = host.includes(':') ? `[${host}]` : host;
+      const [h, w] = server.secure ? ['https', 'wss'] : ['http', 'ws'];
+      console.log(`cc-rhwp collab server: ${w}://${shown}:${server.port} (인증 ${server.authMode}${process.env.COLLAB_STATIC_DIR ? `, 편집기 ${h}://${shown}:${server.port}/` : ''}, 업로드 ${h}://${shown}:${server.port}/upload)`);
+    },
     (error) => { console.error(error.message); process.exit(1); },
   );
   // 서버 종료 때 저장본(S3-3). kill -9 는 여기를 지나지 않는다 — 그때는 fsync 한 기록으로 복원한다.

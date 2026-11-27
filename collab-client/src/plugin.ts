@@ -7,7 +7,8 @@
  *
  * studio 를 import 하지 않는다 — 타입만 `import type` 이다(플러그인 계약 `plugin/types.ts`).
  * 연결 설정은 URL 에서 읽는다: `?collab=ws://localhost:8787&room=demo&name=A` (`&collabFast=0` 이면 R11 빠른
- * 경로를 끄고 언제나 되감는다)
+ * 경로를 끄고 언제나 되감는다). 5단계: `?collab#token=…&room=…` — 값이 빈 collab 은 같은 출처 wss, 토큰은 주소의
+ * 조각으로 받는다(아래 "studio 쪽 접속 정보", 규약 docs/collab-protocol.md).
  */
 import type { DocumentLease, PluginCaret, PluginHost, PluginSurface, StudioPlugin } from '@/plugin/types';
 import { CollabEngine, type Entry, type EngineDoc, type TextCaret } from './engine/engine.ts';
@@ -15,12 +16,16 @@ import { CATALOG, ENGINE_FINGERPRINT } from './engine/catalog.ts';
 import { base64ToBytes, bytesToBase64 } from './engine/codec.ts';
 import { FONT_POLICY } from './engine/types.ts';
 import { CollabUndo } from './undo.ts';
+import {
+  AuthSession, buildHello, editLevel,
+  type ForbiddenMessage, type SessionUser, type TokenProvider, type UnauthorizedMessage, type UnauthorizedReason,
+} from './session/index.ts';
 
 type LogItem = { seq: number; clientId: string; entries: Entry[]; batchId?: string };
 type ServerMessage =
-  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number }
+  | { type: 'welcome'; seq: number; base: string | null; log: LogItem[]; resync?: boolean; maxMessageBytes?: number; generation?: number; user?: SessionUser }
   | { type: 'ops'; seq: number; clientId: string; entries: Entry[]; batchId?: string }
-  | { type: 'catchup'; seq: number; log: LogItem[]; maxMessageBytes?: number; cont?: boolean }
+  | { type: 'catchup'; seq: number; log: LogItem[]; maxMessageBytes?: number; cont?: boolean; user?: SessionUser }
   | { type: 'reject'; seq: number; batchId?: string }
   | { type: 'diverged'; seq: number }
   | { type: 'incompatible'; engine: string }
@@ -28,6 +33,8 @@ type ServerMessage =
   | { type: 'invalid'; what: 'ops' | 'base'; reason: string; batchId?: string }
   | { type: 'cursor'; clientId: string; name: string; seq: number; caret: TextCaret | null }
   | { type: 'cursor-leave'; clientId: string }
+  | UnauthorizedMessage
+  | ForbiddenMessage
   | { type: 'error'; error: string };
 
 /** digest 보고 최소 간격 (1단계 §6.8) */
@@ -91,6 +98,88 @@ const BANNER_STYLE = [
   'background:#c53030', 'color:#fff',
 ].join(';');
 
+// ── 5단계: studio 쪽 접속 정보 (docs/collab-stage5.md D0·D1·D2) ─────────────────────────────
+// 플랫폼 중립 규칙(토큰 공급자 호출, 만료 때 한 번 갱신, 이유 코드 분류, hello)은 `./session` 에 있다. 여기에는
+// studio 에서만 하는 일 — 주소에서 서버·방·토큰 읽기, 보안 컨텍스트 확인, 안내 문구 — 만 둔다.
+
+/** D2: crypto.randomUUID·Clipboard·File System Access 등은 보안 컨텍스트(https·localhost)에서만 있다. */
+const INSECURE_NOTICE = '공동편집은 HTTPS 에서만 쓸 수 있습니다';
+/** 토큰은 탭마다(sessionStorage) 방별로 둔다 — 새로고침해도 다시 들어오고, 탭을 닫으면 사라진다(Q5). */
+const TOKEN_KEY = (room: string) => `collab-token:${room}`;
+/** 이름이 없는 초대 토큰으로 들어올 때 물어본 표시 이름(기기에 남김) */
+const NAME_KEY = 'collab-display-name';
+const UNAUTHORIZED_TEXT: Record<UnauthorizedReason, string> = {
+  missing: '공동편집 토큰이 없습니다. 받은 링크로 다시 열어 주세요',
+  invalid: '공동편집 토큰이 올바르지 않습니다. 받은 링크로 다시 열어 주세요',
+  expired: '인증이 만료되었습니다. 다시 열어 주세요',
+  room: '이 링크로는 이 방에 들어갈 수 없습니다',
+  scope: '이 링크에는 방에 들어갈 권한이 없습니다',
+  'no-room': '방이 없습니다. 링크를 확인해 주세요',
+  unavailable: '인증 서버에 닿지 못했습니다',
+};
+const FORBIDDEN_NOTICE: Record<string, string> = {
+  scope: '보기 전용 링크라 편집이 반영되지 않습니다. 서버 문서로 되돌립니다',
+  confined: '이 링크로 바꿀 수 있는 부분이 아니라 서버가 거절했습니다. 서버 문서로 되돌립니다',
+  unsupported: '이 서버는 양식·메모 권한의 편집을 아직 받지 않습니다. 서버 문서로 되돌립니다',
+};
+const VIEW_ONLY_NOTICE = '보기 전용으로 들어왔습니다. 편집은 다른 사람에게 보내지지 않습니다';
+
+const safeStorage = (kind: 'sessionStorage' | 'localStorage') => {
+  try { return window[kind]; } catch { return null; }
+};
+
+/**
+ * 주소에서 접속 정보를 읽는다. 쿼리 `collab`(값이 비면 같은 출처 wss), 조각 또는 쿼리의 `room`·`name`, 조각의 `token`.
+ * 토큰은 읽은 뒤 주소에서 지운다(조각은 서버로 가지 않지만 주소창·기록·화면 공유에 남지 않게).
+ */
+function readStudioEntry(): { url: string; room: string; name: string; token: string | null } {
+  const query = new URLSearchParams(window.location.search);
+  const frag = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const url = query.get('collab') || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/`;
+  const room = frag.get('room') || query.get('room') || 'demo';
+  let token = frag.get('token');
+  const store = safeStorage('sessionStorage');
+  if (token) {
+    try { store?.setItem(TOKEN_KEY(room), token); } catch { /* 저장소를 쓸 수 없음 — 이번 탭 메모리에만 */ }
+    frag.delete('token');
+    const rest = frag.toString();
+    history.replaceState(history.state, '', `${window.location.pathname}${window.location.search}${rest ? `#${rest}` : ''}`);
+  } else {
+    try { token = store?.getItem(TOKEN_KEY(room)) ?? null; } catch { token = null; }
+  }
+  let name = frag.get('name') || query.get('name') || '';
+  if (!name && token) name = askDisplayName();
+  return { url, room, name: name || 'anon', token };
+}
+
+/** 이름이 없는 초대 링크: 다른 사람에게 보일 이름을 한 번 묻고 기억한다(확인된 값이 아닌 표시용). */
+function askDisplayName(): string {
+  const local = safeStorage('localStorage');
+  let saved = '';
+  try { saved = local?.getItem(NAME_KEY) ?? ''; } catch { /* 없음 */ }
+  if (saved) return saved;
+  const answer = (typeof window.prompt === 'function' ? window.prompt('다른 사람에게 보일 이름을 입력하세요', '') : null)?.trim() ?? '';
+  if (answer) { try { local?.setItem(NAME_KEY, answer); } catch { /* 저장 못 함 */ } }
+  return answer;
+}
+
+/** studio 의 토큰 공급자: 링크로 받은 토큰을 그대로. 링크 하나로는 새 토큰을 받을 길이 없다(만료면 다시 열어야 함). */
+const studioTokenProvider = (token: string | null): TokenProvider => ({ reason }) => (reason === 'expired' ? null : token);
+
+/** 보안 컨텍스트가 아니면 들어가지 않고 안내만 띄운다(아무것도 중지·가로채지 않는다). */
+function insecureSurface(): PluginSurface {
+  const banner = document.createElement('div');
+  banner.dataset.collab = 'insecure';
+  banner.style.cssText = BANNER_STYLE;
+  banner.textContent = `${INSECURE_NOTICE} (지금 주소: ${window.location.protocol}//${window.location.host})`;
+  document.body.appendChild(banner);
+  console.warn(`[collab] ${INSECURE_NOTICE} — isSecureContext=false`);
+  teardown = () => banner.remove();
+  const surface = { status: () => ({ ready: false, left: true, insecure: true }), digest: () => '' };
+  (window as unknown as { __collab?: typeof surface }).__collab = surface;
+  return surface;
+}
+
 /** 활성화한 연결의 정리 함수. `deactivate` 는 `activate` 의 클로저를 볼 수 없어 여기에 둔다. */
 let teardown: (() => void) | null = null;
 
@@ -99,11 +188,14 @@ export const collabPlugin = {
   apiVersion: 1,
 
   activate(host: PluginHost): PluginSurface {
+    // 5단계 D2: 보안 컨텍스트가 아니면 들어가지 않는다(crypto.randomUUID 등이 없다).
+    if (!window.isSecureContext) return insecureSurface();
     const params = new URLSearchParams(window.location.search);
-    const url = params.get('collab');
-    if (!url) throw new Error('collab URL 파라미터가 없습니다 (?collab=ws://…&room=…&name=…)');
-    const room = params.get('room') || 'demo';
-    const name = params.get('name') || 'anon';
+    // 5단계 D1: 서버·방·이름·토큰 (studio 쪽 접속 정보). 이름은 인증한 서버가 welcome 에서 알려 주면 그것으로 바꾼다.
+    const entry = readStudioEntry();
+    const { url, room } = entry;
+    let name = entry.name;
+    const auth = new AuthSession({ room, getToken: studioTokenProvider(entry.token) });
     const fast = params.get('collabFast') !== '0';
     // 4단계: 공동편집 되돌리기(`&collabUndo=0` 이면 예전처럼 되돌리기를 멈춘다)
     const undoEnabled = params.get('collabUndo') !== '0';
@@ -434,6 +526,7 @@ export const collabPlugin = {
 
     // ── 메시지 처리 ────────────────────────────────────────────────────
     const onWelcome = async (msg: Extract<ServerMessage, { type: 'welcome' }>) => {
+      onAdmitted(msg.user);
       if (typeof msg.maxMessageBytes === 'number') maxMessageBytes = msg.maxMessageBytes;
       if (typeof msg.generation === 'number') generation = msg.generation;
       // S3-4: 다시 붙었는데 서버가 따라잡기를 못 해 주면(기준점이 그 뒤로 옮겨 감) 재동기화와 같다 — 미확정을 버린다.
@@ -554,6 +647,7 @@ export const collabPlugin = {
      * 그 안에 있으면 남의 편집이 아니라 확정(ack)이다 — 다시 적용하지 않는다. 없으면 받아지지 않은 것이라 다시 보낸다.
      */
     const onCatchup = (msg: Extract<ServerMessage, { type: 'catchup' }>) => {
+      onAdmitted(msg.user);
       resuming = false;
       if (typeof msg.maxMessageBytes === 'number') maxMessageBytes = msg.maxMessageBytes;
       let acked = false;
@@ -594,8 +688,29 @@ export const collabPlugin = {
       scheduleDigest();
     };
 
+    // ── 5단계 D1: 인증 결과 (규칙은 ./session, 여기서는 studio 안내만) ────────────────
+    let viewOnlyNoticed = false;
+    /** 방에 들어갔다: 서버가 확인한 이름·권한을 받는다(인증을 끈 서버는 user 가 없다). */
+    const onAdmitted = (user: SessionUser | undefined) => {
+      auth.admitted(user ?? null);
+      if (!user) return;
+      if (user.name && user.name !== name) { name = user.name; render(); }
+      if (editLevel(user.scope) === 'none' && !viewOnlyNoticed) { viewOnlyNoticed = true; notice(VIEW_ONLY_NOTICE, 'view-only'); }
+    };
+    /** unauthorized: 만료면 한 번 새 토큰으로 다시 붙고(닫힘 처리의 재접속이 새 토큰을 쓴다), 아니면 멈추고 안내한다. */
+    const onUnauthorized = async (reason: string) => {
+      const decision = await auth.onUnauthorized(reason);
+      if (decision.action !== 'give-up') { log(`인증 ${reason} → ${decision.action === 'reconnect' ? '새 토큰으로 다시 붙음' : '다시 붙음(백오프)'}`); return; }
+      const unsent = engine.pendingCount;
+      const text = UNAUTHORIZED_TEXT[decision.reason];
+      leave(text);
+      showBanner(`${text}${unsent > 0 ? ` — 보내지 못한 편집 ${unsent}건은 이 화면에만 있습니다` : ''}`);
+      if (banner) banner.dataset.collab = 'unauthorized';
+    };
+
     const handle1 = async (msg: ServerMessage) => {
       if (left || desynced) return;
+      if (msg.type === 'unauthorized') return onUnauthorized(msg.reason); // 5단계 D1 — 재동기화 중이어도
       if (resyncing && msg.type !== 'welcome') return; // 재동기화 welcome 이 이 사이 항목을 포함한다
       switch (msg.type) {
         case 'welcome': return onWelcome(msg);
@@ -620,6 +735,16 @@ export const collabPlugin = {
           if (msg.batchId !== undefined && msg.batchId !== inflightBatch) return;
           notice(INVALID_NOTICE, 'invalid');
           requestResync(`서버 정본이 편집을 거절: ${msg.reason}`);
+          return;
+        case 'forbidden':
+          // 5단계 D0·D4: 권한 밖 편집 — invalid 와 같이 그 묶음과 뒤를 버리고 서버 문서로(정상 클라이언트는 문에서 먼저 막혀 드물다).
+          if (msg.what === 'base') {
+            leave('이 링크로는 문서를 올릴 수 없습니다');
+            return;
+          }
+          if (msg.batchId !== undefined && msg.batchId !== inflightBatch) return;
+          notice(FORBIDDEN_NOTICE[msg.reason] ?? FORBIDDEN_NOTICE.scope, 'forbidden');
+          requestResync(`서버가 권한 밖 편집을 거절: ${msg.reason}`);
           return;
         case 'too-large':
           if (msg.what === 'base') {
@@ -661,7 +786,7 @@ export const collabPlugin = {
         log('서버 메시지 해석 실패');
         return;
       }
-      if (ready && host.isComposing() && msg.type !== 'incompatible' && msg.type !== 'too-large') {
+      if (ready && host.isComposing() && msg.type !== 'incompatible' && msg.type !== 'too-large' && msg.type !== 'unauthorized') {
         held.push(msg);
         return;
       }
@@ -683,13 +808,17 @@ export const collabPlugin = {
       socket.addEventListener('message', (event) => { if (socket === ws) onSocketMessage(event); });
       socket.addEventListener('open', () => {
         if (socket !== ws) return;
-        connection = 'open';
-        reconnectAttempts = 0;
-        // 이미 방에 들어와 있었으면(재접속) 마지막으로 받은 seq 를 싣는다 → 서버가 따라잡기(catchup) 또는 welcome.
-        resuming = ready && !resyncing && !desynced;
-        render();
-        send({ type: 'hello', room, clientId, name, engine: ENGINE_FINGERPRINT, ...(resuming ? { lastSeq, generation } : {}) });
-        log(`연결 ${url} room=${room} 엔진 ${ENGINE_FINGERPRINT}${resuming ? ` (다시 붙음, lastSeq ${lastSeq})` : ''}`);
+        // 5단계 D1: 토큰을 받은 뒤 hello(공급자는 비동기일 수 있다 — 그동안은 아직 열리지 않은 것으로 둔다).
+        void auth.helloToken().then((token) => {
+          if (socket !== ws || socket.readyState !== WebSocket.OPEN || closing || left) return;
+          connection = 'open';
+          reconnectAttempts = 0;
+          // 이미 방에 들어와 있었으면(재접속) 마지막으로 받은 seq 를 싣는다 → 서버가 따라잡기(catchup) 또는 welcome.
+          resuming = ready && !resyncing && !desynced;
+          render();
+          send(buildHello({ room, clientId, name, engine: ENGINE_FINGERPRINT, token, resume: resuming ? { lastSeq, generation } : null }));
+          log(`연결 ${url} room=${room} 엔진 ${ENGINE_FINGERPRINT}${token ? ' (토큰)' : ''}${resuming ? ` (다시 붙음, lastSeq ${lastSeq})` : ''}`);
+        });
       });
       socket.addEventListener('close', () => {
         if (socket !== ws) return;
@@ -718,7 +847,7 @@ export const collabPlugin = {
         pending: engine.pendingCount, unsent: engine.unsentCount, sentEntries, droppedTotal,
         lastDigest, digestSentSeq, resyncCount: resyncTimes.length, engine: ENGINE_FINGERPRINT,
         cursors: [...cursors.entries()].map(([id, c]) => ({ clientId: id, name: c.name, caret: c.caret })),
-        reconnects, disconnectedAt, inflightBatch,
+        reconnects, disconnectedAt, inflightBatch, user: auth.user,
         fast: { enabled: fast, ...engine.fastStats, mismatches: engine.fastStats.mismatches.length },
       }),
       digest: () => handle()?.collabDigest() ?? '',

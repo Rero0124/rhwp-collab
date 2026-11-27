@@ -60,7 +60,11 @@ export class Canonical {
   }
 
   load(base) { return this.call('load', { base }); }
-  apply(entries) { return this.call('apply', { entries }); }
+  /**
+   * 기록 열을 적용해 본다. confine(['form'] | ['comment'] | 둘 다)이 있으면 바뀐 곳이 그 부분뿐인지 결과로 확인하고,
+   * 벗어나면 되돌린 뒤 {ok: false, forbidden: true, reason} 을 준다(5단계 D4).
+   */
+  apply(entries, { confine } = {}) { return this.call('apply', { entries, ...(confine?.length ? { confine } : {}) }); }
   digest() { return this.call('digest'); }
   export() { return this.call('export'); }
 

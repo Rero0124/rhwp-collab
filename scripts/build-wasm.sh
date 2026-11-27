@@ -36,6 +36,8 @@ node "${root}/scripts/gen-catalog.mjs" >/dev/null
 
 # 기본 산출물(pkg/)이면 이 rev 의 빌드로 보관한다(R1b 동작 동일성 검사의 "이전 엔진").
 # 다른 rev 의 보관 빌드가 있으면(업스트림을 올린 뒤 첫 빌드) 동작 동일성 검사를 돌려 분류표에 반영한다.
+# 동작 동일성 검사는 Node 의 엔진만 본다 — 업스트림을 올리면 브라우저 간 시험(s31-cross-browser)도 다시 돌린다
+# (Windows 기기가 있으면 포함, docs/collab-stage2.md §3 동작 동일성 검사).
 case " $* " in
   *" --out-dir "*|*" --out-dir="*) ;;
   *)
@@ -46,6 +48,7 @@ case " $* " in
     if ls -d "${root}/.tools/engine-builds/"*/ 2>/dev/null | grep -v "/${rev}/$" | grep -q .; then
       echo "build-wasm: 업스트림이 바뀌었습니다 — 동작 동일성 검사(scripts/check-behavior.mjs)를 돌립니다"
       node "${root}/scripts/check-behavior.mjs"
+      echo "build-wasm: 브라우저 간 시험도 다시 돌리세요 — collab-client/e2e/s31-cross-browser.mjs (Windows 기기가 있으면 포함)"
     fi
     ;;
 esac

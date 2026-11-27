@@ -37,8 +37,8 @@ const RESYNC_LIMIT = 3;
 /** 공유 문서 열기는 확인 창 없이 (1단계 §6.2) */
 const OPEN_OPTIONS = { suppressDialogs: true } as const;
 const AUTOSAVE_NOTICE = '공동편집 중에는 로컬 자동 저장을 하지 않습니다 — 서버 문서가 기준입니다';
-/** S3-1: 공동편집 중 조판은 엔진 내장 글꼴 규칙 — 문서 글꼴이 설치된 기기에서는 혼자 편집할 때와 배치가 다를 수 있다. */
-const FONT_POLICY_NOTICE = '공동편집 중에는 모든 참여자가 같은 결과를 보도록 내장 글꼴 규칙으로 배치합니다 — 문서 글꼴이 설치된 기기에서는 혼자 편집할 때와 줄·쪽 나눔이 다를 수 있습니다';
+/** S3-1: 공동편집 중 조판은 엔진 내장 글꼴 규칙 — 혼자 편집할 때(선언 환경·Canvas 보충 측정)와 배치가 다를 수 있다. */
+const FONT_POLICY_NOTICE = '공동편집 중에는 모두 같은 배치를 쓰므로 혼자 편집할 때와 줄·쪽 나눔이 다를 수 있습니다';
 const NOTICE_MS = 8000;
 /** S3-4 재접속: 지수 백오프 상한, 오래 끊김 안내 기준 */
 const RECONNECT_BASE_MS = 500;

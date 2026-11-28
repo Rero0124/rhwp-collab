@@ -14,6 +14,8 @@
 //!   입력·링크·메모 앵커를 걸친 삭제)의 되돌리기도 같은 범위 복원으로 한다. 조각은 DocInfo 를 들고 있지 않으므로 실행 직후
 //!   뜬 DocInfo 표시([`DocInfoMark`])로 전제를 본다.
 //! - [`CollabCore::check_range_hint`]: 서버 정본 — 범위 표시가 붙은 state 를 읽은 뒤, 범위 밖이 적용 전과 같은지 확인한다.
+//! - [`CollabCore::state_range_hint`](7단계 A): 되돌리기 밖의 일반 state 에도 범위 표시를 단다 — 호출 직전 스냅샷과 견주어
+//!   한 구역의 연속 문단 범위만 바뀌었고 DocInfo 가 그대로면.
 //!
 //! 이 모듈은 `ot` 의 자식이다(분류·발자국을 다시 쓴다). 문서를 바꾸는 부분(`CollabCore` impl)도 여기 둔다 — `lib.rs`·
 //! `wasm.rs` 를 고치지 않고 JS 표면도 이 파일에 둔다(맨 아래).
@@ -28,7 +30,7 @@ use super::{cell_space_of, classify, touches, Conc, Rec, Space, TOp, Touch};
 use crate::collab::CollabCore;
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
-use crate::model::document::{DocInfo, Document};
+use crate::model::document::{DocInfo, Document, Section};
 use crate::model::paragraph::Paragraph;
 use crate::model::raw_provenance::{bytes_digest, record_digest, section_model_digest};
 
@@ -649,17 +651,7 @@ fn compare_hint(base: &Document, now: &Document, sec: usize, lo: usize, before: 
         return Err("메모 답글 관계가 다름".into());
     }
     check_doc_info(doc_info, &now.doc_info)?;
-    if bin_data_content.len() > now.bin_data_content.len() {
-        return Err("BinData 항목이 줄었음".into());
-    }
-    for (x, y) in bin_data_content.iter().zip(&now.bin_data_content) {
-        let stored = |c: &crate::model::bin_data::BinDataContent| {
-            crate::collab::BinDigestCache::stored_digest(&c.data).unwrap_or_else(|| bytes_digest(&c.data.load_shared()))
-        };
-        if x.id != y.id || x.extension != y.extension || stored(x) != stored(y) {
-            return Err(format!("BinData {} 가 다름", x.id));
-        }
-    }
+    check_bins(bin_data_content, &now.bin_data_content)?;
     if sections.len() != now.sections.len() {
         return Err(format!("구역 수가 다름 ({} → {})", sections.len(), now.sections.len()));
     }
@@ -670,22 +662,53 @@ fn compare_hint(base: &Document, now: &Document, sec: usize, lo: usize, before: 
             }
             continue;
         }
-        if record_digest(&a.section_def) != record_digest(&b.section_def) {
-            return Err(format!("구역 {i} 의 구역 정의가 다름"));
+        compare_section(a, b, i, lo, before, after)?;
+    }
+    Ok(())
+}
+
+/// BinData 내용: 덧붙이기만, 있던 항목은 번호·확장자·내용이 같다(내용은 저장된 다이제스트 — 없으면 바이트를 해시).
+fn check_bins(a: &[crate::model::bin_data::BinDataContent], b: &[crate::model::bin_data::BinDataContent]) -> Result<(), String> {
+    if a.len() > b.len() {
+        return Err("BinData 항목이 줄었음".into());
+    }
+    use crate::model::bin_data::BinDataBytes;
+    let stored = |c: &crate::model::bin_data::BinDataContent| {
+        crate::collab::BinDigestCache::stored_digest(&c.data).unwrap_or_else(|| bytes_digest(&c.data.load_shared()))
+    };
+    // 빠른 길: 메모리 바이트는 그대로 견주고(해시 둘보다 싸다), 지연 항목은 같은 원본 컨테이너·같은 키면 같다(7단계 A —
+    // 보낸 쪽의 호출 직전 스냅샷은 지연 항목의 리졸버를 나눠 갖는다). 그 밖은 다이제스트.
+    let same = |x: &crate::model::bin_data::BinDataContent, y: &crate::model::bin_data::BinDataContent| match (&x.data, &y.data) {
+        (BinDataBytes::Loaded(p), BinDataBytes::Loaded(q)) => p == q,
+        (BinDataBytes::Lazy { resolver: r1, key: k1 }, BinDataBytes::Lazy { resolver: r2, key: k2 }) if std::sync::Arc::ptr_eq(r1, r2) && k1 == k2 => true,
+        _ => stored(x) == stored(y),
+    };
+    for (x, y) in a.iter().zip(b) {
+        if x.id != y.id || x.extension != y.extension || !same(x, y) {
+            return Err(format!("BinData {} 가 다름", x.id));
         }
-        if record_digest(&a.trailing_lists) != record_digest(&b.trailing_lists) {
-            return Err(format!("구역 {i} 의 꼬리 기록이 다름"));
-        }
-        let (na, nb) = (a.paragraphs.len(), b.paragraphs.len());
-        if lo + before > na || nb as i64 != na as i64 - before as i64 + after as i64 {
-            return Err(format!("구역 {i} 의 문단 수가 범위와 맞지 않음 ({na} → {nb}, 범위 {lo}+{before}→{after})"));
-        }
-        if let Some(p) = (0..lo).find(|&p| !para_same(&a.paragraphs[p], &b.paragraphs[p], false)) {
-            return Err(format!("범위 앞 문단 {p} 가 다름"));
-        }
-        if let Some(k) = (0..na - lo - before).find(|&k| !para_same(&a.paragraphs[lo + before + k], &b.paragraphs[lo + after + k], true)) {
-            return Err(format!("범위 뒤 문단 {} 가 다름", lo + before + k));
-        }
+    }
+    Ok(())
+}
+
+/// 범위 표시의 구역 안: 구역 정의·꼬리 같음, 문단 수가 범위와 맞음, 범위 앞 문단 같음(줄 정보까지), 범위 뒤 문단 같음(줄 세로
+/// 위치 뺌 — 범위가 문단 높이를 바꾸면 뒤 문단의 세로 위치가 밀린다).
+fn compare_section(a: &Section, b: &Section, i: usize, lo: usize, before: usize, after: usize) -> Result<(), String> {
+    if record_digest(&a.section_def) != record_digest(&b.section_def) {
+        return Err(format!("구역 {i} 의 구역 정의가 다름"));
+    }
+    if record_digest(&a.trailing_lists) != record_digest(&b.trailing_lists) {
+        return Err(format!("구역 {i} 의 꼬리 기록이 다름"));
+    }
+    let (na, nb) = (a.paragraphs.len(), b.paragraphs.len());
+    if lo + before > na || nb as i64 != na as i64 - before as i64 + after as i64 {
+        return Err(format!("구역 {i} 의 문단 수가 범위와 맞지 않음 ({na} → {nb}, 범위 {lo}+{before}→{after})"));
+    }
+    if let Some(p) = (0..lo).find(|&p| !para_same(&a.paragraphs[p], &b.paragraphs[p], false)) {
+        return Err(format!("범위 앞 문단 {p} 가 다름"));
+    }
+    if let Some(k) = (0..na - lo - before).find(|&k| !para_same(&a.paragraphs[lo + before + k], &b.paragraphs[lo + after + k], true)) {
+        return Err(format!("범위 뒤 문단 {} 가 다름", lo + before + k));
     }
     Ok(())
 }
@@ -742,6 +765,95 @@ fn check_doc_info(a: &DocInfo, b: &DocInfo) -> Result<(), String> {
         return Err("DocInfo 속성이 바뀜".into());
     }
     Ok(())
+}
+
+// ── 7단계 A: 결과 전송에 자동 범위 표시 ───────────────────────────────────────
+
+/// 호출 전 문서 `pre` → 지금 문서 `now` 의 차이가 한 구역의 연속 문단 범위뿐이면 (구역, lo, before, after). 아니면 사유:
+/// `nochange` 바뀐 것 없음, `docinfo` DocInfo·BinData 가 바뀜(덧붙이기 포함 — 다시 만들 때 남이 그사이 덧붙인 항목과 번호가
+/// 겹칠 수 있다), `props` 문서 속성·메모 관계, `sections` 구역 수가 다르거나 둘 이상 바뀜, `section-def` 그 구역의 구역 정의·
+/// 꼬리 기록이 바뀜. 범위는 앞 공통 문단(줄 정보 그대로)과 뒤 공통 문단(줄 세로 위치 뺌 — 서버 확인과 같다)을 깎아 구한다.
+fn state_range(pre: &Document, now: &Document) -> Result<(usize, usize, usize, usize), &'static str> {
+    if DocInfoMark::of(pre) != DocInfoMark::of(now) || check_bins(&pre.bin_data_content, &now.bin_data_content).is_err() || pre.bin_data_content.len() != now.bin_data_content.len() {
+        return Err("docinfo");
+    }
+    if props_digest(&pre.doc_properties) != props_digest(&now.doc_properties) || pre.memo_parents != now.memo_parents {
+        return Err("props");
+    }
+    if pre.sections.len() != now.sections.len() {
+        return Err("sections");
+    }
+    let changed: Vec<usize> = (0..pre.sections.len()).filter(|&i| section_model_digest(&pre.sections[i]) != section_model_digest(&now.sections[i])).collect();
+    let sec = match changed.as_slice() {
+        [] => return Err("nochange"),
+        [one] => *one,
+        _ => return Err("sections"),
+    };
+    let (a, b) = (&pre.sections[sec], &now.sections[sec]);
+    if record_digest(&a.section_def) != record_digest(&b.section_def) || record_digest(&a.trailing_lists) != record_digest(&b.trailing_lists) {
+        return Err("section-def");
+    }
+    let (na, nb) = (a.paragraphs.len(), b.paragraphs.len());
+    let mut lo = 0;
+    while lo < na && lo < nb && para_same(&a.paragraphs[lo], &b.paragraphs[lo], false) {
+        lo += 1;
+    }
+    let mut tail = 0;
+    while tail < na - lo && tail < nb - lo && para_same(&a.paragraphs[na - 1 - tail], &b.paragraphs[nb - 1 - tail], true) {
+        tail += 1;
+    }
+    // 순수 끼워 넣기·지우기(한쪽이 0 개)는 이웃 공통 문단 하나를 범위에 넣는다(범위 표시는 before·after ≥ 1)
+    if na - lo - tail == 0 || nb - lo - tail == 0 {
+        if lo > 0 {
+            lo -= 1;
+        } else if tail > 0 {
+            tail -= 1;
+        } else {
+            return Err("nochange");
+        }
+    }
+    Ok((sec, lo, na - lo - tail, nb - lo - tail))
+}
+
+impl CollabCore {
+    /// 7단계 A: 결과 전송(state)이 될 호출 직전에 뜬 자체 스냅샷 `pre` 와 지금 문서를 견주어, 한 범위 바꾸기면 범위 표시와
+    /// 복원 재료(after 문단 — 보정된 미확정을 옮긴 자리에서 다시 만들 때)를 돌려준다. 구한 범위는 서버 정본과 같은 규칙으로
+    /// 한 번 더 확인한다(DocInfo `check_doc_info`, 그 구역 `compare_section` — 다른 구역은 `state_range` 가 같은
+    /// `section_model_digest` 로 이미 견줬으므로 다시 해시하지 않는다. 큰 문서에서 비용의 대부분이 구역 해시다). 엔진은
+    /// **내보내기→다시 읽기 전에** 부른다(다시 읽은 문서는 항등이 아니라 범위 밖도 달라 보인다).
+    /// 반환 `{"range":{..},"recipe":n}` | `{"reason":".."}`.
+    pub fn state_range_hint(&self, pre_snapshot: u32) -> Result<Value, HwpError> {
+        let pre = self
+            .snapshots
+            .iter()
+            .find(|(id, _)| *id == pre_snapshot)
+            .map(|(_, s)| &s.document)
+            .ok_or_else(|| bad(format!("collab 스냅샷 {pre_snapshot} 없음")))?;
+        let now = &self.inner.document;
+        let found = state_range(pre, now).and_then(|r| {
+            check_doc_info(&pre.doc_info, &now.doc_info)
+                .and_then(|()| compare_section(&pre.sections[r.0], &now.sections[r.0], r.0, r.1, r.2, r.3))
+                .map(|()| r)
+                .map_err(|_| "check")
+        });
+        Ok(match found {
+            Ok((section, lo, before, after)) => {
+                let recipe = keep_recipe(Recipe { section, paras: now.sections[section].paragraphs[lo..lo + after].to_vec(), mark: DocInfoMark::of(now) });
+                json!({ "range": { "section": section, "lo": lo, "before": before, "after": after }, "recipe": recipe })
+            }
+            Err(reason) => json!({ "reason": reason }),
+        })
+    }
+
+    /// 7단계 A: 지금 문서의 (구역, `lo`부터 `n` 문단)으로 복원 재료를 만든다 — 엔진이 보내지 않은 범위 state 둘을 한 범위로
+    /// 합칠 때(합친 범위의 after 문단).
+    pub fn state_recipe(&self, section: usize, lo: usize, n: usize) -> Result<u32, HwpError> {
+        let paras = &self.inner.document.sections.get(section).ok_or_else(|| bad("구역 범위 밖"))?.paragraphs;
+        if n == 0 || lo + n > paras.len() {
+            return Err(bad("문단 범위 밖"));
+        }
+        Ok(keep_recipe(Recipe { section, paras: paras[lo..lo + n].to_vec(), mark: DocInfoMark::of(&self.inner.document) }))
+    }
 }
 
 // ── JS 표면 ──────────────────────────────────────────────────────────────
@@ -831,6 +943,24 @@ mod js {
         pub fn collab_undo_restore_fragment(&mut self, frag_id: u32, spec_json: &str, mark_json: &str) -> Result<u32, JsValue> {
             let (spec, mark) = (parse(spec_json, "spec")?, parse(mark_json, "mark")?);
             self.undo_restore_fragment(frag_id, &spec, &mark).map_err(js_err)
+        }
+
+        /// 7단계 A: state 가 될 호출 직전의 자체 스냅샷과 견주어 범위 표시·복원 재료 `{range, recipe}` 또는 `{reason}`.
+        #[wasm_bindgen(js_name = collabStateRangeHint)]
+        pub fn collab_state_range_hint(&self, pre_snapshot: u32) -> Result<String, JsValue> {
+            self.state_range_hint(pre_snapshot).map(|v| v.to_string()).map_err(js_err)
+        }
+
+        /// 7단계 A: 지금 문서의 한 범위로 복원 재료(보내지 않은 범위 state 둘을 합칠 때).
+        #[wasm_bindgen(js_name = collabStateRecipe)]
+        pub fn collab_state_recipe(&self, section: u32, lo: u32, n: u32) -> Result<u32, JsValue> {
+            self.state_recipe(section as usize, lo as usize, n as usize).map_err(js_err)
+        }
+
+        /// 7단계 A 시험용: 살아 있는 자체 스냅샷 수(미리 뜬 스냅샷이 남지 않는지).
+        #[wasm_bindgen(js_name = collabSnapshotCount)]
+        pub fn collab_snapshot_count(&self) -> u32 {
+            self.snapshot_count() as u32
         }
 
         /// 4단계 U3(서버 정본): 범위 표시가 붙은 state 를 읽은 지금 문서가 자체 스냅샷에서 그 범위만 바뀐 것인가.

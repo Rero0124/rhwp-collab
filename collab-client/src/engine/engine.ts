@@ -82,6 +82,12 @@ export interface EngineDoc {
   collabUndoFragmentCheck?(fragmentId: number, specJson: string, markJson: string): string;
   /** 4단계 U3-b: 조각 복원을 범위로(조각 소비, 기록 훅 밖) — 복원 재료 번호 */
   collabUndoRestoreFragment?(fragmentId: number, specJson: string, markJson: string): number;
+  /** 7단계 A: state 가 될 호출 직전 스냅샷과 견주어 범위 표시·복원 재료 `{range, recipe}` 또는 `{reason}` */
+  collabStateRangeHint?(preSnapshotId: number): string;
+  /** 7단계 A: 지금 문서의 한 범위로 복원 재료(보내지 않은 범위 state 둘을 합칠 때) */
+  collabStateRecipe?(section: number, lo: number, n: number): number;
+  /** 7단계 A 시험용: 살아 있는 자체 스냅샷 수 */
+  collabSnapshotCount?(): number;
   /** 5단계 D4 클라이언트 문: 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가. */
   collabFieldContains?(method: string, argsJson: string, activeFieldJson: string): boolean;
   /** D6: 메모 목록(작성자 확인) — 업스트림 `getMemoList` */
@@ -271,6 +277,8 @@ export class CollabEngine {
   private readonly fast: boolean;
   private readonly verifyFast: boolean;
   readonly fastStats: FastStats = { fast: 0, slow: 0, fallback: 0, blocks: {}, mismatches: [], fastMs: 0, slowMs: 0 };
+  /** 7단계 A: state 기록에 범위 표시를 단 수·못 단 수와 사유(보조 예외는 `error`) */
+  readonly stateHints: { hinted: number; plain: number; reasons: Record<string, number> } = { hinted: 0, plain: 0, reasons: {} };
 
   constructor(options: EngineOptions = {}) {
     this.classifyFn = options.classify ?? ((n) => classify(n));
@@ -441,12 +449,16 @@ export class CollabEngine {
       throw error;
     }
 
+    // 7단계 A: state 가 될 호출은 바로 전에 자체 스냅샷을 떠 둔다 — 호출 뒤 범위 표시를 구한다. 뜨지 못하면 표시 없이.
+    // 이 스냅샷은 어떤 경로에서든(성공·실패·예외) 이 호출 안에서 버린다.
+    const pre = info.sync === 'state' || info.sync === 'watch' ? this.preSnapshot(doc) : null;
     let result: unknown;
     const pinned = ctx?.memoTime !== undefined ? doc.collabSetMemoTime(ctx.memoTime) : null;
     try {
       result = invoke();
     } catch (error) {
       // 원래 호출이 실패하면 기록하지 않는다(대부분의 export 는 바꾸기 전에 검증한다).
+      this.discardPre(doc, pre);
       if (createdSnapshot) this.dropSnapshotIfIdle(doc);
       throw error;
     } finally {
@@ -454,14 +466,20 @@ export class CollabEngine {
     }
 
     let entry: Entry | null = null;
-    if (info.sync === 'watch') {
-      if (doc.collabDigest() !== digestBefore) {
-        this.onWarn(`분류되지 않은 ${name} 가 문서를 바꿨다 — 결과로 보낸다`);
-        entry = this.stateEntry(doc);
+    try {
+      if (info.sync === 'watch') {
+        if (doc.collabDigest() !== digestBefore) {
+          this.onWarn(`분류되지 않은 ${name} 가 문서를 바꿨다 — 결과로 보낸다`);
+          entry = this.stateEntry(doc, pre);
+        }
+      } else if (info.sync === 'state') {
+        entry = this.stateEntry(doc, pre);
       }
-    } else if (info.sync === 'state') {
-      entry = this.stateEntry(doc);
-    } else {
+    } finally {
+      this.discardPre(doc, pre);
+    }
+    if (info.sync !== 'watch' && info.sync !== 'state') {
+      // op 가 기록 중에 결과로 바뀌는 경우(인자 인코딩 실패·실측 불변식 위반)는 미리 뜬 스냅샷이 없어 보통 state 다
       try {
         entry = { kind: 'op', m: name, a: encodeArgs(args) };
       } catch (error) {
@@ -492,21 +510,87 @@ export class CollabEngine {
    * (R4 시험에서 확인) 받는 쪽은 다시 읽은 문서를 갖는데 나만 원래 문서를 들고 있으면 갈린다. 1단계에서 base
    * 담당이 자기 base 를 다시 연 것과 같은 이유다.
    */
-  private stateEntry(doc: EngineDoc): Entry {
-    const bytes = doc.collabExportState();
-    doc.collabLoadState(bytes);
-    return { kind: 'state', data: bytesToBase64(bytes) };
+  private stateEntry(doc: EngineDoc, pre: number | null = null): Entry {
+    // 7단계 A: 범위 표시는 내보내기→다시 읽기 **전에** 구한다(다시 읽은 문서는 항등이 아니라 범위 밖도 달라 보인다). 보조가
+    // 없거나 예외를 던지거나 조건이 맞지 않으면 표시 없이(보통 state) — 편집은 막지 않는다.
+    let hint: { range?: StateRange; recipe?: number; reason?: string } | null = null;
+    if (pre !== null && doc.collabStateRangeHint) {
+      try {
+        hint = JSON.parse(doc.collabStateRangeHint(pre));
+      } catch {
+        hint = { reason: 'error' };
+      }
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = doc.collabExportState();
+      doc.collabLoadState(bytes);
+    } catch (error) {
+      if (typeof hint?.recipe === 'number') this.discardRecipes([{ kind: 'state', data: '', recipe: hint.recipe }]);
+      throw error;
+    }
+    const entry: Extract<Entry, { kind: 'state' }> = { kind: 'state', data: bytesToBase64(bytes) };
+    if (pre === null) return entry;
+    if (hint?.range && typeof hint.recipe === 'number') {
+      entry.range = hint.range;
+      entry.recipe = hint.recipe;
+      this.stateHints.hinted += 1;
+    } else {
+      if (typeof hint?.recipe === 'number') this.discardRecipes([{ kind: 'state', data: '', recipe: hint.recipe }]);
+      const why = hint?.reason ?? 'unsupported';
+      this.stateHints.plain += 1;
+      this.stateHints.reasons[why] = (this.stateHints.reasons[why] ?? 0) + 1;
+    }
+    return entry;
+  }
+
+  /**
+   * 보내지 않은 state `a` 뒤에 `b` 가 왔을 때 하나로 합친 기록(합치지 않으면 `null`). 범위 `a` 는 a 의 앞 문서 D0 → D1, `b` 는
+   * D1 → D2 기준이다. 합친 범위는 D1 에서 두 범위를 덮는 [lo, e) 이고 D0·D2 쪽 끝은 각 범위의 문단 수 차이만큼 옮긴다.
+   */
+  private mergeStates(a: Extract<Entry, { kind: 'state' }>, b: Extract<Entry, { kind: 'state' }>): Entry | null {
+    if (!a.range && !b.range) return b;
+    if (!a.range || !b.range || a.range.section !== b.range.section || !this.doc?.collabStateRecipe) return null;
+    const { section } = a.range;
+    const lo = Math.min(a.range.lo, b.range.lo);
+    const end = Math.max(a.range.lo + a.range.after, b.range.lo + b.range.before);
+    const range: StateRange = { section, lo, before: end + a.range.before - a.range.after - lo, after: end + b.range.after - b.range.before - lo };
+    let recipe: number;
+    try {
+      recipe = this.doc.collabStateRecipe(section, lo, range.after);
+    } catch {
+      return null;
+    }
+    this.discardRecipes([a, b]);
+    return { kind: 'state', data: b.data, range, recipe };
+  }
+
+  /** 7단계 A: state 호출 직전 자체 스냅샷(보조가 없거나 뜨지 못하면 `null`). */
+  private preSnapshot(doc: EngineDoc): number | null {
+    if (!doc.collabStateRangeHint) return null;
+    try {
+      return doc.collabSnapshotSave();
+    } catch {
+      return null;
+    }
+  }
+
+  private discardPre(doc: EngineDoc, pre: number | null): void {
+    if (pre === null) return;
+    try { doc.collabSnapshotDiscard(pre); } catch { /* 문서가 이미 해제됨 */ }
   }
 
   private push(entry: Entry): void {
     const lid = this.nextLid++;
     this.localLog.push({ lid, entry });
-    // 보내지 않은 state 가 끝에 있으면 새 state 가 그것을 포함한다 — 마지막 것만 남긴다. U3: 범위 표시가 있는 state 는
-    // 합치지 않는다 — 합친 변경은 한 범위가 아니라 표시를 떼야 하고, 그러면 받는 쪽의 왕복 중 입력이 다시 취소된다(되돌리기를
-    // 연달아 누른 경우). 문서 두 벌을 보내는 비용을 택한다.
+    // 보내지 않은 state 가 끝에 있으면 새 state 가 그것을 포함한다 — 마지막 것만 남긴다. 둘 다 범위 표시가 있고 같은 구역이면
+    // 두 범위를 합친 표시로(7단계 A). 그 밖(표시 있는 것과 없는 것, 다른 구역, 재료를 못 만듦)은 합치지 않는다 — 표시를 떼면
+    // 받는 쪽의 왕복 중 입력이 다시 취소되고, 보통 state 와 합치면 그것이 버려질 때 범위 편집도 함께 버려진다. 문서 두 벌을
+    // 보내는 비용을 택한다.
     const last = this.unconfirmed[this.unconfirmed.length - 1];
-    if (entry.kind === 'state' && last?.kind === 'state' && !entry.range && !last.range && this.unconfirmed.length > this.sent) {
-      this.unconfirmed[this.unconfirmed.length - 1] = entry;
+    const merged = entry.kind === 'state' && last?.kind === 'state' && this.unconfirmed.length > this.sent ? this.mergeStates(last, entry) : null;
+    if (merged) {
+      this.unconfirmed[this.unconfirmed.length - 1] = merged;
       this.lids[this.lids.length - 1].push(lid);
     } else {
       this.unconfirmed.push(entry);

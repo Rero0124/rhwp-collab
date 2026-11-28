@@ -171,6 +171,8 @@ export interface SessionStatus {
   inflightBatch: string | null;
   user: SessionUser | null;
   fast: Omit<FastStats, 'mismatches'> & { enabled: boolean; mismatches: number };
+  /** 7단계 A: 내 state 기록에 범위 표시를 단 수·못 단 수(사유별) */
+  stateHints: { hinted: number; plain: number; reasons: Record<string, number> };
 }
 
 export interface CollabSessionOptions {
@@ -432,6 +434,7 @@ export class CollabSession {
       cursors: [...this._cursors.entries()].map(([id, c]) => ({ clientId: id, name: c.name, caret: c.caret })),
       reconnects: this.reconnects, disconnectedAt: this.disconnectedAt, inflightBatch: this.inflightBatch, user: this.auth.user,
       fast: { enabled: this.fast, ...fastStats, mismatches: mismatches.length },
+      stateHints: { ...this.engine.stateHints, reasons: { ...this.engine.stateHints.reasons } },
     };
   }
 

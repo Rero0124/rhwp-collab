@@ -47,6 +47,8 @@ const NO_STRUCT = flag('no-struct');
 const REWRITE_STATE = flag('rewrite-state');
 /** 4단계 U3: 스냅샷 명령의 범위 되돌리기를 섞는다 */
 const RANGE_UNDO = flag('range-undo');
+/** 7단계 A 비교용: state 기록에 자동 범위 표시를 달지 않는다(처음 문서에만 — S3 의 새 참여자·재시작 문서는 단다) */
+const NO_STATE_HINT = flag('no-state-hint');
 /**
  * --s3: 3단계 조건(docs/collab-stage3.md 관문 "R5 시뮬레이션 확장") — 서버 정본(S3-2), 무작위 연결 끊김·다시 붙기
  * (S3-4 catchup/welcome), 체크포인트(기준점 이동, S3-3), 서버 재시작(모든 연결 끊김 + 정본을 체크포인트 + 기록으로
@@ -402,6 +404,7 @@ async function runRealisticSeed(seed, base) {
   const r = prng(seed);
   const server = new Server(base);
   const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(String.fromCharCode(65 + i), base, server, { fast: FAST, verifyFast: VERIFY_FAST }));
+  if (NO_STATE_HINT) for (const c of clients) c.doc.collabStateRangeHint = undefined;
   const ONE_WAY = 50;
   // 각자 다른 문단에서 시작하도록 미리 문단을 만들고 맞춘다.
   for (let i = 0; i < CLIENTS; i += 1) { clients[0].doc.insertText(0, i, 0, `참여자${i} `); if (i < CLIENTS - 1) clients[0].doc.splitParagraph(0, i, 5); }
@@ -660,7 +663,7 @@ function finish(seed, server, clients, made, edits) {
   const errors = clients.flatMap((c) => c.errors.map((e) => `${c.id}: ${e}`));
   // U3: 정상 클라이언트의 범위 표시는 언제나 맞다(거절 0), 모두 확정되면 복원 재료가 남지 않는다
   const recipesLeft = RANGE_UNDO ? clients[0].engine.recipeCount() : 0;
-  const rangeOk = !RANGE_UNDO || (server.rangeRejects === 0 && recipesLeft === 0);
+  const rangeOk = server.rangeRejects === 0 && (!RANGE_UNDO || recipesLeft === 0);
   const ok = digests.every((d) => d === digests[0]) && replay === digests[0] && (canon === null || canon === digests[0]) && errors.length === 0 && rangeOk;
   const droppedByClass = {};
   for (const c of clients) for (const e of c.droppedEntries) {
@@ -682,6 +685,13 @@ function finish(seed, server, clients, made, edits) {
     reasons: clients.flatMap((c) => c.drops), fast,
     digests: digests.map((d) => d.slice(0, 10)), replay: replay.slice(0, 10), errors,
     ...(REWRITE_STATE ? { rewrite: { rewrites: server.rewrites, replacedAcks: clients.reduce((n, c) => n + (c.replacedAcks ?? 0), 0) } } : {}),
+    // 7단계 A: state 기록에 범위 표시를 단 수·못 단 수(사유별), 정본의 범위 확인·거절
+    stateHints: {
+      hinted: clients.reduce((n, c) => n + c.engine.stateHints.hinted, 0),
+      plain: clients.reduce((n, c) => n + c.engine.stateHints.plain, 0),
+      reasons: clients.reduce((o, c) => { for (const [k, v] of Object.entries(c.engine.stateHints.reasons)) o[k] = (o[k] ?? 0) + v; return o; }, {}),
+      rangeChecks: server.rangeChecks, rangeRejects: server.rangeRejects,
+    },
     ...(RANGE_UNDO ? { range: { ...rangeStatsOf(server), recipesLeft } } : {}),
     ...(S3 ? { s3: { canon: canon?.slice(0, 10), generations: server.generations, newcomers: clients.length - CLIENTS, restarts: server.restarts, invalids: server.invalids,
       catchups: clients.reduce((n, c) => n + c.catchups, 0), welcomes: clients.reduce((n, c) => n + c.resyncs, 0) } } : {}),
@@ -709,6 +719,7 @@ async function runSeed(seed, base) {
   const r = prng(seed);
   const server = new Server(base, { canonical: S3 || RANGE_UNDO, rewriteState: REWRITE_STATE || RANGE_UNDO });
   const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(String.fromCharCode(65 + i), base, server, { fast: FAST, verifyFast: VERIFY_FAST }));
+  if (NO_STATE_HINT) for (const c of clients) c.doc.collabStateRangeHint = undefined;
   rangeStats = { executed: 0, ranged: 0, notices: {}, docinfo: {}, failures: [] };
   if (RANGE_UNDO) for (const c of clients) withUndo(c, rangeStats);
   const made = {};
@@ -766,7 +777,8 @@ const m = await loadWasm();
 const base = (() => { const b = MIX === 'tn' ? tableBaseBytes(m) : blankBytes(); return S3 ? normalized(m, b) : b; })();
 const total = { seeds: 0, failed: [], edits: 0, made: {}, dropped: 0, droppedByClass: {}, reasons: {}, dropPairs: {},
   fast: { fast: 0, slow: 0, fallback: 0, blocks: {}, fastMs: 0, slowMs: 0 }, mismatches: [], mismatchSeeds: [],
-  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 }, rewrite: { rewrites: 0, replacedAcks: 0 }, range: {} };
+  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 }, rewrite: { rewrites: 0, replacedAcks: 0 }, range: {},
+  stateHints: { hinted: 0, plain: 0, reasons: {}, rangeChecks: 0, rangeRejects: 0 } };
 for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   const res = REALISTIC ? await runRealisticSeed(seed, base) : await runSeed(seed, base);
   for (const k of ['fast', 'slow', 'fallback', 'fastMs', 'slowMs']) total.fast[k] += res.fast[k];
@@ -779,6 +791,10 @@ for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   total.seeds += 1;
   if (res.s3) for (const k of Object.keys(total.s3)) total.s3[k] += res.s3[k];
   if (res.rewrite) for (const k of Object.keys(total.rewrite)) total.rewrite[k] += res.rewrite[k];
+  if (res.stateHints) {
+    for (const k of ['hinted', 'plain', 'rangeChecks', 'rangeRejects']) total.stateHints[k] += res.stateHints[k];
+    for (const [k, v] of Object.entries(res.stateHints.reasons)) total.stateHints.reasons[k] = (total.stateHints.reasons[k] ?? 0) + v;
+  }
   if (res.range) {
     for (const [k, v] of Object.entries(res.range)) {
       if (k === 'notices') for (const [t, n] of Object.entries(v)) total.range[`알림 ${t}`] = (total.range[`알림 ${t}`] ?? 0) + n;
@@ -809,7 +825,7 @@ console.log(JSON.stringify({
   seeds: total.seeds, ops: OPS, clients: CLIENTS, failed: total.failed.length, failedSeeds: total.failed.slice(0, 20),
   edits: total.edits, made: total.made, madeByClass, dropped: total.dropped, droppedByClass: total.droppedByClass,
   conflictRateByClass: rate, dropReasons: total.reasons,
-  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), ...(REWRITE_STATE ? { rewrite: total.rewrite } : {}), ...(RANGE_UNDO ? { range: total.range } : {}), cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
+  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), ...(REWRITE_STATE ? { rewrite: total.rewrite } : {}), ...(RANGE_UNDO ? { range: total.range } : {}), stateHints: total.stateHints, cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
   dropRate: total.edits ? `${((total.dropped / total.edits) * 100).toFixed(2)}%` : '-',
   dropPairs: Object.fromEntries(Object.entries(total.dropPairs).sort((a, b) => b[1] - a[1])),
   dropEvents: Object.values(total.reasons).reduce((n, v) => n + v, 0),

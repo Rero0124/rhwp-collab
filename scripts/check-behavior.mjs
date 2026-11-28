@@ -3,6 +3,10 @@
 //
 //   node scripts/check-behavior.mjs [--old <pkg 디렉터리>] [--new <pkg 디렉터리>] [--only a,b]
 //                                   [--attempts 300] [--want 8] [--seed 1] [--dry] [--report <json>]
+//   node scripts/check-behavior.mjs --state-range [--only a,b] [--report <json>]
+//       7단계 A 측정: 분류표 state 기능마다 같은 사례 생성기로 문서를 바꾼 호출을 모아, 호출 직전 자체 스냅샷과 견주어 범위
+//       표시를 얻는지(못 얻으면 사유)와 "스냅샷 + 비교" 시간을 낸다. 가장 큰 샘플 문서에서의 비용도 따로 잰다. 분류표·drift 는
+//       건드리지 않는다.
 //
 // `op` 로 분류된 기능마다 사례(샘플 문서 + 호출 인자)를 모으고 두 가지를 본다.
 //
@@ -419,6 +423,210 @@ function replay(name, entry, c, s) {
     b.free();
   }
   return fails;
+}
+
+// ── 7단계 A 측정: state 기능의 자동 범위 표시 ─────────────────────────────
+const STATE_RANGE = flag('state-range');
+const median = (xs) => { const v = [...xs].sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : null; };
+const ms = (x) => (x === null ? '-' : x < 10 ? x.toFixed(2) : x.toFixed(1));
+/** 사례 하나: 준비 → 자체 스냅샷 → 호출 → 범위 표시. 시간은 스냅샷 + 비교(호출 자체는 뺀다). */
+function hintOf(name, c) {
+  const d = open(NEW, docs[c.doc].bytes);
+  try {
+    for (const [m, a] of c.prep ?? []) if (!call(d, m, a)) return { reason: 'prep' };
+    const t0 = performance.now();
+    const pre = d.collabSnapshotSave();
+    const t1 = performance.now();
+    if (!call(d, name, c.args)) { d.collabSnapshotDiscard(pre); return { reason: 'call' }; }
+    const t2 = performance.now();
+    let v;
+    try { v = JSON.parse(d.collabStateRangeHint(pre)); } catch (e) { v = { reason: 'error' }; }
+    const t3 = performance.now();
+    d.collabSnapshotDiscard(pre);
+    if (typeof v.recipe === 'number') d.collabUndoRecipeDiscard(v.recipe);
+    return { range: v.range ?? null, reason: v.reason ?? null, ms: (t1 - t0) + (t3 - t2), paras: d.getParagraphCount(0) };
+  } finally {
+    d.free();
+  }
+}
+/** 가장 큰 샘플(HWP)에서 한 문단 고치는 state(덧말 넣기)의 스냅샷 + 비교 비용 */
+function bigDocCost() {
+  const files = readdirSync(SAMPLES).filter((f) => f.endsWith('.hwp')).map((f) => ({ f, size: statSync(join(SAMPLES, f)).size })).sort((x, y) => y.size - x.size);
+  for (const { f, size } of files.slice(0, 3)) {
+    let d;
+    try { d = open(NEW, readFileSync(join(SAMPLES, f))); } catch { continue; }
+    try {
+      const paras = d.getParagraphCount(0);
+      const p = Array.from({ length: paras }, (_, i) => i).find((i) => d.getParagraphLength(0, i) > 2) ?? 0;
+      const times = [];
+      const snaps = [];
+      const compares = [];
+      let last = null;
+      for (let k = 0; k < 5; k += 1) {
+        const t0 = performance.now();
+        const pre = d.collabSnapshotSave();
+        const t1 = performance.now();
+        d.insertRuby(0, p, 0, JSON.stringify({ mainText: '漢', rubyText: '한', below: false, styleId: null }));
+        const t2 = performance.now();
+        last = JSON.parse(d.collabStateRangeHint(pre));
+        const t3 = performance.now();
+        if (typeof last.recipe === 'number') d.collabUndoRecipeDiscard(last.recipe);
+        d.collabSnapshotRestore(pre);
+        d.collabSnapshotDiscard(pre);
+        times.push((t1 - t0) + (t3 - t2));
+        snaps.push(t1 - t0);
+        compares.push(t3 - t2);
+      }
+      // 견줄 기준: state 기록이 원래 하는 내보내기 → 다시 읽기(범위 표시와 상관없이 state 호출마다 든다)
+      const reloads = [];
+      for (let k = 0; k < 3; k += 1) {
+        const a = performance.now();
+        d.collabLoadState(d.collabExportState());
+        reloads.push(performance.now() - a);
+      }
+      return { file: f, bytes: size, sections: d.getSectionCount(), paras0: paras, median: median(times), max: Math.max(...times), snapshotMedian: median(snaps), compareMedian: median(compares), exportReloadMedian: median(reloads), hint: last.range ? 'range' : last.reason };
+    } catch (e) {
+      return { file: f, bytes: size, error: String(e?.message ?? e).slice(0, 80) };
+    } finally {
+      d.free();
+    }
+  }
+  return null;
+}
+// 사례 생성기가 인자를 만들지 못하는 state 기능의 손으로 쓴 사례 — 이 측정 전용(R1b 감사·분류표에는 쓰지 않는다).
+// 기능마다 [문서 고르기, (d) => 준비를 하고 잴 호출(thunk)]. 준비는 스냅샷 전에 끝난다.
+const RUBY = (t = '漢') => JSON.stringify({ mainText: t, rubyText: '한', below: false, styleId: null });
+const OVERLAP = (t = '가') => JSON.stringify({ text: t, shape: 0, innerSize: 0, overlap: false });
+const textPara = (d) => { for (let p = 0; p < d.getParagraphCount(0); p += 1) if (d.getParagraphLength(0, p) >= 2) return p; throw new Error('글자 있는 문단 없음'); };
+const lastPara = (d) => d.getParagraphCount(0) - 1;
+const table = (d) => {
+  const p = lastPara(d);
+  const t = JSON.parse(d.createTable(0, p, d.getParagraphLength(0, p), 2, 2));
+  d.insertTextInCell(0, t.paraIdx, t.controlIdx, 0, 0, 0, '12');
+  return { p: t.paraIdx, ci: t.controlIdx, path: JSON.stringify([{ controlIndex: t.controlIdx, cellIndex: 0, cellParaIndex: 0 }]) };
+};
+const footnote = (d) => {
+  const f = JSON.parse(d.insertFootnote(0, textPara(d), 1));
+  d.insertTextInFootnote(0, f.paraIdx, f.controlIdx, 0, 0, '각주');
+  return f;
+};
+const EVERY = () => true;
+const MULTI_SECTION = (() => {
+  // 구역이 둘 이상인 작은 샘플(구역 합치기용)
+  const files = readdirSync(SAMPLES).filter((f) => /\.hwp$/.test(f) && statSync(join(SAMPLES, f)).size < 600_000);
+  for (const f of files) {
+    try { const d = open(NEW, readFileSync(join(SAMPLES, f))); const n = d.getSectionCount(); d.free(); if (n >= 2) return { name: f, bytes: readFileSync(join(SAMPLES, f)) }; } catch { /* 못 엶 */ }
+  }
+  return null;
+})();
+const MANUAL = {
+  insertRuby: (d) => { const p = textPara(d); return () => d.insertRuby(0, p, 1, RUBY()); },
+  insertCharOverlap: (d) => { const p = textPara(d); return () => d.insertCharOverlap(0, p, 1, OVERLAP()); },
+  setComposeControl: (d) => { const p = textPara(d); const r = JSON.parse(d.insertRuby(0, p, 1, RUBY())); return () => d.setComposeControl(0, p, r.controlIdx, RUBY('字')); },
+  deleteComposeControl: (d) => { const p = textPara(d); const r = JSON.parse(d.insertRuby(0, p, 1, RUBY())); return () => d.deleteComposeControl(0, p, r.controlIdx, true); },
+  insertRubyByPath: (d) => { const t = table(d); return () => d.insertRubyByPath(0, t.p, t.path, 0, RUBY()); },
+  insertCharOverlapByPath: (d) => { const t = table(d); return () => d.insertCharOverlapByPath(0, t.p, t.path, 0, OVERLAP()); },
+  setComposeControlByPath: (d) => { const t = table(d); const r = JSON.parse(d.insertRubyByPath(0, t.p, t.path, 0, RUBY())); return () => d.setComposeControlByPath(0, t.p, t.path, r.controlIdx, RUBY('字')); },
+  deleteComposeControlByPath: (d) => { const t = table(d); const r = JSON.parse(d.insertRubyByPath(0, t.p, t.path, 0, RUBY())); return () => d.deleteComposeControlByPath(0, t.p, t.path, r.controlIdx, false); },
+  insertRubyInFootnote: (d) => { const f = footnote(d); return () => d.insertRubyInFootnote(0, f.paraIdx, f.controlIdx, 0, 0, RUBY()); },
+  insertCharOverlapInFootnote: (d) => { const f = footnote(d); return () => d.insertCharOverlapInFootnote(0, f.paraIdx, f.controlIdx, 0, 0, OVERLAP()); },
+  setComposeControlInFootnote: (d) => { const f = footnote(d); const r = JSON.parse(d.insertRubyInFootnote(0, f.paraIdx, f.controlIdx, 0, 0, RUBY())); return () => d.setComposeControlInFootnote(0, f.paraIdx, f.controlIdx, 0, r.controlIdx, RUBY('字')); },
+  deleteComposeControlInFootnote: (d) => { const f = footnote(d); const r = JSON.parse(d.insertRubyInFootnote(0, f.paraIdx, f.controlIdx, 0, 0, RUBY())); return () => d.deleteComposeControlInFootnote(0, f.paraIdx, f.controlIdx, 0, r.controlIdx, true); },
+  restoreSnapshot: (d) => { const p = textPara(d); const id = d.saveSnapshot(); d.insertText(0, p, 0, '가나'); return () => d.restoreSnapshot(id); },
+  restoreDeleteFragment: (d) => {
+    const p = textPara(d);
+    if (p + 1 > lastPara(d)) throw new Error('문단 부족');
+    const id = d.captureDeleteRange(0, p, p + 1);
+    d.deleteRange(0, p, 1, p + 1, 0);
+    return () => d.restoreDeleteFragment(id);
+  },
+  restoreSectionRaw: (d) => { const p = textPara(d); const id = d.captureSectionRaw(0); d.insertText(0, p, 0, '가'); return () => d.restoreSectionRaw(id); },
+  setTableCellFormula: (d) => { const t = table(d); return () => d.setTableCellFormula(0, t.p, t.ci, 3, '=1+2', '%g'); },
+  removeTableCellFormulas: (d) => { const t = table(d); d.setTableCellFormula(0, t.p, t.ci, 3, '=1+2', '%g'); return () => d.removeTableCellFormulas(0, t.p, t.ci, 3); },
+  recalculateTableFormulas: (d) => {
+    const t = table(d);
+    d.setTableCellFormula(0, t.p, t.ci, 3, '=A1+1', '%g');
+    d.insertTextInCell(0, t.p, t.ci, 0, 0, 0, '9');
+    return () => d.recalculateTableFormulas(0, t.p, t.ci, 0, true);
+  },
+  createMasterPage: () => (d) => d.createMasterPage(0, JSON.stringify({ applyTo: 0 })),
+  deleteMasterPage: (d) => { d.createMasterPage(0, JSON.stringify({ applyTo: 0 })); return () => d.deleteMasterPage(0, 16); },
+  createBullet: () => (d) => d.createBullet(JSON.stringify({ char: '❏' }), undefined, undefined),
+  ensureDefaultNumbering: () => (d) => d.ensureDefaultNumbering(),
+  mergeSection: { docs: () => (MULTI_SECTION ? [MULTI_SECTION] : []), setup: () => (d) => d.mergeSection(1) },
+};
+/** 손 사례 하나: 준비 → 자체 스냅샷 → 호출 → 범위 표시. `setup` 이 thunk 를 주거나, (d)=>thunk 함수를 주면 그 함수에 d 를 넘긴다. */
+function manualHint(name, doc, setup) {
+  const d = open(NEW, doc.bytes);
+  try {
+    let thunk;
+    try {
+      const got = setup(d);
+      thunk = got.length === 1 ? () => got(d) : got;
+    } catch (e) { return { reason: 'prep', error: String(e?.message ?? e).slice(0, 60) }; }
+    const t0 = performance.now();
+    const pre = d.collabSnapshotSave();
+    const t1 = performance.now();
+    const before = d.collabDigest();
+    try { thunk(); } catch (e) { d.collabSnapshotDiscard(pre); return { reason: 'call', error: String(e?.message ?? e).slice(0, 60) }; }
+    if (d.collabDigest() === before) { d.collabSnapshotDiscard(pre); return { reason: 'call', error: '문서를 바꾸지 않음' }; }
+    const t2 = performance.now();
+    let v;
+    try { v = JSON.parse(d.collabStateRangeHint(pre)); } catch { v = { reason: 'error' }; }
+    const t3 = performance.now();
+    d.collabSnapshotDiscard(pre);
+    if (typeof v.recipe === 'number') d.collabUndoRecipeDiscard(v.recipe);
+    return { range: v.range ?? null, reason: v.reason ?? null, ms: (t1 - t0) + (t3 - t2) };
+  } finally {
+    d.free();
+  }
+}
+if (STATE_RANGE) {
+  const t0 = Date.now();
+  const features = Object.entries(CATALOG).filter(([n, e]) => e.sync === 'state' && (!ONLY || ONLY.includes(n)));
+  const rows = [];
+  for (const [name, entry] of features) {
+    const { cases, successes, topError: generatorError } = await collect(name, entry);
+    let topError = generatorError;
+    const results = cases.map((c) => hintOf(name, c));
+    // 생성기 사례가 없으면 손 사례(문서마다 하나)
+    const manual = MANUAL[name];
+    let source = cases.length ? '생성기' : '-';
+    if (!cases.length && manual) {
+      const m = typeof manual === 'function' ? { docs: () => docs, setup: manual } : manual;
+      const tried = m.docs().map((doc) => manualHint(name, doc, m.setup));
+      const ok = tried.filter((x) => x.reason !== 'prep' && x.reason !== 'call');
+      results.push(...ok);
+      cases.push(...ok);
+      source = '손';
+      if (!ok.length) topError = tried.find((x) => x.error)?.error ?? topError;
+      if (flag('verbose')) console.log(name, JSON.stringify(tried.map((x) => x.error ?? x.reason ?? 'range')));
+    }
+    const timed = results.filter((x) => typeof x.ms === 'number');
+    const reasons = {};
+    for (const x of results) if (!x.range) reasons[x.reason] = (reasons[x.reason] ?? 0) + 1;
+    rows.push({ name, source, reach: entry.reach, cases: cases.length, successes, hinted: results.filter((x) => x.range).length, reasons, median: median(timed.map((x) => x.ms)), max: timed.length ? Math.max(...timed.map((x) => x.ms)) : null, topError: cases.length ? undefined : topError });
+    if (process.stdout.isTTY || flag('verbose')) console.log(`${name} 사례 ${cases.length} 표시 ${rows.at(-1).hinted} ${JSON.stringify(reasons)}`);
+  }
+  const big = bigDocCost();
+  const withCases = rows.filter((r) => r.cases > 0);
+  const summary = {
+    functions: rows.length, withCases: withCases.length, noCases: rows.length - withCases.length,
+    allHinted: withCases.filter((r) => r.hinted === r.cases).length, someHinted: withCases.filter((r) => r.hinted > 0 && r.hinted < r.cases).length, noneHinted: withCases.filter((r) => r.hinted === 0).length,
+    cases: withCases.reduce((n, r) => n + r.cases, 0), hinted: withCases.reduce((n, r) => n + r.hinted, 0),
+    reasons: withCases.reduce((o, r) => { for (const [k, v] of Object.entries(r.reasons)) o[k] = (o[k] ?? 0) + v; return o; }, {}),
+    bigDoc: big, seconds: Math.round((Date.now() - t0) / 1000),
+  };
+  console.log('| 기능 | 닿는 곳 | 사례 | 표시 | 못 단 사유 | 스냅샷+비교 ms (중앙값/최대) |');
+  console.log('|---|---|---|---|---|---|');
+  for (const r of rows) {
+    const why = Object.entries(r.reasons).map(([k, v]) => `${k} ${v}`).join(', ') || '-';
+    const n = r.cases ? `${r.cases}${r.source === '손' ? ' (손)' : ''}` : `0 (${(r.topError ?? '성공 호출이 문서를 바꾸지 않음').slice(0, 40)})`;
+    console.log(`| \`${r.name}\` | ${r.reach ?? '-'} | ${n} | ${r.hinted} | ${why} | ${ms(r.median)} / ${ms(r.max)} |`);
+  }
+  console.log(JSON.stringify(summary, null, 1));
+  if (REPORT) writeFileSync(REPORT, JSON.stringify({ rows, summary }, null, 1));
+  process.exit(0);
 }
 
 // ── 실행 ───────────────────────────────────────────────────────────────

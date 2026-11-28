@@ -757,7 +757,7 @@ test('U3 ⑪ 거짓 범위 표시를 단 원시 클라이언트의 state 는 정
   converged(r);
 });
 
-test('U3 ⑫ 되돌리기·다시 하기를 연달아(한 묶음이 왕복 중): 복원 state 들을 합치지 않아 범위 표시가 남고 B 의 입력이 산다', () => {
+test('U3 ⑫ 되돌리기·다시 하기를 연달아(한 묶음이 왕복 중): 복원 state 들은 두 범위를 덮는 하나로 합쳐 범위 표시가 남고 B 의 입력이 산다', () => {
   const r = rangeRoom();
   r.a.history.execute(makeTable(1));
   r.server.drain(r.all);
@@ -769,9 +769,11 @@ test('U3 ⑫ 되돌리기·다시 하기를 연달아(한 묶음이 왕복 중):
   assert.equal(r.a.history.undo(), 'ok'); // 표 되돌리기(범위)
   assert.equal(r.a.history.redo(), 'ok'); // 표 다시 하기(범위)
   assert.equal(r.a.history.undo(), 'ok'); // 다시 되돌리기(범위)
+  // 7단계 A: 보내지 않은 연속 범위 state 는 합친다(전에는 표시를 잃지 않으려고 따로 두었다)
   const states = r.a.engine.unconfirmed.filter((e) => e.kind === 'state');
-  assert.equal(states.length, 3, '복원 state 셋이 따로 남는다');
-  assert.ok(states.every((e) => e.range && typeof e.recipe === 'number'), '모두 범위 표시와 재료');
+  assert.equal(states.length, 1, '복원 state 셋이 한 범위 state 로');
+  assert.ok(states.every((e) => e.range && typeof e.recipe === 'number'), '범위 표시와 재료');
+  assert.equal(r.a.engine.recipeCount(), 1, '재료도 하나');
   r.b.history.execute(insertText(n - 1, 0, 'B'));
   r.b.flush();
   r.server.drain(r.all);
@@ -781,7 +783,7 @@ test('U3 ⑫ 되돌리기·다시 하기를 연달아(한 묶음이 왕복 중):
   assert.deepEqual(paragraphs(r.a.doc), ['p0', 'p1', 'p2', 'p3', 'Bp4']);
   assert.equal(r.a.engine.recipeCount(), 0);
   const sent = r.server.log.flatMap((m) => m.entries).filter((e) => e.kind === 'state');
-  assert.ok(sent.length >= 3 && sent.every((e) => e.range && !('recipe' in e)), '서버에 간 복원 state 에는 범위 표시만(재료 번호 없음)');
+  assert.ok(sent.length >= 1 && sent.every((e) => e.range && !('recipe' in e)), '서버에 간 복원 state 에는 범위 표시만(재료 번호 없음)');
 });
 
 

@@ -593,3 +593,121 @@ fn fragment_restore_state_passes_the_server_range_check() {
     assert_eq!(canonical_apply_hinted(&mut canon, &client.export_state().unwrap(), &hint), json!({ "ok": true }));
     assert_eq!(texts(&canon), vec!["p0", "p1", "p2", "p3", "p4"]);
 }
+
+// ── 7단계 A: 결과 전송에 자동 범위 표시 ─────────────────────────────────────
+
+/// 자체 스냅샷을 뜨고 `edit` 를 한 뒤 범위 표시를 구한다(엔진이 state 호출 앞뒤로 하는 일). 재료는 푼다.
+fn hint_after(c: &mut CollabCore, edit: impl FnOnce(&mut CollabCore)) -> Value {
+    let pre = c.snapshot_save();
+    edit(c);
+    let v = c.state_range_hint(pre).unwrap();
+    c.snapshot_discard(pre);
+    if let Some(id) = v["recipe"].as_u64() {
+        recipe_discard(id as u32);
+    }
+    v
+}
+
+#[test]
+fn state_range_hint_finds_one_paragraph_range() {
+    let mut c = doc_with(5);
+    let v = hint_after(&mut c, |c| { c.insert_text_native(0, 2, 1, "덧").unwrap(); });
+    assert_eq!(v["range"], json!({ "section": 0, "lo": 2, "before": 1, "after": 1 }), "{v}");
+    let v = hint_after(&mut c, |c| { c.split_paragraph_native(0, 3, 1, None).unwrap(); });
+    assert_eq!(v["range"], json!({ "section": 0, "lo": 3, "before": 1, "after": 2 }), "{v}");
+    let v = hint_after(&mut c, |c| { c.merge_paragraph_native(0, 1).unwrap(); });
+    assert_eq!(v["range"], json!({ "section": 0, "lo": 0, "before": 2, "after": 1 }), "{v}");
+    // 떨어진 두 문단을 고치면 그 사이까지 범위
+    let v = hint_after(&mut c, |c| {
+        c.insert_text_native(0, 0, 0, "a").unwrap();
+        c.insert_text_native(0, 3, 0, "b").unwrap();
+    });
+    assert_eq!(v["range"], json!({ "section": 0, "lo": 0, "before": 4, "after": 4 }), "{v}");
+}
+
+#[test]
+fn state_range_hint_refuses_docinfo_props_sections_and_no_change() {
+    let mut c = doc_with(3);
+    assert_eq!(hint_after(&mut c, |_| {})["reason"], json!("nochange"));
+    // 새 글자 모양을 덧붙이는 서식 → DocInfo 가 바뀜(덧붙이기여도 다시 만들 때 번호가 겹칠 수 있다)
+    assert_eq!(hint_after(&mut c, |c| { c.apply_char_format_native(0, 1, 0, 2, r#"{"bold":true}"#).unwrap(); })["reason"], json!("docinfo"));
+    // 구역 정의의 해석 밖 꼬리가 바뀜
+    assert_eq!(hint_after(&mut c, |c| { c.document.sections[0].section_def.raw_ctrl_extra.push(7); })["reason"], json!("section-def"));
+    // 두 구역이 바뀜
+    let mut two = doc_with(2);
+    let extra = two.document.sections[0].clone();
+    two.document.sections.push(extra);
+    let v = hint_after(&mut two, |c| {
+        c.insert_text_native(0, 0, 0, "x").unwrap();
+        c.document.sections[1].paragraphs[0].text.push('y');
+    });
+    assert_eq!(v["reason"], json!("sections"), "{v}");
+    // 스냅샷이 없으면 오류(엔진은 보통 state 로 보낸다)
+    assert!(c.state_range_hint(9999).is_err());
+}
+
+#[test]
+fn state_range_hint_recipe_rebuilds_after_a_remote_enter_and_passes_the_server_check() {
+    // 보낸 쪽: state 기능 대신 문단 안 고침을 범위로 — 재료(after 문단)로 옮긴 자리에서 다시 만들고, 정본 확인을 지난다
+    let base = doc_with(5).export_state().unwrap();
+    let open = || {
+        let mut c = CollabCore::new(blank());
+        c.load_state(&base).unwrap();
+        c
+    };
+    let (mut canon, mut client) = (open(), open());
+    let confirmed = client.snapshot_save();
+    let pre = client.snapshot_save();
+    client.insert_text_native(0, 3, 0, "덧말").unwrap();
+    client.split_paragraph_native(0, 3, 2, None).unwrap();
+    let v = client.state_range_hint(pre).unwrap();
+    client.snapshot_discard(pre);
+    let range = v["range"].clone();
+    // 가장 작은 차이: 나눈 뒤의 "p3" 가 원래 "p3" 와 같아 [2] → [2, "덧말"] 로 잡힌다
+    assert_eq!(range, json!({ "section": 0, "lo": 2, "before": 1, "after": 2 }));
+    let recipe = v["recipe"].as_u64().unwrap() as u32;
+    // 정본: 범위 표시 확인
+    assert_eq!(canonical_apply_hinted(&mut canon, &client.export_state().unwrap(), &range), json!({ "ok": true }));
+    // 보낸 쪽 보정: 확정 상태로 되감고 남의 앞 문단 Enter 를 먼저 → 옮긴 lo 에서 재료로 다시 만듦
+    client.snapshot_restore(confirmed).unwrap();
+    client.snapshot_discard(confirmed);
+    client.split_paragraph_native(0, 0, 1, None).unwrap();
+    client.undo_reapply_range(recipe, &json!({ "section": 0, "lo": 3, "n": 1 })).unwrap();
+    recipe_discard(recipe);
+    assert_eq!(texts(&client), vec!["p", "0", "p1", "p2", "덧말", "p3", "p4"]);
+}
+
+#[test]
+fn state_recipe_from_the_current_document_rebuilds_that_range() {
+    let mut c = doc_with(4);
+    assert!(c.state_recipe(0, 3, 2).is_err() && c.state_recipe(0, 1, 0).is_err() && c.state_recipe(1, 0, 1).is_err());
+    c.insert_text_native(0, 1, 0, "가").unwrap();
+    c.insert_text_native(0, 2, 0, "나").unwrap();
+    let recipe = c.state_recipe(0, 1, 2).unwrap();
+    let mut other = doc_with(4);
+    other.undo_reapply_range(recipe, &json!({ "section": 0, "lo": 1, "n": 2 })).unwrap();
+    recipe_discard(recipe);
+    assert_eq!(texts(&other), texts(&c));
+}
+
+#[test]
+fn state_range_hint_refuses_changed_or_added_bin_data() {
+    use crate::model::bin_data::{BinDataBytes, BinDataContent};
+    let mut c = doc_with(3);
+    c.document.bin_data_content.push(BinDataContent { id: 1, data: BinDataBytes::Loaded(vec![1, 2, 3]), extension: "png".into() });
+    // 문단 고침과 함께 그림 바이트가 바뀜 → 범위 밖 변경
+    let v = hint_after(&mut c, |c| {
+        c.insert_text_native(0, 1, 0, "x").unwrap();
+        c.document.bin_data_content[0].data = BinDataBytes::Loaded(vec![9, 2, 3]);
+    });
+    assert_eq!(v["reason"], json!("docinfo"), "{v}");
+    // 그림 항목이 덧붙음
+    let v = hint_after(&mut c, |c| {
+        c.insert_text_native(0, 1, 0, "y").unwrap();
+        c.document.bin_data_content.push(BinDataContent { id: 2, data: BinDataBytes::Loaded(vec![4]), extension: "png".into() });
+    });
+    assert_eq!(v["reason"], json!("docinfo"), "{v}");
+    // 그림이 그대로면 표시
+    let v = hint_after(&mut c, |c| { c.insert_text_native(0, 1, 0, "z").unwrap(); });
+    assert_eq!(v["range"], json!({ "section": 0, "lo": 1, "before": 1, "after": 1 }), "{v}");
+}

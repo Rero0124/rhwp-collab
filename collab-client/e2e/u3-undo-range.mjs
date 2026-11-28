@@ -293,6 +293,81 @@ try {
   const final = await Promise.all(pages.map(status));
   record('끝까지 어긋남·재동기화 없음', final.every((st) => !st.desynced && !st.left && st.resyncCount === 0), final.map((st) => `${st.name}: resync ${st.resyncCount}, replaced ${st.replacedAcks}`).join(', '));
 
+  // ── U3-b: 삭제 조각으로 되돌리는 명령(본문 선택 삭제·덮어쓰기 입력·링크를 걸친 삭제)도 범위 복원 ──
+  // 앞 단계의 표 문단과 섞이지 않게 다섯 문단짜리 새 방에서 한다
+  const A3 = await openTab(browser, `u3b-${Date.now()}`, 'A3');
+  const B3 = await openTab(browser, (await status(A3)).room, 'B3');
+  const tabs = [A3, B3];
+  lastSeq = -1;
+  await caretAt(B3, 0, 0);
+  await B3.keyboard.type('line zero', { delay: 10 });
+  for (const t of ['line one', 'line two', 'line three', 'line four']) { await B3.keyboard.press('Enter'); await B3.keyboard.type(t, { delay: 10 }); }
+  await same(tabs);
+
+  // ⑨ 선택 삭제(Delete 키 — FragmentDeleteCommand: 문단 1 가운데 ~ 문단 3 가운데) 뒤 B 가 범위 앞에서 Enter, 범위 뒤에 입력
+  // → 허용(U1 이면 막히던 경우), 원래 내용·B 의 편집 유지
+  const before9 = await paragraphs(A3);
+  await selectRange(A3, [1, 2], [3, 3]);
+  await A3.keyboard.press('Delete');
+  await same(tabs);
+  const deleted9 = await paragraphs(B3);
+  await caretAt(B3, 0, 4);
+  await B3.keyboard.press('Enter');
+  await typeAtEnd(B3, await lastPara(B3), ' B9');
+  await same(tabs);
+  await undo(A3);
+  s = await same(tabs);
+  const after9 = await paragraphs(B3);
+  const expect9 = ['line', ' zero', ...before9.slice(1, -1), `${before9.at(-1)} B9`];
+  record('⑨ 선택 삭제 되돌리기(남의 앞 Enter·뒤 입력 뒤, U1 이면 막히던 경우)', s.ok && deleted9.length === 3 && JSON.stringify(after9) === JSON.stringify(expect9),
+    `${JSON.stringify(deleted9)} → ${JSON.stringify(after9)}`);
+
+  // ⑩ 수정(덮어쓰기) 모드 입력(Insert 키 — InsertTextCommand 의 조각, 연속 입력은 한 단계로 병합) 뒤 B 가 다른 문단에 입력
+  // → 되돌리면 덮어쓰기 전 글자
+  const p10 = 3;
+  const before10 = (await paragraphs(A3))[p10];
+  await caretAt(A3, p10, 0);
+  await A3.keyboard.press('Insert');
+  await A3.keyboard.type('ZZ', { delay: 30 });
+  await A3.keyboard.press('Insert');
+  await same(tabs);
+  const typed10 = (await paragraphs(B3))[p10];
+  await typeAtEnd(B3, 0, ' B10');
+  await same(tabs);
+  await undo(A3);
+  s = await same(tabs);
+  const after10 = await paragraphs(B3);
+  record('⑩ 덮어쓰기 입력 되돌리기(남의 다른 문단 입력 뒤)', s.ok && typed10.startsWith('ZZ') && typed10.length === before10.length && after10[p10] === before10 && after10[0].endsWith(' B10'),
+    `${JSON.stringify(before10)} → ${JSON.stringify(typed10)} → ${JSON.stringify(after10[p10])}`);
+
+  // ⑪ 메모 앵커를 걸친 삭제(DeleteTextCommand 의 조각 — 링크 안 삭제는 studio 가 확인 뒤 스냅샷 명령으로 지운다): B 가 메모를
+  // 단 문단에서 A 가 메모 범위의 글자 하나를 지움 → B 가 앞 문단에서 Enter → A 되돌리기로 글자와 메모 범위가 돌아옴
+  const p11 = 4;
+  const memos = (page, p) => page.evaluate((q) => window.__wasm.getMemoAnchors().filter((m) => m.paraIndex === q).map((m) => [m.startCharIdx, m.endCharIdx]), p);
+  await B3.evaluate((q) => window.__wasm.borrowDocumentHandle().insertMemo(0, q, 0, 4, JSON.stringify({ author: 'B3', text: '확인' })), p11);
+  await same(tabs);
+  const memo11 = await memos(A3, p11);
+  const text11 = (await paragraphs(A3))[p11];
+  await caretAt(A3, p11, 2);
+  await A3.keyboard.press('Delete');
+  await same(tabs);
+  const cut11 = (await paragraphs(B3))[p11];
+  const top11 = (await stack(A3)).undo.at(-1);
+  await caretAt(B3, 0, 1);
+  await B3.keyboard.press('Enter');
+  await same(tabs);
+  await undo(A3);
+  s = await same(tabs);
+  const memo11b = await memos(B3, p11 + 1);
+  const back11 = (await paragraphs(B3))[p11 + 1];
+  record('⑪ 메모 앵커를 걸친 삭제 되돌리기(남의 앞 Enter 뒤): 글자·메모 범위가 돌아옴', s.ok && memo11.length === 1 && top11?.type === 'deleteText' && top11?.store === 'fragment'
+    && cut11.length === text11.length - 1 && back11 === text11 && JSON.stringify(memo11b) === JSON.stringify(memo11),
+    `글자 ${JSON.stringify(text11)} → ${JSON.stringify(cut11)} → ${JSON.stringify(back11)}, 메모 ${JSON.stringify(memo11)} → ${JSON.stringify(memo11b)}, 명령 ${top11?.type}/${top11?.store}`);
+  const recipes = await A3.evaluate(() => window.__wasm.borrowDocumentHandle().collabUndoRecipeCount());
+  const final3 = await Promise.all(tabs.map(status));
+  record('U3-b 끝: 복원 재료 0·취소 0·재동기화 0', recipes === 0 && final3.every((st) => st.droppedTotal === 0 && st.resyncCount === 0 && !st.desynced),
+    `재료 ${recipes}, ${final3.map((st) => `${st.name}: 취소 ${st.droppedTotal} resync ${st.resyncCount}`).join(', ')}`);
+
   // ⑧ 파일에서 온 표(표 머리·표 레코드 꼬리·셀 목록 꼬리 같은 날 바이트가 있는 표)를 지웠다가 되돌림 → 서버의 결과 다시
   // 쓰기(정본이 본 날 바이트만 남김)를 지나도 잃는 것이 없다: 되돌린 문서 = 지우기 전 문서(맞춘 digest)
   const sample = readFileSync(path.resolve(studioDir, '../samples/hwp_table_test-m.hwp'));

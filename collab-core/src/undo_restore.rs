@@ -10,6 +10,9 @@
 //!   범위를 가져와 지금 문서의 범위와 바꾼다. 전제: 스냅샷의 DocInfo 목록이 지금 문서의 앞부분과 같다(덧붙이기만).
 //!   복원할 때 원본 문단·DocInfo 를 따로 떠 둔다(복원 재료) — 보낸 쪽의 미확정 복원 state 가 보정될 때 새 문서 위에서
 //!   다시 만든다([`CollabCore::undo_reapply_range`]). 확정·버림·리셋 때 엔진이 푼다([`recipe_discard`]).
+//! - [`CollabCore::undo_fragment_check`]·[`CollabCore::undo_restore_fragment`](U3-b): 삭제 조각(본문 선택 삭제·덮어쓰기
+//!   입력·링크·메모 앵커를 걸친 삭제)의 되돌리기도 같은 범위 복원으로 한다. 조각은 DocInfo 를 들고 있지 않으므로 실행 직후
+//!   뜬 DocInfo 표시([`DocInfoMark`])로 전제를 본다.
 //! - [`CollabCore::check_range_hint`]: 서버 정본 — 범위 표시가 붙은 state 를 읽은 뒤, 범위 밖이 적용 전과 같은지 확인한다.
 //!
 //! 이 모듈은 `ot` 의 자식이다(분류·발자국을 다시 쓴다). 문서를 바꾸는 부분(`CollabCore` impl)도 여기 둔다 — `lib.rs`·
@@ -122,6 +125,16 @@ impl RangeItem {
     fn meets(&self, a: usize, b: usize) -> bool {
         a < self.hi && self.lo <= b
     }
+    /// 범위에 닿은 기록(적용 전 [a, b] 를 고치고 문단 수가 pd 바뀜)을 범위에 합친다 — 닿음으로 표시하고, 범위도 그 기록을
+    /// 품도록 넓혀 문단 수를 맞춘다(`range_of` 와 같은 합집합). 남의 기록이면 어차피 막히지만, 내 기록(호스트가 닿음을 무시)
+    /// 이면 범위가 지금 문서와 계속 맞아야 한다(범위 안의 내 선택 삭제 뒤 아래 표 명령의 범위 등).
+    fn absorb(&mut self, why: &'static str, a: usize, b: usize, pd: i64) {
+        self.mark(why);
+        let (lo, hi) = (self.lo.min(a), self.hi.max(b + 1));
+        let hi = (hi as i64 + pd).max(lo as i64 + 1) as usize;
+        self.lo = lo;
+        self.hi = hi;
+    }
 }
 
 /// DocInfo 정의(스타일·번호의 글자 모양)만 고치는 문서 단위 서식 — 분류표 why 가 "정의만 바꾼다"인 neutral.
@@ -137,13 +150,14 @@ fn map_range(it: &mut RangeItem, r: &Rec) {
     if let Some(t) = &r.text {
         match t.space() {
             Space::Body { sec } if *sec == it.sec => {
-                let hit = match t {
-                    TOp::Ins { at, .. } | TOp::Replace { at, .. } | TOp::Split { at, .. } => it.has(at.para),
-                    TOp::Del { from, to, .. } => it.meets(from.para, to.para),
-                    TOp::Merge { para, .. } => it.meets(para.saturating_sub(1), *para),
+                let (a, b, pd) = match t {
+                    TOp::Ins { at, .. } | TOp::Replace { at, .. } => (at.para, at.para, 0),
+                    TOp::Split { at, .. } => (at.para, at.para, 1),
+                    TOp::Del { from, to, .. } => (from.para, to.para, -((to.para - from.para) as i64)),
+                    TOp::Merge { para, .. } => (para.saturating_sub(1), *para, -1),
                 };
-                if hit {
-                    it.mark("touched");
+                if it.meets(a, b) {
+                    it.absorb("touched", a, b, pd);
                     return;
                 }
                 match (super::map_para(it.lo, t), super::map_para(it.hi - 1, t)) {
@@ -176,7 +190,7 @@ fn map_range(it: &mut RangeItem, r: &Rec) {
             Some(f) => {
                 let overlap = if f.paragraph_level() { it.meets(f.anchor, f.end()) } else { it.has(f.anchor) };
                 if overlap {
-                    it.mark("structural");
+                    it.absorb("structural", f.anchor, f.end(), f.pd);
                     return;
                 }
                 match (f.shift(it.lo), f.shift(it.hi - 1)) {
@@ -223,10 +237,8 @@ pub fn map_ranges(recs: &[Value], catalog: &Value, ranges: &[Value]) -> Value {
                     return Value::Null;
                 }
                 let mut it = RangeItem { sec, lo, hi, hit: None };
+                // 닿은 뒤에도 끝까지 옮긴다 — 내 기록으로 옮길 때는 범위가 지금 문서와 맞아야 한다
                 for r in &rs {
-                    if it.hit.is_some() {
-                        break;
-                    }
                     map_range(&mut it, r);
                 }
                 json!({ "section": it.sec, "lo": it.lo, "hi": it.hi, "hit": it.hit })
@@ -244,65 +256,113 @@ fn digest_wo_raw<T: Clone + Serialize>(x: &T, clear: fn(&mut T)) -> [u8; 32] {
     record_digest(&c)
 }
 
-/// 목록 `b` 의 앞부분이 `a` 와 같은가(덧붙이기만 허용) — 항목을 `key` 로 견준다. 다르면 처음 다른 항목 번호(줄었으면 `a` 길이).
-fn prefix_by<T, K: PartialEq>(a: &[T], b: &[T], key: impl Fn(&T) -> K) -> Option<usize> {
-    if b.len() < a.len() {
-        return Some(b.len());
-    }
-    a.iter().zip(b).position(|(x, y)| key(x) != key(y))
-}
-
-/// 되살릴 문단이 참조할 수 있는 DocInfo 목록이 지금 문서에 같은 번호·같은 내용으로 있는가(덧붙이기만 허용). 참조한
-/// 항목만 보지 않는다 — 목록끼리 서로 참조해(문단 모양 → 번호·탭·테두리, 스타일 → 모양) 닫힘을 구해야 하므로, 보수적으로
-/// 목록 전체의 앞부분을 본다.
+/// DocInfo 표시 — 목록마다 (항목 수, 앞부분 항목 저장 바이트의 해시). 되살릴 문단이 참조할 수 있는 DocInfo 목록이 나중에도
+/// 같은 번호·같은 내용으로 있는지(덧붙이기만 허용) 보는 기준이다. 참조한 항목만 보지 않는다 — 목록끼리 서로 참조해(문단
+/// 모양 → 번호·탭·테두리, 스타일 → 모양) 닫힘을 구해야 하므로, 보수적으로 목록 전체의 앞부분을 본다. 수백 바이트라 플러그인이
+/// 명령마다 들고 있을 수 있다(U3-b: 조각은 DocInfo 를 들고 있지 않다 — 실행 직후 떠 둔다).
 ///
 /// 같은 내용은 **저장할 때 쓰일 레코드 바이트**로 본다(업스트림 항목 직렬화기 — 원본 바이트가 아니라 모델에서 쓴다). 세션
 /// 안에서 만든 항목은 모델의 속성 비트(`attr` 등)가 저장 때 필드에서 다시 계산되므로, 결과(state)를 다시 읽은 문서와 모델
 /// 값으로 견주면 같은 항목도 다르게 나온다. 직렬화기가 공개되지 않은 번호·글머리표는 원본 바이트를 뺀 모델 값으로 본다(다시
 /// 읽은 뒤 거짓으로 막을 수 있다 — 안전 쪽). BinData 는 레코드(목록)와 내용 항목의 번호·확장자(내용 바이트는 보지 않는다 —
 /// 같은 번호의 바이트를 제자리에서 바꾸는 차트 편집은 그 그림을 쓰는 문단에 그대로 보이는 것이 맞다).
-fn docinfo_prefix(src: &DocInfo, src_bins: &[(u16, String)], now: &Document) -> Result<(), String> {
-    use crate::serializer::doc_info as ser;
-    let b = &now.doc_info;
-    let lists = [
-        ("bin_data_list", prefix_by(&src.bin_data_list, &b.bin_data_list, ser::serialize_bin_data)),
-        ("border_fills", prefix_by(&src.border_fills, &b.border_fills, ser::serialize_border_fill)),
-        ("char_shapes", prefix_by(&src.char_shapes, &b.char_shapes, ser::serialize_char_shape)),
-        ("tab_defs", prefix_by(&src.tab_defs, &b.tab_defs, ser::serialize_tab_def)),
-        ("numberings", prefix_by(&src.numberings, &b.numberings, |x| digest_wo_raw(x, |n| n.raw_data = None))),
-        ("bullets", prefix_by(&src.bullets, &b.bullets, |x| digest_wo_raw(x, |n| n.raw_data = None))),
-        ("para_shapes", prefix_by(&src.para_shapes, &b.para_shapes, ser::serialize_para_shape)),
-        ("styles", prefix_by(&src.styles, &b.styles, ser::serialize_style)),
-    ];
-    if let Some((name, Some(i))) = lists.iter().find(|(_, bad)| bad.is_some()) {
-        return Err(format!("DocInfo {name} 의 기존 항목이 바뀜 ({i}번)"));
-    }
-    if src.font_faces.len() > b.font_faces.len()
-        || src.font_faces.iter().zip(&b.font_faces).any(|(x, y)| prefix_by(x, y, ser::serialize_face_name).is_some())
-    {
-        return Err("DocInfo font_faces 의 기존 항목이 바뀜".into());
-    }
-    if src_bins.len() > now.bin_data_content.len()
-        || src_bins.iter().zip(&now.bin_data_content).any(|((id, ext), c)| *id != c.id || *ext != c.extension)
-    {
-        return Err("BinData 항목이 바뀜".into());
-    }
-    Ok(())
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DocInfoMark {
+    lists: Vec<(&'static str, usize, String)>,
+    fonts: Vec<(usize, String)>,
 }
 
-fn bins_of(doc: &Document) -> Vec<(u16, String)> {
-    doc.bin_data_content.iter().map(|c| (c.id, c.extension.clone())).collect()
+/// 항목 열의 앞 `n` 개를 하나의 해시로(항목마다 길이를 앞에 붙여 경계를 가른다).
+fn prefix_hash<T>(items: &[T], n: usize, key: impl Fn(&T) -> Vec<u8>) -> String {
+    let mut h = blake3::Hasher::new();
+    for x in &items[..n] {
+        let b = key(x);
+        h.update(&(b.len() as u64).to_le_bytes());
+        h.update(&b);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// 목록마다의 (이름, 항목 열 → 해시) — 표시를 뜰 때와 견줄 때 같은 열을 쓴다.
+fn mark_lists(info: &DocInfo, bins: &[crate::model::bin_data::BinDataContent], n: impl Fn(&str, usize) -> usize) -> Vec<(&'static str, usize, String)> {
+    use crate::serializer::doc_info as ser;
+    let raw = |x: [u8; 32]| x.to_vec();
+    let one = |name: &'static str, len: usize, f: &dyn Fn(usize) -> String| {
+        let k = n(name, len);
+        (name, k, if k <= len { f(k) } else { String::new() })
+    };
+    vec![
+        one("bin_data_list", info.bin_data_list.len(), &|k| prefix_hash(&info.bin_data_list, k, ser::serialize_bin_data)),
+        one("border_fills", info.border_fills.len(), &|k| prefix_hash(&info.border_fills, k, ser::serialize_border_fill)),
+        one("char_shapes", info.char_shapes.len(), &|k| prefix_hash(&info.char_shapes, k, ser::serialize_char_shape)),
+        one("tab_defs", info.tab_defs.len(), &|k| prefix_hash(&info.tab_defs, k, ser::serialize_tab_def)),
+        one("numberings", info.numberings.len(), &|k| prefix_hash(&info.numberings, k, |x| raw(digest_wo_raw(x, |v| v.raw_data = None)))),
+        one("bullets", info.bullets.len(), &|k| prefix_hash(&info.bullets, k, |x| raw(digest_wo_raw(x, |v| v.raw_data = None)))),
+        one("para_shapes", info.para_shapes.len(), &|k| prefix_hash(&info.para_shapes, k, ser::serialize_para_shape)),
+        one("styles", info.styles.len(), &|k| prefix_hash(&info.styles, k, ser::serialize_style)),
+        one("bin_data_content", bins.len(), &|k| prefix_hash(bins, k, |c| [c.id.to_le_bytes().to_vec(), c.extension.as_bytes().to_vec()].concat())),
+    ]
+}
+
+impl DocInfoMark {
+    pub(crate) fn of(doc: &Document) -> DocInfoMark {
+        use crate::serializer::doc_info as ser;
+        DocInfoMark {
+            lists: mark_lists(&doc.doc_info, &doc.bin_data_content, |_, len| len),
+            fonts: doc.doc_info.font_faces.iter().map(|f| (f.len(), prefix_hash(f, f.len(), ser::serialize_face_name))).collect(),
+        }
+    }
+
+    /// 지금 문서의 목록 앞부분이 표시와 같은가(덧붙이기만 허용). 아니면 처음 어긋난 목록.
+    pub(crate) fn matches(&self, now: &Document) -> Result<(), String> {
+        use crate::serializer::doc_info as ser;
+        let want = |name: &str| self.lists.iter().find(|(n, _, _)| *n == name).map(|(_, k, _)| *k).unwrap_or(0);
+        let got = mark_lists(&now.doc_info, &now.bin_data_content, |name, _| want(name));
+        for ((name, k, h), (_, _, g)) in self.lists.iter().zip(&got) {
+            if h != g {
+                return Err(if name.starts_with("bin_data_content") {
+                    "BinData 항목이 바뀜".into()
+                } else {
+                    format!("DocInfo {name} 의 기존 항목이 바뀜(앞 {k}개)")
+                });
+            }
+        }
+        let fonts = &now.doc_info.font_faces;
+        if self.fonts.len() > fonts.len()
+            || self.fonts.iter().zip(fonts).any(|((k, h), f)| *k > f.len() || prefix_hash(f, *k, ser::serialize_face_name) != *h)
+        {
+            return Err("DocInfo font_faces 의 기존 항목이 바뀜".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn json(&self) -> Value {
+        json!({
+            "lists": self.lists.iter().map(|(n, k, h)| json!([n, k, h])).collect::<Vec<_>>(),
+            "fonts": self.fonts.iter().map(|(k, h)| json!([k, h])).collect::<Vec<_>>(),
+        })
+    }
+
+    pub(crate) fn parse(v: &Value) -> Option<DocInfoMark> {
+        let names = ["bin_data_list", "border_fills", "char_shapes", "tab_defs", "numberings", "bullets", "para_shapes", "styles", "bin_data_content"];
+        let lists = v.get("lists")?.as_array()?.iter().map(|x| {
+            let n = x.get(0)?.as_str()?;
+            let name = *names.iter().find(|m| **m == n)?;
+            Some((name, x.get(1)?.as_u64()? as usize, x.get(2)?.as_str()?.to_string()))
+        }).collect::<Option<Vec<_>>>()?;
+        let fonts = v.get("fonts")?.as_array()?.iter().map(|x| Some((x.get(0)?.as_u64()? as usize, x.get(1)?.as_str()?.to_string()))).collect::<Option<Vec<_>>>()?;
+        (lists.len() == names.len()).then_some(DocInfoMark { lists, fonts })
+    }
 }
 
 // ── 복원 재료 ────────────────────────────────────────────────────────────
 
-/// 복원 재료: 되살린 원본 문단과 그때의 DocInfo. 보낸 쪽의 미확정 복원 state 가 보정되면 이것으로 새 문서 위에서 다시
+/// 복원 재료: 되살린 원본 문단과 그때의 DocInfo 표시. 보낸 쪽의 미확정 복원 state 가 보정되면 이것으로 새 문서 위에서 다시
 /// 만든다. 엔진이 그 state 를 확정·버림·리셋할 때 푼다. studio 스냅샷(redo 쪽 `afterId`)은 redo 직후 지워지므로 따로 둔다.
 struct Recipe {
     section: usize,
     paras: Vec<Paragraph>,
-    doc_info: DocInfo,
-    bins: Vec<(u16, String)>,
+    mark: DocInfoMark,
 }
 
 thread_local! {
@@ -320,6 +380,16 @@ pub fn recipe_discard(id: u32) {
 /// 시험용: 살아 있는 복원 재료 수.
 pub fn recipe_count() -> usize {
     RECIPES.with(|r| r.borrow().1.len())
+}
+
+fn keep_recipe(recipe: Recipe) -> u32 {
+    RECIPES.with(|r| {
+        let mut r = r.borrow_mut();
+        let id = r.0;
+        r.0 = r.0.wrapping_add(1).max(1);
+        r.1.insert(id, recipe);
+        id
+    })
 }
 
 /// 문단 범위 지정 `{lo, n}`.
@@ -393,7 +463,7 @@ impl CollabCore {
                 return Ok(fail("counts", "명령 전후 문단 수가 범위와 맞지 않음".into()));
             }
         }
-        if let Err(detail) = docinfo_prefix(&snap.doc_info, &bins_of(snap), now) {
+        if let Err(detail) = DocInfoMark::of(snap).matches(now) {
             return Ok(fail("docinfo", detail));
         }
         Ok(json!({ "ok": true }))
@@ -410,17 +480,9 @@ impl CollabCore {
         let (slo, sn) = span_of(&spec["src"], "src")?;
         let (dlo, dn) = span_of(&spec["dst"], "dst")?;
         let snap = self.studio_snapshot(snapshot_id).expect("위에서 확인한 스냅샷");
-        let mut doc_info = snap.doc_info.clone();
-        doc_info.raw_stream = None;
-        let recipe = Recipe { section, paras: snap.sections[section].paragraphs[slo..slo + sn].to_vec(), doc_info, bins: bins_of(snap) };
+        let recipe = Recipe { section, paras: snap.sections[section].paragraphs[slo..slo + sn].to_vec(), mark: DocInfoMark::of(snap) };
         splice(&mut self.inner, section, dlo, dn, &recipe.paras)?;
-        Ok(RECIPES.with(|r| {
-            let mut r = r.borrow_mut();
-            let id = r.0;
-            r.0 = r.0.wrapping_add(1).max(1);
-            r.1.insert(id, recipe);
-            id
-        }))
+        Ok(keep_recipe(recipe))
     }
 
     /// 복원 재료로 다시 복원한다(보정된 미확정 복원 state 를 새 문서 위에서 다시 만들 때). `spec = {section, lo, n}` —
@@ -434,10 +496,72 @@ impl CollabCore {
             if recipe.section != section {
                 return Err(bad("구역이 다름"));
             }
-            docinfo_prefix(&recipe.doc_info, &recipe.bins, &self.inner.document).map_err(bad)?;
+            recipe.mark.matches(&self.inner.document).map_err(bad)?;
             Ok(recipe.paras.clone())
         })?;
         splice(&mut self.inner, section, lo, n, &paras)
+    }
+
+    /// U3-b: 지금 DocInfo 의 표시(플러그인이 조각 명령마다 실행 직후 떠 둔다 — 조각은 DocInfo 를 들고 있지 않다).
+    pub fn docinfo_mark(&self) -> Value {
+        DocInfoMark::of(&self.inner.document).json()
+    }
+
+    /// U3-b: 삭제 조각(업스트림 `fragment_store`)의 (구역, 시작 문단, 끝 문단, 캡처 때 구역 문단 수).
+    fn fragment_of(&self, id: u32) -> Option<(usize, usize, usize, usize)> {
+        self.inner.fragment_store.iter().find(|(fid, _)| *fid == id).map(|(_, f)| (f.section_idx, f.start_para, f.end_para, f.pre_para_count))
+    }
+
+    /// U3-b: 조각 복원을 범위로 할 수 있는가. `spec = {section, src: {lo, n}, dst: {lo, n}, counts?}` — 조각(캡처한 [start,
+    /// end])이 src 이고 지금 문서의 dst 와 바꾼다. `counts` 면(명령 직후 한 번) 캡처 때 문단 수 − src.n + dst.n = 지금 문단 수.
+    /// `mark` 는 실행 직후 뜬 DocInfo 표시. 반환은 [`Self::undo_range_check`] 와 같은 모양(`reason` 에 `fragment` 가 더 있다).
+    pub fn undo_fragment_check(&self, frag_id: u32, spec: &Value, mark: &Value) -> Result<Value, HwpError> {
+        let fail = |reason: &str, detail: String| json!({ "ok": false, "reason": reason, "detail": detail });
+        let section = spec.get("section").and_then(Value::as_u64).ok_or_else(|| bad("section 이 없음"))? as usize;
+        let (slo, sn) = span_of(&spec["src"], "src")?;
+        let (dlo, dn) = span_of(&spec["dst"], "dst")?;
+        let Some((fsec, start, end, pre)) = self.fragment_of(frag_id) else {
+            return Ok(fail("fragment", format!("삭제 조각 {frag_id} 없음")));
+        };
+        if fsec != section || start != slo || end + 1 - start != sn {
+            return Ok(fail("fragment", format!("조각 [{start}, {end}] 이 범위 {slo}+{sn} 와 다름")));
+        }
+        let now = &self.inner.document;
+        let Some(cs) = now.sections.get(section) else {
+            return Ok(fail("bounds", format!("구역 {section} 없음")));
+        };
+        if dlo + dn > cs.paragraphs.len() {
+            return Ok(fail("bounds", format!("dst {dlo}+{dn} 가 문단 수 {} 를 넘음", cs.paragraphs.len())));
+        }
+        if spec.get("counts").and_then(Value::as_bool) == Some(true) && cs.paragraphs.len() as i64 != pre as i64 - sn as i64 + dn as i64 {
+            return Ok(fail("counts", "명령 전후 문단 수가 범위와 맞지 않음".into()));
+        }
+        let Some(m) = DocInfoMark::parse(mark) else {
+            return Ok(fail("docinfo", "DocInfo 표시 형식".into()));
+        };
+        if let Err(detail) = m.matches(now) {
+            return Ok(fail("docinfo", detail));
+        }
+        Ok(json!({ "ok": true }))
+    }
+
+    /// U3-b: 조각 복원을 범위로 — 조각 문단을 지금 문서의 dst 와 바꾸고 조각을 소비한다(업스트림 `restore_delete_fragment`
+    /// 와 같은 계약: studio 는 성공 뒤 그 번호를 버린다). 업스트림 복원과 달리 캡처 때 문단 수 전제·구역 원본 바이트·뒤 문단
+    /// 줄 좌표를 되살리지 않는다 — 범위 지도로 옮긴 자리에 끼우고 뒤 문단 세로 위치를 다시 잇는다(그 구역은 원본 바이트를
+    /// 잃고 다음 저장 때 모델에서 쓰인다). 복원 재료 번호를 돌려준다.
+    pub fn undo_restore_fragment(&mut self, frag_id: u32, spec: &Value, mark: &Value) -> Result<u32, HwpError> {
+        let verdict = self.undo_fragment_check(frag_id, &json!({ "section": spec["section"], "src": spec["src"], "dst": spec["dst"] }), mark)?;
+        if verdict["ok"] != json!(true) {
+            return Err(bad(format!("{}: {}", verdict["reason"].as_str().unwrap_or(""), verdict["detail"].as_str().unwrap_or(""))));
+        }
+        let section = spec["section"].as_u64().unwrap_or(0) as usize;
+        let (dlo, dn) = span_of(&spec["dst"], "dst")?;
+        let pos = self.inner.fragment_store.iter().position(|(fid, _)| *fid == frag_id).expect("위에서 확인한 조각");
+        let paras = self.inner.fragment_store[pos].1.captured_paras.clone();
+        splice(&mut self.inner, section, dlo, dn, &paras)?;
+        self.inner.fragment_store.remove(pos);
+        let mark = DocInfoMark::parse(mark).expect("위에서 확인한 표시");
+        Ok(keep_recipe(Recipe { section, paras, mark }))
     }
 
     /// 서버 정본: 범위 표시(`{section, lo, before, after}`)가 붙은 state 를 읽은 지금 문서가, 자체 스냅샷 `snapshot_id`
@@ -688,6 +812,25 @@ mod js {
         #[wasm_bindgen(js_name = collabUndoRecipeCount)]
         pub fn collab_undo_recipe_count(&self) -> u32 {
             super::recipe_count() as u32
+        }
+
+        /// 4단계 U3-b: 지금 DocInfo 의 표시(JSON) — 조각 명령의 되돌리기 전제.
+        #[wasm_bindgen(js_name = collabDocInfoMark)]
+        pub fn collab_docinfo_mark(&self) -> String {
+            self.docinfo_mark().to_string()
+        }
+
+        /// 4단계 U3-b: 조각 복원을 범위로 할 수 있는가. `{ok, reason?, detail?}`.
+        #[wasm_bindgen(js_name = collabUndoFragmentCheck)]
+        pub fn collab_undo_fragment_check(&self, frag_id: u32, spec_json: &str, mark_json: &str) -> Result<String, JsValue> {
+            self.undo_fragment_check(frag_id, &parse(spec_json, "spec")?, &parse(mark_json, "mark")?).map(|v| v.to_string()).map_err(js_err)
+        }
+
+        /// 4단계 U3-b: 조각 복원을 범위로(조각 소비). 복원 재료 번호. 기록 훅 대상이 아니다 — 엔진이 결과를 state 로 기록한다.
+        #[wasm_bindgen(js_name = collabUndoRestoreFragment)]
+        pub fn collab_undo_restore_fragment(&mut self, frag_id: u32, spec_json: &str, mark_json: &str) -> Result<u32, JsValue> {
+            let (spec, mark) = (parse(spec_json, "spec")?, parse(mark_json, "mark")?);
+            self.undo_restore_fragment(frag_id, &spec, &mark).map_err(js_err)
         }
 
         /// 4단계 U3(서버 정본): 범위 표시가 붙은 state 를 읽은 지금 문서가 자체 스냅샷에서 그 범위만 바뀐 것인가.

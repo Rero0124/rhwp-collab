@@ -29,7 +29,7 @@ const opaque = (para, off, text) => ({ ...insertText(para, off, text), type: 'sn
 
 /**
  * 작은 히스토리: CommandHistory 의 훅 호출과 같은 순서(실행 → 기록 → recorded, 막힘 → 버림 → rejected). undo/redo 때 명령에
- * 넘기는 문서는 studio 의 다리와 같다(U3: `restoreSnapshot` 만 훅에 먼저 묻는다).
+ * 넘기는 문서는 studio 의 다리와 같다(U3·U3-b: `restoreSnapshot`·`restoreDeleteFragment` 만 훅에 먼저 묻는다).
  */
 class MiniHistory {
   constructor(doc) { this.doc = doc; this.undoStack = []; this.redoStack = []; this.hook = null; }
@@ -40,6 +40,7 @@ class MiniHistory {
     return new Proxy(doc, {
       get(target, key) {
         if (key === 'restoreSnapshot') return (id) => { if (!hook.restoreSnapshot(cmd, dir, id)) target.restoreSnapshot(id); };
+        if (key === 'restoreDeleteFragment') return (id) => (hook.restoreDeleteFragment(cmd, dir, id) ? '{"ok":true}' : target.restoreDeleteFragment(id));
         const v = Reflect.get(target, key, target);
         return typeof v === 'function' ? v.bind(target) : v;
       },
@@ -72,6 +73,15 @@ class MiniHistory {
     this.undoStack.push(cmd);
     this.hook?.redone(cmd);
     return 'ok';
+  }
+  /** studio 의 병합(300ms 연속 입력): 실행 → 앞 명령과 합친 명령으로 맨 위를 바꾸고 recorded(merged, last) */
+  executeMerged(cmd, merge) {
+    cmd.execute(this.doc);
+    const last = this.undoStack.pop();
+    const merged = merge(last, cmd);
+    this.undoStack.push(merged);
+    this.redoStack = [];
+    this.hook?.recorded(merged, last);
   }
   controller() {
     return {
@@ -772,4 +782,142 @@ test('U3 ⑫ 되돌리기·다시 하기를 연달아(한 묶음이 왕복 중):
   assert.equal(r.a.engine.recipeCount(), 0);
   const sent = r.server.log.flatMap((m) => m.entries).filter((e) => e.kind === 'state');
   assert.ok(sent.length >= 3 && sent.every((e) => e.range && !('recipe' in e)), '서버에 간 복원 state 에는 범위 표시만(재료 번호 없음)');
+});
+
+
+// ── 4단계 U3-b: 삭제 조각의 범위 복원 ────────────────────────────────────────
+
+/** studio FragmentDeleteCommand(본문 선택 삭제): 조각 캡처 [start..end] → deleteRange, 되돌리기는 조각 복원(소비) */
+const fragmentDelete = (s, so, e, eo) => ({
+  type: 'deleteSelection', sectionIdx: 0, startPara: s, endPara: e, cursorBefore: pos(s, so), cursorAfter: pos(s, so), fragmentId: null,
+  execute(doc) { this.fragmentId = doc.captureDeleteRange(0, this.startPara, this.endPara); doc.deleteRange(0, this.startPara, so, this.endPara, eo); },
+  undo(doc) { doc.restoreDeleteFragment(this.fragmentId); this.fragmentId = null; },
+  discard(doc) { if (this.fragmentId !== null) { doc.discardDeleteFragment(this.fragmentId); this.fragmentId = null; } },
+});
+/** studio InsertTextCommand 수정(덮어쓰기) 모드: 캐럿 문단 조각 → 덮어쓴 글자 지우고 입력, 되돌리기는 첫 조각 복원 + 나머지 해제 */
+const overwrite = (para, off, text, replaced) => ({
+  type: 'insertText', position: pos(para, off), text, replacedText: replaced, fragmentIds: [],
+  execute(doc) {
+    const p = this.position;
+    this.fragmentIds = [doc.captureDeleteRange(0, p.paragraphIndex, p.paragraphIndex)];
+    doc.deleteText(0, p.paragraphIndex, p.charOffset, [...this.replacedText].length);
+    doc.insertText(0, p.paragraphIndex, p.charOffset, this.text);
+  },
+  undo(doc) {
+    const [id, ...rest] = this.fragmentIds;
+    doc.restoreDeleteFragment(id);
+    this.fragmentIds = rest;
+    this.discard(doc);
+  },
+  discard(doc) { for (const id of this.fragmentIds) doc.discardDeleteFragment(id); this.fragmentIds = []; },
+});
+/** studio InsertTextCommand.mergeWith 의 덮어쓰기 병합: 글자 이어 붙이고 조각은 [앞 조각들, 뒤 조각들] */
+const mergeOverwrite = (a, b) => ({ ...overwrite(a.position.paragraphIndex, a.position.charOffset, a.text + b.text, a.replacedText + b.replacedText), position: a.position, fragmentIds: [...a.fragmentIds, ...b.fragmentIds] });
+/** studio DeleteTextCommand 의 링크·메모 앵커를 걸친 삭제: 문단 조각 → 글자 지움, 되돌리기는 조각 복원 */
+const anchoredDelete = (para, off, count) => ({
+  type: 'deleteText', position: pos(para, off), count, fragmentId: null,
+  execute(doc) { const p = this.position; this.fragmentId = doc.captureDeleteRange(0, p.paragraphIndex, p.paragraphIndex); doc.deleteText(0, p.paragraphIndex, p.charOffset, this.count); },
+  undo(doc) { doc.restoreDeleteFragment(this.fragmentId); this.fragmentId = null; },
+  discard(doc) { if (this.fragmentId !== null) { doc.discardDeleteFragment(this.fragmentId); this.fragmentId = null; } },
+});
+
+test('U3-b ① 선택 삭제 뒤 B 가 범위 앞에서 Enter → 허용(U1 의 "조각이 옮겨지면 막음"을 풂), 원래 내용·B 의 Enter 유지, 범위 표시', () => {
+  const r = rangeRoom(6);
+  r.a.history.execute(fragmentDelete(1, 1, 3, 1));
+  r.server.drain(r.all);
+  assert.deepEqual(paragraphs(r.b.doc), ['p0', 'p3', 'p4', 'p5']);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'p4', 'p5']);
+  assert.deepEqual(lastEntry(r).range, { section: 0, lo: 2, before: 1, after: 3 });
+  assert.equal(r.server.rangeRejects, 0);
+  assert.equal(r.a.engine.recipeCount(), 0);
+});
+
+test('U3-b ② 선택 삭제 뒤 B 가 범위 뒤에서 Enter → 허용(업스트림 조각 복원은 문단 수 전제에 걸려 실패하던 경우)', () => {
+  const r = rangeRoom(6);
+  r.a.history.execute(fragmentDelete(1, 1, 3, 1));
+  r.server.drain(r.all);
+  r.b.history.execute(splitParagraph(3, 1)); // 'p5' → 'p', '5'
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p0', 'p1', 'p2', 'p3', 'p4', 'p', '5']);
+});
+
+test('U3-b ③ B 가 합쳐진 문단(범위)을 고쳤으면 막힘·알림·문서 그대로', () => {
+  const r = rangeRoom(6);
+  r.a.history.execute(fragmentDelete(1, 1, 3, 1));
+  r.server.drain(r.all);
+  r.b.history.execute(insertText(1, 0, 'B'));
+  r.server.drain(r.all);
+  const before = paragraphs(r.a.doc);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  assert.deepEqual(paragraphs(r.a.doc), before);
+  converged(r);
+});
+
+test('U3-b ④ B 가 계속 치는 중: A 의 복원 state 가 먼저 가도, B 의 묶음이 먼저 가도 둘 다 취소되지 않는다', () => {
+  for (const order of ['A 먼저', 'B 먼저']) {
+    const r = rangeRoom(6);
+    r.a.history.execute(fragmentDelete(1, 1, 3, 1));
+    r.server.drain(r.all);
+    assert.equal(r.a.history.undo(), 'ok');
+    if (order === 'A 먼저') {
+      r.a.flush();
+      r.b.history.execute(insertText(3, 0, 'B')); // 범위 밖(합쳐진 뒤 마지막 문단)
+      r.b.flush();
+      while (r.server.deliverOne(r.b)) { /* B: 미확정이 있는 채로 A 의 복원 state */ }
+    } else {
+      r.b.history.execute(splitParagraph(0, 1));
+      r.b.flush();
+      r.server.deliverOne(r.b);
+      while (r.server.deliverOne(r.a)) { /* A: 미확정 복원 state 가 있는 채로 B 의 Enter → 다시 만듦 */ }
+    }
+    r.server.drain(r.all);
+    converged(r);
+    assert.deepEqual([r.a.dropped, r.b.dropped], [0, 0], order);
+    assert.equal(r.server.rangeRejects, 0, order);
+    assert.equal(r.a.engine.recipeCount(), 0, order);
+  }
+});
+
+test('U3-b ⑤ 덮어쓰기 입력(병합 포함): B 가 다른 문단에 입력·Enter 해도 문단이 덮어쓰기 전으로', () => {
+  const r = rangeRoom(5);
+  r.a.history.execute(overwrite(2, 0, 'X', 'p'));
+  r.a.history.executeMerged(overwrite(2, 1, 'Y', '2'), mergeOverwrite);
+  r.server.drain(r.all);
+  assert.equal(paragraphs(r.b.doc)[2], 'XY');
+  assert.equal(r.a.history.undoStack.length, 1, '병합해 한 단계');
+  r.b.history.execute(insertText(4, 0, 'B'));
+  r.b.history.execute(splitParagraph(0, 1));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'Bp4']);
+  assert.ok(lastEntry(r).range, '범위 표시');
+  assert.equal(r.a.engine.recipeCount(), 0);
+});
+
+test('U3-b ⑥ 링크·메모 앵커를 걸친 삭제(조각): 앞 문단 Enter 뒤 되돌리기 허용, 다시 하기·다시 되돌리기', () => {
+  const r = rangeRoom(5);
+  r.a.history.execute(anchoredDelete(3, 0, 1));
+  r.server.drain(r.all);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  r.server.drain(r.all);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'p4']);
+  // 다시 하기는 조각을 새로 잡아 지운다(op) — 옮겨진 자리에서
+  assert.equal(r.a.history.redo(), 'ok');
+  r.server.drain(r.all);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', '3', 'p4']);
+  r.b.history.execute(insertText(5, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok', '다시 한 뒤에도 새 조각으로 범위 복원');
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'Bp4']);
+  assert.equal(r.a.engine.recipeCount(), 0);
 });

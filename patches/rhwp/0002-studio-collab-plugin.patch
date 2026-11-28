@@ -167,10 +167,10 @@ index 1e2a6986..4caa8146 100644
      if (!this.currentRect) return;
 diff --git a/rhwp-studio/src/engine/collab-undo.ts b/rhwp-studio/src/engine/collab-undo.ts
 new file mode 100644
-index 00000000..2517171a
+index 00000000..e566e97c
 --- /dev/null
 +++ b/rhwp-studio/src/engine/collab-undo.ts
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,520 @@
 +/**
 + * cc-rhwp(4단계 U1·U2): 공동편집 중 되돌리기 — 명령이 기억한 위치의 표 (docs/collab-stage4.md §5).
 + *
@@ -185,6 +185,9 @@ index 00000000..2517171a
 + *
 + * U3: 스냅샷 명령(`SnapshotCommand` 계열)은 studio 스냅샷 번호(`beforeId`·`afterId`)를 알려 준다. 명령이 만든 기록이 한
 + * 구역의 문단 범위로 모이면 플러그인이 그 범위만 스냅샷에서 되살린다(히스토리 훅 `restoreSnapshot`). 아니면 3.2-3.
++ *
++ * U3-b: 삭제 조각으로 되돌리는 명령(본문 선택 삭제, 덮어쓰기·예약 글자 모양 입력, 링크·메모 앵커를 걸친 삭제)은 조각 번호를
++ * 알려 준다 — 되돌리기의 조각 복원(`restoreDeleteFragment`)도 플러그인이 범위 복원으로 맡을 수 있다.
 + *
 + * 이 파일은 명령 클래스를 import 하지 않는다(필드 이름으로 읽고 쓴다). 업스트림이 필드 이름을 바꾸면
 + * `tests/plugin-collab-undo.test.ts` 의 대조 시험이 깨진다.
@@ -240,6 +243,8 @@ index 00000000..2517171a
 +   * 것(다시 하기의 원본, 되돌린 뒤에만). 없으면 `null`.
 +   */
 +  snapshot?: { before(): number | null; after(): number | null };
++  /** U3-b `store === 'fragment'`: 되돌리기가 쓸 삭제 조각 번호(덮어쓰기 병합이면 첫 조각). 없으면 `null`. */
++  fragment?: { id(): number | null };
 +}
 +
 +/** 히스토리가 공동편집 플러그인에 알리는 훅. */
@@ -259,6 +264,8 @@ index 00000000..2517171a
 +   * 히스토리는 원래 복원을 부르지 않는다. 히스토리가 명령에 넘기는 다리가 묻는다(`restoreSnapshot` 만).
 +   */
 +  restoreSnapshot?(command: object, dir: 'undo' | 'redo', id: number): boolean;
++  /** U3-b: 같은 다리로 삭제 조각 복원(`restoreDeleteFragment`)도 훅에 먼저 묻는다. 맡으면 조각은 훅 쪽에서 소비된다. */
++  restoreDeleteFragment?(command: object, dir: 'undo' | 'redo', id: number): boolean;
 +}
 +
 +/** 플러그인이 쓰는 히스토리 조작. */
@@ -577,12 +584,18 @@ index 00000000..2517171a
 +    case 'insertText': {
 +      const position = docPos(cmd, 'position');
 +      const fragment = Array.isArray(cmd.fragmentIds) && cmd.fragmentIds.length > 0;
-+      return { slots: compact([position]), store: fragment ? 'fragment' : 'none', fragmentAnchor: fragment ? position ?? undefined : undefined };
++      return {
++        slots: compact([position]), store: fragment ? 'fragment' : 'none', fragmentAnchor: fragment ? position ?? undefined : undefined,
++        ...(fragment ? { fragment: { id: () => (Array.isArray(cmd.fragmentIds) && isNum(cmd.fragmentIds[0]) ? cmd.fragmentIds[0] as number : null) } } : {}),
++      };
 +    }
 +    case 'deleteText': {
 +      const position = docPos(cmd, 'position');
 +      const fragment = cmd.fragmentId !== null && cmd.fragmentId !== undefined;
-+      return { slots: compact([position]), store: fragment ? 'fragment' : 'none', fragmentAnchor: fragment ? position ?? undefined : undefined };
++      return {
++        slots: compact([position]), store: fragment ? 'fragment' : 'none', fragmentAnchor: fragment ? position ?? undefined : undefined,
++        ...(fragment ? { fragment: { id: () => (isNum(cmd.fragmentId) ? cmd.fragmentId : null) } } : {}),
++      };
 +    }
 +    case 'applyCharFormat':
 +      return { slots: compact([docPos(cmd, 'start'), docPos(cmd, 'end', { bias: 'before' }), ...charFormatEntries(cmd)]), store: 'none' };
@@ -675,10 +688,11 @@ index 00000000..2517171a
 +    slots: compact([anchor, docPos(cmd, 'cursorBefore', { caret: true }), docPos(cmd, 'cursorAfter', { caret: true })]),
 +    store: 'fragment',
 +    fragmentAnchor: anchor ?? undefined,
++    fragment: { id: () => (isNum(cmd.fragmentId) ? cmd.fragmentId : null) },
 +  };
 +}
 diff --git a/rhwp-studio/src/engine/history.ts b/rhwp-studio/src/engine/history.ts
-index 8610bc16..0c3be368 100644
+index 8610bc16..cd1990f4 100644
 --- a/rhwp-studio/src/engine/history.ts
 +++ b/rhwp-studio/src/engine/history.ts
 @@ -3,6 +3,7 @@ import type { DocumentPosition } from '@/core/types';
@@ -689,7 +703,7 @@ index 8610bc16..0c3be368 100644
  
  /** 스택 내 모든 명령의 discard()를 호출하여 리소스 해제 */
  function discardAll(stack: EditCommand[], wasm: WasmBridge): void {
-@@ -43,6 +44,66 @@ function snapshotIdBudget(wasm: WasmBridge): number {
+@@ -43,6 +44,71 @@ function snapshotIdBudget(wasm: WasmBridge): number {
  /** Undo/Redo 히스토리 관리 */
  export class CommandHistory {
    lastFailureRecovery: RollbackOutcome = 'unknown';
@@ -725,18 +739,23 @@ index 8610bc16..0c3be368 100644
 +  }
 +
 +  /**
-+   * cc-rhwp(4단계 U3): undo/redo 때 명령에 넘기는 다리. 스냅샷 복원(`restoreSnapshot`)만 훅에 먼저 묻고(범위 복원), 훅이
-+   * 맡지 않으면 원래 복원을 부른다. 나머지는 그대로 넘긴다 — 메서드는 원래 객체에 묶어 `this` 가 바뀌지 않게 한다.
++   * cc-rhwp(4단계 U3·U3-b): undo/redo 때 명령에 넘기는 다리. 스냅샷 복원(`restoreSnapshot`)과 삭제 조각 복원
++   * (`restoreDeleteFragment`)만 훅에 먼저 묻고(범위 복원), 훅이 맡지 않으면 원래 복원을 부른다. 나머지는 그대로 넘긴다 —
++   * 메서드는 원래 객체에 묶어 `this` 가 바뀌지 않게 한다.
 +   */
 +  private collabBridge(command: EditCommand, dir: 'undo' | 'redo', wasm: WasmBridge): WasmBridge {
 +    const hook = this.collab;
-+    if (!hook?.restoreSnapshot) return wasm;
++    if (!hook?.restoreSnapshot && !hook?.restoreDeleteFragment) return wasm;
 +    const restore = (id: number): void => {
-+      if (!hook.restoreSnapshot!(command, dir, id)) wasm.restoreSnapshot(id);
++      if (!hook.restoreSnapshot?.(command, dir, id)) wasm.restoreSnapshot(id);
 +    };
++    // 업스트림 복원과 같은 모양을 돌려준다(부르는 쪽은 지금 쓰지 않는다)
++    const restoreFragment = (id: number): string =>
++      (hook.restoreDeleteFragment?.(command, dir, id) ? '{"ok":true}' : wasm.restoreDeleteFragment(id));
 +    return new Proxy(wasm, {
 +      get(target, key) {
 +        if (key === 'restoreSnapshot') return restore;
++        if (key === 'restoreDeleteFragment') return restoreFragment;
 +        const value = Reflect.get(target, key, target);
 +        return typeof value === 'function' ? value.bind(target) : value;
 +      },
@@ -756,7 +775,7 @@ index 8610bc16..0c3be368 100644
  
    /** 동일 엔트리·순서의 양 스택을 확인한다. counts만으로 redo 파괴를 숨기지 않는다. */
    recoveryCheckpoint(): () => boolean {
-@@ -123,6 +184,7 @@ export class CommandHistory {
+@@ -123,6 +189,7 @@ export class CommandHistory {
        this.lastFailureRecovery = command.failureRecovery?.() ?? 'unknown';
        // 부분 변경이 남았으면 복원 정보를 보존하여 Undo로 재시도한다.
        if (command.retainOnFailure?.()) this.recordWithoutExecute(command, wasm);
@@ -764,7 +783,7 @@ index 8610bc16..0c3be368 100644
        throw error;
      }
      this.captureExecutionEffects(command);
-@@ -132,6 +194,13 @@ export class CommandHistory {
+@@ -132,6 +199,13 @@ export class CommandHistory {
      // redo 스택이 파기되며 ③스냅샷 명령이면 예산 2슬롯을 먹어 오래된 진짜 이력이
      // 축출된다(#2328). 세 피해 모두 여기서 끊는다 — redo 스택도 그대로 둔다.
      if (command.isNoOp?.()) {
@@ -778,7 +797,7 @@ index 8610bc16..0c3be368 100644
        command.discard?.(wasm);
        return cursorAfter;
      }
-@@ -145,6 +214,7 @@ export class CommandHistory {
+@@ -145,6 +219,7 @@ export class CommandHistory {
          // redo 스택 정리 (리소스 해제 후 비움)
          discardAll(this.redoStack, wasm);
          this.redoStack = [];
@@ -786,7 +805,7 @@ index 8610bc16..0c3be368 100644
          return cursorAfter;
        }
      }
-@@ -153,6 +223,7 @@ export class CommandHistory {
+@@ -153,6 +228,7 @@ export class CommandHistory {
      // redo 스택 정리 (새 명령 실행 시 redo 불가)
      discardAll(this.redoStack, wasm);
      this.redoStack = [];
@@ -794,7 +813,7 @@ index 8610bc16..0c3be368 100644
  
      // 크기 제한 — eviction 시 리소스 해제
      if (this.undoStack.length > this.maxSize) {
-@@ -189,6 +260,7 @@ export class CommandHistory {
+@@ -189,6 +265,7 @@ export class CommandHistory {
      const cursorAfter = command.undo(wasm);
      this.undoStack.pop();
      command.discard?.(wasm);
@@ -802,7 +821,7 @@ index 8610bc16..0c3be368 100644
      return cursorAfter;
    }
  
-@@ -198,6 +270,15 @@ export class CommandHistory {
+@@ -198,6 +275,15 @@ export class CommandHistory {
      const command = this.undoStack[this.undoStack.length - 1];
      if (!command) return null;
  
@@ -818,7 +837,7 @@ index 8610bc16..0c3be368 100644
      // [Task #2328] op-우선 + 실패시-드롭 하이브리드.
      // - 성공: 스택을 이동한다(op 전에 pop 하지 않으므로 성공 엔트리 무손실).
      // - 실패(예: 복구 불가한 스냅샷 restore 오류): 오래동안 스택 top 에 남겨
-@@ -206,15 +287,20 @@ export class CommandHistory {
+@@ -206,15 +292,20 @@ export class CommandHistory {
      //   (스냅샷 복원은 문서 전체 치환이라 다음(더 오래된) 엔트리 undo 가 안전).
      let cursorAfter: DocumentPosition;
      try {
@@ -841,7 +860,7 @@ index 8610bc16..0c3be368 100644
      // [Task #5769] undo 가 스냅샷 id 를 늘리므로(엔트리 1 → 2) 여기서도 예산을 강제한다.
      // 스택 이동 이후에 불러야 방금 늘어난 +1 이 계산에 포함된다.
      if ((command.snapshotResourceCount?.() ?? 0) > 0) {
-@@ -232,29 +318,46 @@ export class CommandHistory {
+@@ -232,29 +323,46 @@ export class CommandHistory {
      const command = this.redoStack[this.redoStack.length - 1];
      if (!command) return null;
  
@@ -889,7 +908,7 @@ index 8610bc16..0c3be368 100644
      // 직전 명령과 병합 시도
      if (this.undoStack.length > 0) {
        const last = this.undoStack[this.undoStack.length - 1];
-@@ -265,6 +368,7 @@ export class CommandHistory {
+@@ -265,6 +373,7 @@ export class CommandHistory {
            discardAll(this.redoStack, wasm);
          }
          this.redoStack = [];
@@ -897,7 +916,7 @@ index 8610bc16..0c3be368 100644
          return;
        }
      }
-@@ -274,6 +378,7 @@ export class CommandHistory {
+@@ -274,6 +383,7 @@ export class CommandHistory {
        discardAll(this.redoStack, wasm);
      }
      this.redoStack = [];
@@ -2276,10 +2295,10 @@ index 00000000..877ebd9b
 +});
 diff --git a/rhwp-studio/tests/plugin-collab-undo.test.ts b/rhwp-studio/tests/plugin-collab-undo.test.ts
 new file mode 100644
-index 00000000..a5270f49
+index 00000000..792a6f3f
 --- /dev/null
 +++ b/rhwp-studio/tests/plugin-collab-undo.test.ts
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,521 @@
 +// cc-rhwp(4단계 U1·U2·U3): 공동편집 되돌리기 — 명령 위치 표(engine/collab-undo.ts)와 히스토리·호스트 배선.
 +//
 +// 명령 클래스(command.ts)와 CommandHistory 는 node 의 strip-only TS 로 실행할 수 없어(이 저장소의 undo 테스트
@@ -2330,7 +2349,7 @@ index 00000000..a5270f49
 +  SplitParagraphInCellCommand: ['position'],
 +  MergeParagraphInCellCommand: ['position'],
 +  MergeNextParagraphInCellCommand: ['position'],
-+  FragmentDeleteCommand: ['cursorBefore', 'cursorAfter', 'sectionIdx', 'startPara', 'endPara'],
++  FragmentDeleteCommand: ['cursorBefore', 'cursorAfter', 'sectionIdx', 'startPara', 'endPara', 'fragmentId'],
 +  DeleteSelectionCommand: ['fragment', 'snapshot', 'selection'],
 +  ApplyCharFormatCommand: ['start', 'end', 'entries'],
 +  ApplyParaFormatCommand: ['targets', 'cursorBefore'],
@@ -2479,6 +2498,19 @@ index 00000000..a5270f49
 +  assert.equal(describeCollabUndo({ type: 'deleteSelection', fragment: null, snapshot: {}, selection: { start: cell1(), end: cell1() } })!.store, 'snapshot');
 +  // FragmentDeleteCommand 자체
 +  assert.equal(describeCollabUndo(inner)!.store, 'fragment');
++});
++
++test('U3-b 조각 번호: 선택 삭제(안쪽 조각)·덮어쓰기 입력(첫 조각)·링크 걸친 삭제 — 되돌리기 때의 지금 값을 읽는다', () => {
++  const inner = { type: 'deleteSelection', sectionIdx: 0, startPara: 3, endPara: 5, cursorBefore: body0(3, 1), cursorAfter: body0(3, 1), fragmentId: 11 as number | null };
++  const sel = describeCollabUndo({ type: 'deleteSelection', fragment: inner, snapshot: null, selection: { start: body0(3, 1), end: body0(5, 2) } })!;
++  assert.equal(sel.fragment!.id(), 11);
++  inner.fragmentId = null;
++  assert.equal(sel.fragment!.id(), null, '복원 뒤(소비)에는 없음');
++  const typed = { type: 'insertText', position: body0(2, 1), fragmentIds: [21, 22] };
++  assert.equal(describeCollabUndo(typed)!.fragment!.id(), 21, '병합이면 첫 조각');
++  assert.equal(describeCollabUndo({ type: 'insertText', position: body0(2, 1), fragmentIds: [] })!.fragment, undefined, '조각 없는 입력');
++  assert.equal(describeCollabUndo({ type: 'deleteText', position: body0(2, 1), fragmentId: 31 })!.fragment!.id(), 31);
++  assert.equal(describeCollabUndo({ type: 'deleteText', position: body0(2, 1), fragmentId: null })!.fragment, undefined);
 +});
 +
 +test('글자 서식: 범위 시작·끝(끝은 before)과 문단별 기록(본문 paraIndex, 셀 cellPathJson)', () => {
@@ -2640,9 +2672,12 @@ index 00000000..a5270f49
 +  assert.ok(rb > 0 && rb < redo.indexOf("command.execute(this.collabBridge(command, 'redo', wasm))"), 'redo: 막힘 판정이 실행보다 먼저, 실행은 다리로');
 +  // U3 다리: 훅이 restoreSnapshot 을 맡지 않으면 원래 복원, 나머지는 원래 객체에 묶어 넘긴다
 +  const bridge = balancedFrom(h, "private collabBridge(command: EditCommand, dir: 'undo' | 'redo', wasm: WasmBridge): WasmBridge", '{');
-+  assert.match(bridge, /if \(!hook\?\.restoreSnapshot\) return wasm;/);
-+  assert.match(bridge, /if \(!hook\.restoreSnapshot!\(command, dir, id\)\) wasm\.restoreSnapshot\(id\);/);
++  assert.match(bridge, /if \(!hook\?\.restoreSnapshot && !hook\?\.restoreDeleteFragment\) return wasm;/);
++  assert.match(bridge, /if \(!hook\.restoreSnapshot\?\.\(command, dir, id\)\) wasm\.restoreSnapshot\(id\);/);
 +  assert.match(bridge, /if \(key === 'restoreSnapshot'\) return restore;/);
++  // U3-b: 조각 복원도 같은 다리로(맡지 않으면 원래 복원)
++  assert.match(bridge, /if \(key === 'restoreDeleteFragment'\) return restoreFragment;/);
++  assert.match(bridge, /hook\.restoreDeleteFragment\?\.\(command, dir, id\) \? '\{"ok":true\}' : wasm\.restoreDeleteFragment\(id\)/);
 +  assert.match(bridge, /typeof value === 'function' \? value\.bind\(target\) : value/);
 +  assert.match(redo, /this\.undoStack\.push\(command\);\s*this\.collab\?\.redone\(command\);\s*return cursorAfter;/);
 +  // 훅을 걸 때 기록 중지를 풀고 스택을 비운다

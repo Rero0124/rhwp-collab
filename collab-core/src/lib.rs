@@ -20,7 +20,7 @@
 //! 이 파일은 업스트림 rhwp 크레이트 안에 `#[path]` 로 포함된다 (`patches/rhwp/0001`). 크레이트 내부
 //! 모듈이라 `pub(crate)` 필드·메서드를 쓸 수 있다.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use serde_json::{json, Value};
@@ -35,6 +35,8 @@ use crate::renderer::render_normalization::RenderPath;
 pub mod ot;
 // 5단계 D4: 좁은 권한(form·comment) 편집의 결과 판정·누름틀 범위 판정
 mod confine;
+// 6단계 결과 다시 쓰기 강화: 모델 안 날 바이트 자리(규약 §8.1)
+mod rewrite_raw;
 
 #[cfg(feature = "wasm-api")]
 #[path = "wasm.rs"]
@@ -328,6 +330,9 @@ pub struct CollabCore {
     bin_digest: std::sync::Mutex<BinDigestCache>,
     /// 결과 적재(`load_state`) 횟수. 스냅샷 뒤에 적재가 있었으면 D4 판정이 스냅샷 쪽도 내보내기→다시 읽기로 맞춘다.
     state_loads: u64,
+    /// 6단계 결과 다시 쓰기 강화(결정 2): 정본이 방이 살아 있는 동안 본 날 바이트. 정본만 켠다
+    /// (`track_raw_seen` — 서버 정본 워커가 열자마자, 또는 다시 쓰기·op 인자 문이 처음 부를 때). 클라이언트는 None.
+    raw_seen: Option<rewrite_raw::Seen>,
 }
 
 /// S3-0 BinData 내용 해시 캐시 (docs/collab-stage3.md S3-0).
@@ -444,7 +449,7 @@ fn bad_args(method: &str, detail: impl std::fmt::Display) -> HwpError {
 
 impl CollabCore {
     pub fn new(inner: DocumentCore) -> Self {
-        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default(), state_loads: 0 }
+        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default(), state_loads: 0, raw_seen: None }
     }
 
     // ── 자체 스냅샷 (§5) ────────────────────────────────────────────────
@@ -506,11 +511,36 @@ impl CollabCore {
         let parsed = DocumentCore::from_bytes(&raw)?;
         let paths = parsed.text_reflowed_table_paths_for_snapshot();
         let format = parsed.source_format;
+        // 결정 2: 정본이 본 날 바이트 — 읽기 전 문서(되돌리기가 되살릴 수 있다)와 읽은 문서를 모은다
+        self.collect_raw_seen();
         self.install(parsed.document, &paths);
         self.inner.source_format = format;
         self.inner.active_field = None;
         self.state_loads += 1;
+        self.collect_raw_seen();
         Ok(())
+    }
+
+    /// 6단계 결과 다시 쓰기 강화(결정 2): 이 문서를 정본으로 쓴다 — 지금 문서의 날 바이트를 모으고, 이후 결과를 읽을
+    /// 때마다 더 모은다. 서버 정본 워커가 문서를 열자마자(기록 재생 전) 부른다. 이미 켜져 있으면 아무것도 하지 않는다.
+    pub fn track_raw_seen(&mut self) {
+        if self.raw_seen.is_none() {
+            self.raw_seen = Some(rewrite_raw::Seen::default());
+            self.collect_raw_seen();
+        }
+    }
+
+    /// 켜져 있으면 지금 문서의 날 바이트를 더 모은다.
+    fn collect_raw_seen(&mut self) {
+        if let Some(seen) = &mut self.raw_seen {
+            let doc = &mut self.inner.document;
+            seen.collect(&mut doc.doc_info, &mut doc.doc_properties, &mut doc.sections);
+        }
+    }
+
+    /// 시험·진단: 모은 날 바이트 수(켜지지 않았으면 None)
+    pub fn raw_seen_len(&self) -> Option<usize> {
+        self.raw_seen.as_ref().map(rewrite_raw::Seen::len)
     }
 
     /// 결과 전송용 내보내기. 캐럿을 써 넣지 않는 원시 export 다(studio 의 `onBeforeExport` 를 타지 않음).
@@ -972,10 +1002,19 @@ impl CollabCore {
     ///   그 밖의 날 바이트 자리(개체 `ctrl_data_records`, 스타일 `raw_data` 등)는 그대로 남는다(규약 문서의 알려진 한계).
     /// - BinData: 모델이 참조하는 것만 남긴다(업스트림 `prune_unreferenced_bin_data` — 참조 번호를 함께 옮긴다).
     /// - 형식: 정본의 형식 계열로 쓴다.
-    pub fn rewrite_state(&self, state: &[u8]) -> Result<Vec<u8>, HwpError> {
+    pub fn rewrite_state(&mut self, state: &[u8]) -> Result<Vec<u8>, HwpError> {
+        self.rewrite_state_report(state).map(|(s, _)| s)
+    }
+
+    /// [`Self::rewrite_state`] 와 같고, 결과 다시 쓰기 강화가 바꾼 날 바이트 자리 수(종류 → 개수)를 함께 돌려준다.
+    pub fn rewrite_state_report(&mut self, state: &[u8]) -> Result<(Vec<u8>, BTreeMap<String, usize>), HwpError> {
+        // 결정 2: 지금 정본의 날 바이트도 본 것으로 둔다(처음이면 이때 켠다)
+        self.track_raw_seen();
+        self.collect_raw_seen();
         let raw = unpack_state(state)?;
         let mut tmp = DocumentCore::from_bytes(&raw)?;
         let canon = &self.inner.document;
+        let mut changes = BTreeMap::new();
         {
             let doc = &mut tmp.document;
             for (i, section) in doc.sections.iter_mut().enumerate() {
@@ -999,6 +1038,20 @@ impl CollabCore {
             doc.provenance = canon.provenance.clone();
             keep_known_doc_info_records(doc, canon);
             keep_known_section_tails(doc, canon);
+            // 결과 다시 쓰기 강화: 모델에서 다시 쓰는 구역·DocInfo 의 날 바이트 자리(규약 §8.1). 원본 바이트를 그대로 쓰는
+            // 구역(정본의 봉인된 바이트와 같다)은 건드리지 않는다 — 날 바이트도 정본 것이고, 바꾸면 그 바이트를 못 쓴다.
+            let seen = self.raw_seen.as_ref().expect("track_raw_seen 뒤");
+            let sealed = crate::model::section_tail::validate_preservation(doc).is_ok();
+            for section in doc.sections.iter_mut().filter(|s| s.raw_stream.is_none()) {
+                rewrite_raw::sanitize_section(section, seen, &mut changes);
+            }
+            if doc.doc_info.raw_stream.is_none() {
+                rewrite_raw::sanitize_doc_info(&mut doc.doc_info, &mut doc.doc_properties, seen, &mut changes);
+            }
+            if changes.contains_key("SectionChild") && sealed {
+                // 원본 바탕쪽 목록을 버렸으면 끝 목록 투영이 바뀐다 — 업스트림 바탕쪽 편집처럼 다시 봉인한다
+                doc.seal_section_tail_provenance();
+            }
             crate::document_core::prune_unreferenced_bin_data(doc);
         }
         tmp.source_format = self.inner.source_format;
@@ -1006,7 +1059,7 @@ impl CollabCore {
             crate::parser::FileFormat::Hwpx => tmp.export_hwpx_native()?,
             _ => tmp.export_hwp_native()?,
         };
-        pack_state(&out)
+        Ok((pack_state(&out)?, changes))
     }
 
     /// 6단계 S2(docs/collab-stage6.md): 방을 열 때 왕복 점검. rhwp 는 저장할 때 손대지 않은 부분의 원본 바이트를 그대로

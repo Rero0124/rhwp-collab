@@ -1113,7 +1113,7 @@ fn rewrite_state_keeps_the_canonical_document_and_reloads_to_the_same_model() {
 #[test]
 fn rewrite_state_drops_a_record_injected_into_section_bytes() {
     let raw = text_doc();
-    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     let c = with_injected_record(&mut client);
     assert!(sections_carry_marker(&c), "위조 바이트에 레코드가 있다(전제)");
@@ -1141,7 +1141,7 @@ fn rewrite_state_trusts_canonical_bytes_only_while_their_seal_matches() {
 #[test]
 fn rewrite_state_uses_canonical_streams_and_drops_unreferenced_bin_data() {
     let raw = text_doc();
-    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     // 그림을 넣었다 지워 참조 없는 BinData 를 남기고, 스크립트 스트림을 더한다
     client.insert_picture_native(0, 0, 0, &[], &PNG_1PX, 1000, 1000, 1, 1, "png", "그림", None, None).unwrap();
@@ -1186,7 +1186,7 @@ fn rewrite_state_drops_unknown_doc_info_records_the_canonical_does_not_have() {
     // 결정 (C): 파서가 해석하지 않아 모델이 날 바이트로 들고 있는 DocInfo 레코드(extra_records)에 끼운 것 — 모델에서 다시
     // 써도 남으므로(전제) 정본에 같은 내용으로 없던 것을 버린다. 정본에 있던 것은 그대로.
     let raw = text_doc();
-    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     client.document.doc_info.extra_records.push(crate::model::document::RawRecord { tag_id: 0x0fe, level: 0, data: MARKER.to_vec() });
     client.document.doc_info.raw_stream = None;
@@ -1251,7 +1251,7 @@ fn rewrite_state_drops_records_injected_into_the_section_tail() {
     // 결정 (C): 구역 끝 목록에 끼운 것 — (가) 메모 묶음 안, (나) 따로 선 목록(바탕쪽이 아닌 0×0 LIST_HEADER — 끝 목록의
     // 묶음은 늘 수준 1 LIST_HEADER·MEMO_LIST 로 시작한다). 둘 다 사라지고 메모는 그대로.
     let raw = memo_doc();
-    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     let inject = |front: bool| {
         let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
         let last = client.document.sections.len() - 1;
@@ -1288,7 +1288,7 @@ fn rewrite_state_rewrites_extension_master_pages_from_the_model() {
     // 그 구역의 원본 바탕쪽 묶음을 모두 버려 모델이 다시 쓴다(바탕쪽을 잃지 않는다). 다시 쓴 뒤에는 그 목록이 정본과 같아
     // 그대로 남는다.
     let raw = text_doc();
-    let canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
     client.create_master_page_native(0, r#"{"kind":"last"}"#).unwrap();
     let c = client.export_state().unwrap();
@@ -1299,7 +1299,7 @@ fn rewrite_state_rewrites_extension_master_pages_from_the_model() {
     assert_eq!(digest_of(&s), digest_of(&c));
     // 그 결과를 읽은 정본에서는 같은 끝 목록이 그대로 재사용된다
     let raw2 = super::unpack_state(&s).unwrap().into_owned();
-    let canon2 = CollabCore::new(DocumentCore::from_bytes(&raw2).unwrap());
+    let mut canon2 = CollabCore::new(DocumentCore::from_bytes(&raw2).unwrap());
     let mut client2 = CollabCore::new(DocumentCore::from_bytes(&raw2).unwrap());
     client2.insert_text_native(0, 0, 0, "더 ").unwrap();
     let c2 = client2.export_state().unwrap();
@@ -1334,4 +1334,184 @@ fn roundtrip_check_reports_records_only_the_cached_bytes_keep() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["irDiff"], 0, "모델에는 없던 레코드라 다시 읽은 모델은 같다");
     assert_eq!(v["lost"], serde_json::json!([{ "kind": "record", "count": 1, "detail": "0x3f0×1" }]));
+}
+
+// ── 6단계 결과 다시 쓰기 강화(규약 §8.1, collab-core/src/rewrite_raw.rs) ──────────────────────────
+
+/// 표·그림·글상자가 든 문서
+fn rich_doc() -> Vec<u8> {
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    let end = c.document.sections[0].paragraphs[0].text.chars().count();
+    c.create_table_native(0, 0, end, 2, 2).unwrap();
+    let last = c.document.sections[0].paragraphs.len() - 1;
+    c.insert_picture_native(0, last, 0, &[], &PNG_1PX, 1000, 1000, 1, 1, "png", "", None, None).unwrap();
+    let last = c.document.sections[0].paragraphs.len() - 1;
+    c.create_shape_control_native(0, last, 0, 4000, 2000, 0, 0, false, "Square", "textbox", false, false, &[]).unwrap();
+    super::unpack_state(&c.export_state().unwrap()).unwrap().into_owned()
+}
+
+/// (문단 번호, 컨트롤 번호) — 첫 번째로 `pick` 이 맞는 컨트롤
+fn find_ctrl(doc: &DocumentCore, pick: impl Fn(&crate::model::control::Control) -> bool) -> (usize, usize) {
+    for (p, para) in doc.document.sections[0].paragraphs.iter().enumerate() {
+        if let Some(i) = para.controls.iter().position(&pick) {
+            return (p, i);
+        }
+    }
+    panic!("컨트롤 없음");
+}
+
+/// 다시 읽은 바이트의 모든 구역·DocInfo 레코드 스트림에서 표지("EVIL-…")를 찾는다
+fn evil_marks(bytes: &[u8]) -> Vec<String> {
+    let doc = reread(bytes);
+    let mut streams: Vec<&Vec<u8>> = doc.document.sections.iter().filter_map(|s| s.raw_stream.as_ref()).collect();
+    streams.extend(doc.document.doc_info.raw_stream.as_ref());
+    let mut found = std::collections::BTreeSet::new();
+    for s in streams {
+        for (i, w) in s.windows(5).enumerate() {
+            if w == b"EVIL-" {
+                let tail = &s[i + 5..(i + 5 + 6).min(s.len())];
+                found.insert(String::from_utf8_lossy(tail).chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn evil(name: &str) -> Vec<u8> {
+    format!("EVIL-{name}").into_bytes()
+}
+
+#[test]
+fn hardened_rewrite_drops_bytes_injected_into_raw_fields_of_the_model() {
+    use crate::model::control::Control;
+    use crate::model::shape::ShapeObject;
+    let raw = rich_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let (tp, ti) = find_ctrl(&client, |c| matches!(c, Control::Table(_)));
+    let (pp, pi) = find_ctrl(&client, |c| matches!(c, Control::Picture(_)) || matches!(c, Control::Shape(s) if matches!(**s, ShapeObject::Picture(_))));
+    let (sp, si) = find_ctrl(&client, |c| matches!(c, Control::Shape(s) if matches!(**s, ShapeObject::Rectangle(_))));
+    {
+        let doc = &mut client.document;
+        doc.doc_info.raw_stream = None;
+        doc.doc_info.raw_provenance = None; // 항목별 봉인 없음 → 저장기가 항목 원본을 그대로 쓴다
+        doc.doc_info.char_shapes[0].raw_data.as_mut().unwrap().extend(evil("CHARS"));
+        let s0 = &mut doc.sections[0];
+        s0.raw_stream = None;
+        s0.section_def.raw_ctrl_extra.extend(evil("SECD"));
+        let paras = &mut s0.paragraphs;
+        for c in &mut paras[0].controls {
+            if let Control::SectionDef(sd) = c {
+                sd.raw_ctrl_extra.extend(evil("SECD"));
+            }
+        }
+        paras[1].raw_header_extra.extend(evil("PHEAD"));
+        paras[tp].ctrl_data_records[ti] = Some(evil("CTRLD"));
+        if let Control::Table(t) = &mut paras[tp].controls[ti] {
+            t.raw_ctrl_data.extend(evil("TBLHD"));
+            t.common.raw_extra.extend(evil("COMMON"));
+            t.raw_table_record_extra.extend(evil("TBLREC"));
+        }
+        let pic = match &mut paras[pp].controls[pi] {
+            Control::Picture(p) => p.as_mut(),
+            Control::Shape(s) => match s.as_mut() {
+                ShapeObject::Picture(p) => p.as_mut(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let mut extra = vec![0u8; 18];
+        extra.extend(evil("PICX"));
+        pic.raw_picture_extra = extra;
+        if let Control::Shape(s) = &mut paras[sp].controls[si] {
+            s.shape_attr_mut().raw_rendering = evil("RENDER");
+            if let Some(tb) = s.drawing_mut().and_then(|d| d.text_box.as_mut()) {
+                tb.raw_list_header_extra.extend(evil("TBOX"));
+            }
+        }
+    }
+    let c = client.export_state().unwrap();
+    let planted = evil_marks(&c);
+    // 저장기가 그대로 쓰는 자리 — 결과와 다시 읽은 모델에 남는다(전제). 표 머리(TBLHD)는 공통 꼬리를 바꿔 봉인이 어긋나
+    // 저장기가 `common` 으로 다시 쓰므로 실리지 않는다(그 길로는 공통 꼬리 COMMON 이 실린다).
+    for name in ["CHARS", "SECD", "PHEAD", "CTRLD", "COMMON", "TBLREC", "PIC", "RENDER", "TBOX"] {
+        assert!(planted.iter().any(|p| p.starts_with(name)), "{name} 이 결과에 실려야 한다(전제): {planted:?}");
+    }
+    let (s, changes) = canon.rewrite_state_report(&c).unwrap();
+    assert_eq!(evil_marks(&s), Vec::<String>::new(), "다시 쓴 결과에는 하나도 없다 (바꾼 자리 {changes:?})");
+    // 내용(글자·표·그림·도형)은 그대로
+    let out = reread(&s);
+    assert_eq!(texts(&out), texts(&reread(&c)));
+    let kinds = |d: &DocumentCore| d.document.sections[0].paragraphs.iter().flat_map(|p| p.controls.iter().map(|c| std::mem::discriminant(c))).count();
+    assert_eq!(kinds(&out), kinds(&reread(&c)));
+    // 문단 머리 꼬리는 사양 길이(12)로 잘린다 — 앞 12바이트는 그대로
+    let before = &reread(&c).document.sections[0].paragraphs[1].raw_header_extra;
+    let after = &out.document.sections[0].paragraphs[1].raw_header_extra;
+    assert!(after.len() == 10 || after.len() == 12, "{}", after.len());
+    assert_eq!(&before[..after.len()], &after[..]);
+}
+
+#[test]
+fn hardened_rewrite_keeps_raw_fields_the_canonical_has_and_well_formed_numbers() {
+    // 끼운 것 없는 결과(다른 구역 편집): 정본의 날 바이트·사양 모양의 숫자 자리는 그대로 남는다
+    use crate::model::control::Control;
+    let raw = rich_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    client.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let c = client.export_state().unwrap();
+    let (s, changes) = canon.rewrite_state_report(&c).unwrap();
+    let (cin, sout) = (reread(&c), reread(&s));
+    let renderings = |d: &DocumentCore| {
+        d.document.sections[0].paragraphs.iter().flat_map(|p| p.controls.iter()).filter_map(|c| match c {
+            Control::Shape(s) => Some(s.clone().shape_attr_mut().raw_rendering.clone()),
+            _ => None,
+        }).collect::<Vec<_>>()
+    };
+    assert!(renderings(&cin).iter().all(|r| !r.is_empty()), "도형 렌더링 행렬이 있다(전제)");
+    assert_eq!(renderings(&sout), renderings(&cin), "사양 모양의 렌더링 행렬은 그대로");
+    let heads = |d: &DocumentCore| d.document.sections[0].paragraphs.iter().map(|p| p.raw_header_extra.clone()).collect::<Vec<_>>();
+    assert_eq!(heads(&sout), heads(&cin), "문단 머리 꼬리(10·12바이트)는 그대로");
+    assert!(changes.is_empty(), "정본 것만 있으면 바꾸지 않는다: {changes:?}");
+    assert_eq!(digest_of(&s), digest_of(&c));
+}
+
+#[test]
+fn hardened_rewrite_remembers_raw_bytes_the_canonical_saw_before_an_op_removed_them() {
+    // 결정 2: 되돌리기 계열 state 가 지금 정본에 없는 옛 날 바이트를 되살려도 잃지 않는다 — 정본을 열 때부터 모은 기록.
+    use crate::model::control::Control;
+    let raw = {
+        // 표 컨트롤에 한컴이 둔 듯한 CTRL_DATA(모델에서 다시 만들 수 없는 자리)
+        let mut c = CollabCore::new(DocumentCore::from_bytes(&rich_doc()).unwrap());
+        let (tp, ti) = find_ctrl(&c, |c| matches!(c, Control::Table(_)));
+        c.document.sections[0].paragraphs[tp].ctrl_data_records[ti] = Some(b"\x1b\x02\x01\x00\x00\x00PARAMSET-FROM-HANCOM".to_vec());
+        c.document.sections[0].raw_stream = None;
+        super::unpack_state(&c.export_state().unwrap()).unwrap().into_owned()
+    };
+    let restored = super::pack_state(&raw).unwrap(); // 표를 지운 뒤 되살린 결과(옛 문서 그대로)
+    let has_param = |bytes: &[u8]| {
+        let d = reread(bytes);
+        d.document.sections[0].paragraphs.iter().flat_map(|p| p.ctrl_data_records.iter().flatten()).any(|b| b.ends_with(b"PARAMSET-FROM-HANCOM"))
+    };
+    assert!(has_param(&restored), "전제");
+    let delete_table = |c: &mut CollabCore| {
+        let (tp, ti) = find_ctrl(c, |c| matches!(c, Control::Table(_)));
+        c.delete_table_control_native(0, tp, ti).unwrap();
+    };
+    // 정본이 열 때부터 모았으면: 표를 지운 op 뒤에도 그 바이트를 안다
+    let mut tracked = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    tracked.track_raw_seen();
+    delete_table(&mut tracked);
+    assert!(has_param(&tracked.rewrite_state(&restored).unwrap()), "열 때부터 모은 정본은 되살린 바이트를 남긴다");
+    // 모으기 전에 지워졌으면(지금 정본에만 견주면) 버린다 — 기록이 하는 일
+    let mut late = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    delete_table(&mut late);
+    assert!(!has_param(&late.rewrite_state(&restored).unwrap()));
+    // 결과를 읽을 때도 모은다: 지운 문서를 결과로 읽은 뒤에도 그 전 문서의 바이트를 안다
+    let mut via_state = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    via_state.track_raw_seen();
+    let mut deleted = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    delete_table(&mut deleted);
+    via_state.load_state(&deleted.export_state().unwrap()).unwrap();
+    assert!(has_param(&via_state.rewrite_state(&restored).unwrap()));
 }

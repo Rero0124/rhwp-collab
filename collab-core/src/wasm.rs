@@ -126,8 +126,15 @@ impl HwpDocument {
     /// 6단계 S1(서버 정본): 받은 결과 C(gzip)를 바뀐 부분만 모델에서 다시 쓴 바이트 S(gzip)로 바꾼다. 이 문서(정본)는
     /// 바꾸지 않는다 — 부른 쪽이 S 를 `collabLoadState` 로 읽는다.
     #[wasm_bindgen(js_name = collabRewriteState)]
-    pub fn collab_rewrite_state(&self, state: &[u8]) -> Result<Vec<u8>, JsValue> {
+    pub fn collab_rewrite_state(&mut self, state: &[u8]) -> Result<Vec<u8>, JsValue> {
         self.rewrite_state(state).map_err(js_err)
+    }
+
+    /// 6단계 결과 다시 쓰기 강화(결정 2, 서버 정본): 이 문서를 정본으로 쓴다 — 지금 날 바이트를 모으고 이후 결과를 읽을
+    /// 때마다 더 모은다. 정본 워커가 문서를 열자마자(기록 재생 전) 부른다. 여러 번 불러도 된다.
+    #[wasm_bindgen(js_name = collabTrackRawSeen)]
+    pub fn collab_track_raw_seen(&mut self) {
+        self.track_raw_seen();
     }
 
     /// 6단계 S2(서버 정본, 방을 열 때 한 번): 원본 바이트 캐시를 모두 버리고 모델에서만 쓴 결과를 지금 저장본과 견준다.

@@ -90,6 +90,34 @@ function createRoom(name) {
 }
 
 export const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+/** 문서 암호의 길이 상한(글자 수 — 인코딩을 푼 뒤) */
+const MAX_DOCUMENT_PASSWORD = 256;
+/**
+ * 요청 머리의 문서 암호(5단계 D5 방 만들기·7단계 C 내려받기). HTTP 머리에는 Latin-1 밖 문자(한글 등)를 실을 수 없으므로
+ * `X-Collab-Document-Password-Encoding: uri` 가 있으면 값을 UTF-8 퍼센트 인코딩으로 보고 푼다. 그 머리가 없으면 날 값 그대로
+ * (옛 클라이언트, '%' 가 든 ASCII 암호와 헷갈리지 않게). 없거나 빈 값이면 null. 잘못된 인코딩·모르는 인코딩 이름·너무 긴
+ * 암호는 400 bad-password. 암호는 저장하지도 기록하지도 않는다.
+ */
+function documentPassword(req) {
+  const raw = req.headers['x-collab-document-password'];
+  if (typeof raw !== 'string' || raw === '') return null;
+  const encoding = req.headers['x-collab-document-password-encoding'];
+  let value = raw;
+  if (encoding !== undefined) {
+    if (String(encoding).trim().toLowerCase() !== 'uri') {
+      throw new HttpError(400, 'bad-password', '모르는 문서 암호 인코딩이다(X-Collab-Document-Password-Encoding 은 uri 만)', { reason: 'bad-password' });
+    }
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      throw new HttpError(400, 'bad-password', '문서 암호의 퍼센트 인코딩이 잘못됐다', { reason: 'bad-password' });
+    }
+  }
+  if ([...value].length > MAX_DOCUMENT_PASSWORD) {
+    throw new HttpError(400, 'bad-password', `문서 암호가 너무 길다(${MAX_DOCUMENT_PASSWORD}자까지)`, { reason: 'bad-password' });
+  }
+  return value === '' ? null : value;
+}
 
 /**
  * 6단계 S2: 왕복 점검 결과를 방 메타·응답·welcome 에 실을 모양으로 — {ok, lost: [{kind, count, detail}], irDiff}.
@@ -187,6 +215,8 @@ export function startServer({
   allowEncrypted = process.env.COLLAB_ALLOW_ENCRYPTED === '1',
   // 6단계 S2: 파일로 방을 만들 때 왕복 점검 — warn(결과를 알림) | block(통과하지 못하면 422) | off
   roundtripMode = process.env.COLLAB_ROUNDTRIP || 'warn',
+  /** 7단계 C: 원래 암호 문서였던 방(encryptedSource)의 내려받기 — require(암호를 걸어서만) | optional */
+  encryptedDownload = process.env.COLLAB_ENCRYPTED_DOWNLOAD || 'require',
   /** 6단계 S2: 왕복 점검 시간 상한(ms). 넘으면 점검 워커를 버리고 {ok: null, reason: 'timeout'} */
   roundtripTimeoutMs = Number(process.env.COLLAB_ROUNDTRIP_TIMEOUT_MS ?? 15_000),
   /** 7단계 B: 왕복 점검 다음에 배치 점검(모델에서 다시 쓴 뒤 쪽 수·문단·개체 위치가 같은가)도 할지 — on | off(기본). 같은 시간 상한 안에서 */
@@ -210,6 +240,7 @@ export function startServer({
   if (!['warn', 'block', 'off'].includes(roundtripMode)) throw new Error(`COLLAB_ROUNDTRIP 은 warn | block | off 중 하나다 (지금 ${roundtripMode})`);
   if (!(Number.isFinite(roundtripTimeoutMs) && roundtripTimeoutMs > 0)) throw new Error(`COLLAB_ROUNDTRIP_TIMEOUT_MS 는 양수(ms)다 (지금 ${roundtripTimeoutMs})`);
   if (!['on', 'off'].includes(roundtripLayout)) throw new Error(`COLLAB_ROUNDTRIP_LAYOUT 은 on | off 중 하나다 (지금 ${roundtripLayout})`);
+  if (!['require', 'optional'].includes(encryptedDownload)) throw new Error(`COLLAB_ENCRYPTED_DOWNLOAD 는 require | optional 중 하나다 (지금 ${encryptedDownload})`);
   if (allowEncrypted) log('경고: COLLAB_ALLOW_ENCRYPTED=1 — 암호 문서로 방을 열면 암호가 풀린 상태로 서버 디스크·모든 참여자·내려받은 파일에 남는다');
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map();
@@ -888,8 +919,14 @@ export function startServer({
         return new HttpError(status, reason, message, { reason, ...extra });
       };
       if (!allowEncrypted) throw await fail(400, 'encrypted', '암호가 걸린 문서는 공동편집할 수 없다(서버 설정 COLLAB_ALLOW_ENCRYPTED)', { allowed: false });
-      const password = req.headers['x-collab-document-password'];
-      if (typeof password !== 'string' || !password) throw await fail(400, 'encrypted', '암호가 걸린 문서다 — X-Collab-Document-Password 로 문서 암호를 준다', { allowed: true });
+      let password;
+      try {
+        password = documentPassword(req);
+      } catch (error) {
+        if (error instanceof HttpError) throw await fail(400, 'bad-password', error.message, { allowed: true });
+        throw error;
+      }
+      if (password === null) throw await fail(400, 'encrypted', '암호가 걸린 문서다 — X-Collab-Document-Password 로 문서 암호를 준다', { allowed: true });
       const dec = await room.canonical.decrypt(raw, password);
       if (!dec.ok) throw await fail(400, dec.wrongPassword ? 'wrong-password' : 'encrypted', dec.wrongPassword ? '문서 암호가 맞지 않다' : `암호 문서를 열지 못했다: ${dec.reason}`, { allowed: true });
       packed = dec.data;
@@ -932,12 +969,16 @@ export function startServer({
     scheduleUnload(room);
     log(`[${name}] 방 생성(파일 ${raw.length}B, ${formatOf(raw)})${user.sub ? ` by ${user.sub}` : ''} 정본 ${res.digest.slice(0, 12)}${store ? ' (저장)' : ''}${room.encryptedSource ? ' — 경고: 원래 암호 문서, 암호 없이 보관' : ''}`);
     if (roundtripLater) room.roundtripCheck = roundtripInBackground(room, packed);
-    return { room: name, ...makeInvites(name), ...(roundtripLater ? { roundtrip: { pending: true } } : room.roundtrip ? { roundtrip: room.roundtrip } : {}) };
+    return { room: name, ...makeInvites(name), ...(roundtripLater ? { roundtrip: { pending: true } } : room.roundtrip ? { roundtrip: room.roundtrip } : {}),
+      // 7단계 C: 원래 암호 문서였던 방 — 업로드 페이지가 내려받기에 암호 칸을 보인다
+      ...(room.encryptedSource ? { encryptedSource: true } : {}) };
   };
 
   /** GET /rooms/{room}/document: 정본을 내보낸 최신 문서(원본 형식). 메모리에 없으면 저장소에서 연다. */
   const downloadDocument = async (req, name) => {
     await authorizeHttp(req, name, JOIN_SCOPES);
+    // 7단계 C: 요청 머리의 문서 암호 — 있으면 정본을 원본 형식 계열로 암호를 걸어 내보낸다. 저장하지도 기록하지도 않는다.
+    const password = documentPassword(req);
     let room = rooms.get(name);
     if (!room) {
       if (!(await storeHas(name))) throw new HttpError(404, 'no-room', '없는 방');
@@ -948,6 +989,17 @@ export function startServer({
     await enqueue(room, async () => {
       if (room.broken) { out = new HttpError(409, 'broken', `이 방을 열 수 없다: ${room.broken}`); return; }
       if (room.base === null) { out = new HttpError(404, 'no-document', '아직 문서가 없다'); return; }
+      // 원래 암호 문서였던 방: 작성자가 건 보호를 내려받을 때라도 되살린다(COLLAB_ENCRYPTED_DOWNLOAD=require 가 기본)
+      if (room.encryptedSource && password === null && encryptedDownload === 'require') {
+        out = new HttpError(403, 'password-required', '원래 암호 문서였던 방이라 암호를 걸어서만 내려받는다 — X-Collab-Document-Password 로 걸 암호를 준다(COLLAB_ENCRYPTED_DOWNLOAD=require)', { reason: 'password-required' });
+        return;
+      }
+      if (password !== null) {
+        const ex = await room.canonical.exportEncrypted(password);
+        if (!ex.ok) { out = new HttpError(500, 'export-failed', `암호를 걸어 내보내지 못했다: ${ex.reason}`); return; }
+        out = { raw: Buffer.from(ex.data, 'base64'), seq: room.seq, format: ex.format, encrypted: true };
+        return;
+      }
       const ex = await room.canonical.export();
       if (!ex.ok) { out = new HttpError(500, 'export-failed', `내보내지 못했다: ${ex.reason}`); return; }
       out = { raw: gunzipSync(Buffer.from(ex.data, 'base64')), seq: room.seq };
@@ -955,8 +1007,8 @@ export function startServer({
     if (room.clients.size === 0 && room.waiting.length === 0) scheduleUnload(room);
     if (out === null) throw new HttpError(500, 'export-failed', '내보내지 못했다');
     if (out instanceof HttpError) throw out;
-    log(`[${name}] 문서 내려받기 seq ${out.seq} (${out.raw.length}B)`);
-    return { ...out, format: formatOf(out.raw) };
+    log(`[${name}] 문서 내려받기 seq ${out.seq} (${out.raw.length}B${out.encrypted ? ', 암호를 걸어' : ''})`);
+    return { ...out, format: out.format ?? formatOf(out.raw) };
   };
 
   /** Origin 확인: 목록이 없으면 통과. 같은 출처(Origin 의 호스트 = Host 헤더)와 Origin 이 없는 요청(브라우저 밖)도 통과. */

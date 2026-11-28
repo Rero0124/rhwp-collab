@@ -271,16 +271,20 @@ export class Server {
         const hinted = entries.some((e) => e.kind === 'state' && e.range);
         if ((this.rewriteState || hinted) && entries.some((e) => e.kind === 'state')) {
           // 묶음의 앞 연산까지 적용한 정본과 비교해야 하므로 하나씩 적용하며 state 를 바꾼다(canonical-worker 와 같은 순서:
-          // 적용 전 정본으로 S 를 만들고 → 범위 표시면 C 를 읽어 범위 밖 확인 → S 를 읽음)
+          // 적용 전 정본으로 S 를 만들고 → S 를 읽음 → 범위 표시면 S 를 읽은 정본이 범위 밖 그대로인지 확인)
           entries = structuredClone(entries);
           for (const e of entries) {
             if (e.kind === 'state') {
               const S = this.rewriteState ? doc.collabRewriteState(base64ToBytes(e.data)) : null;
+              if (S) {
+                e.data = bytesToBase64(S);
+                this.rewrites += 1;
+              }
               if (e.range) {
                 this.rangeChecks += 1;
                 const pre = doc.collabSnapshotSave();
                 try {
-                  doc.collabLoadState(base64ToBytes(e.data));
+                  engine.replay([e]);
                   const v = JSON.parse(doc.collabCheckRangeHint(pre, JSON.stringify(e.range)));
                   if (v.ok !== true) {
                     this.rangeRejects += 1;
@@ -289,10 +293,7 @@ export class Server {
                 } finally {
                   doc.collabSnapshotDiscard(pre);
                 }
-              }
-              if (S) {
-                e.data = bytesToBase64(S);
-                this.rewrites += 1;
+                continue;
               }
             }
             engine.replay([e]);

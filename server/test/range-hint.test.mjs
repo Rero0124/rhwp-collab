@@ -8,7 +8,7 @@ import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import { WebSocket } from 'ws';
 import { startServer } from '../server.mjs';
@@ -17,6 +17,7 @@ import { LocalDocStore } from '../doc-store.mjs';
 import { hs256Auth } from '../auth.mjs';
 import { CollabEngine } from '../../collab-client/src/engine/engine.ts';
 import { ENGINE_FINGERPRINT } from '../../collab-client/src/engine/catalog.ts';
+import { hasEvil, injectEvil } from './support/hwp-forge.mjs';
 
 const wasm = await import(pathToFileURL(`${DEFAULT_PKG}/rhwp.js`).href);
 wasm.initSync({ module: readFileSync(`${DEFAULT_PKG}/rhwp_bg.wasm`) });
@@ -161,4 +162,39 @@ test('범위 표시 모양이 틀리면(다른 키·0 문단) 형식 오류로 �
     assert.match(res.reason, /range 형식/);
   }
   X.close();
+});
+
+test('7단계 A: 범위 밖(구역 끝)에 모르는 레코드를 끼운 C 에 참인 범위 표시 — S 에서 걸러진 뒤 확인을 지나고, ack·방송·다른 참여자에 그 바이트가 없다', { skip: !(SUPPORTED && typeof wasm.HwpDocument.prototype.collabStateRangeHint === 'function') && '범위 표시 보조가 없는 빌드' }, async () => {
+  const { room } = await makeRoom();
+  const W = await client(room, 'W');
+  const E = await client(room, 'E');
+  // 보낸 쪽이 실제로 다는 표시: 문단 1 에 덧말(분류표 state) → {lo:1, before:1, after:1}. 끼울 자리가 생길 때까지 글 길이를 바꾼다
+  let forged = null;
+  let range = null;
+  for (let n = 1; n < 64 && !forged; n += 1) {
+    const d = new wasm.HwpDocument(gunzipSync(Buffer.from(E.doc.collabExportState())));
+    const pre = d.collabSnapshotSave();
+    d.insertRuby(0, 1, 0, JSON.stringify({ mainText: '漢'.repeat(n), rubyText: '한', below: false, styleId: null }));
+    const hint = JSON.parse(d.collabStateRangeHint(pre));
+    d.collabSnapshotDiscard(pre);
+    if (typeof hint.recipe === 'number') d.collabUndoRecipeDiscard(hint.recipe);
+    range = hint.range;
+    forged = injectEvil(Buffer.from(gunzipSync(Buffer.from(d.collabExportState()))));
+    d.free();
+  }
+  assert.ok(forged && hasEvil(forged), '레코드를 끼움');
+  assert.deepEqual(range, { section: 0, lo: 1, before: 1, after: 1 });
+  const ack = await E.ops([{ kind: 'state', data: gzipSync(forged).toString('base64'), range }]);
+  assert.equal(ack.type, 'ops', JSON.stringify(ack).slice(0, 200));
+  assert.equal(ack.replaced, true);
+  assert.deepEqual(ack.entries[0].range, range, '범위 표시는 남는다');
+  const stateBytes = (e) => gunzipSync(Buffer.from(e.data, 'base64'));
+  assert.equal(hasEvil(stateBytes(ack.entries[0])), false, '보낸 쪽이 받은 S');
+  const got = await W.next();
+  assert.equal(hasEvil(stateBytes(got.entries[0])), false, '방송된 바이트');
+  assert.deepEqual(got.entries[0].range, range);
+  W.apply(got);
+  assert.equal(hasEvil(gunzipSync(Buffer.from(W.doc.collabExportState()))), false, '다른 참여자가 내보낸 바이트');
+  assert.equal(W.doc.collabDigest(), await canonicalDigest(room));
+  W.close(); E.close();
 });

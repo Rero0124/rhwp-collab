@@ -74,15 +74,17 @@ class RangeHintError extends Error {
 }
 
 /**
- * 4단계 U3: 범위 표시가 붙은 state 바이트 C 를 지금 정본에 읽고, 적용 전 스냅샷과 견주어 그 범위 밖이 그대로인지 확인한다.
- * 범위 표시가 거짓이면 다른 참여자의 미확정을 잘못 보정하게 된다(받는 쪽은 그 state 를 그 범위의 구조 편집으로 보고 범위
- * 밖 미확정을 번호만 옮겨 살린다). 확인 뒤 정본은 C 를 읽은 상태다 — 부른 쪽이 이어서 S 를 읽는다.
+ * 4단계 U3: 범위 표시가 붙은 state 를 읽는다 — 적용 전 스냅샷을 뜨고, 다시 쓴 S(없으면 받은 C)를 읽은 뒤 그 문서가 스냅샷에서
+ * 그 범위 밖이 그대로인지 확인한다. 범위 표시가 거짓이면 다른 참여자의 미확정을 잘못 보정하게 된다(받는 쪽은 그 state 를 그
+ * 범위의 구조 편집으로 보고 범위 밖 미확정을 번호만 옮겨 살린다). 7단계 A: 확인은 C 가 아니라 **S 를 읽은 문서**로 한다 —
+ * 받는 쪽이 모두 읽는 것이 S 이고(표시가 S 위에서 참이어야 한다), 정상 클라이언트는 S 와 C 의 모델이 같으며, 끼운 날 바이트가
+ * 있는 C 는 S 에서 이미 걸러졌다. C 를 따로 읽던 한 번이 빠진다. 거짓이면 던진다(부른 쪽이 묶음 스냅샷으로 되돌린다).
  */
-function checkRangeHint(e) {
+function loadHinted(e, bytes) {
   if (typeof doc.collabCheckRangeHint !== 'function') throw new RangeHintError('collabCheckRangeHint 가 없다');
   const pre = doc.collabSnapshotSave();
   try {
-    doc.collabLoadState(b64ToBytes(e.data));
+    doc.collabLoadState(bytes);
     const res = JSON.parse(doc.collabCheckRangeHint(pre, JSON.stringify(e.range)));
     if (res.ok !== true) throw new RangeHintError(String(res.detail ?? res.reason ?? ''));
   } finally {
@@ -221,12 +223,13 @@ parentPort.on('message', ({ id, op, ...p }) => {
           const hinted = p.entries.some((e) => e?.kind === 'state' && e.range);
           if ((rewriteSupported() || hinted) && p.entries.some((e) => e?.kind === 'state')) {
             // S1: 하나씩 적용하며 state 는 다시 쓴 S 로 읽는다 — 뒤의 op 는 R(S) 위에 얹힌다(다른 참여자도 S 위에 얹는다).
-            // U3: 범위 표시가 있으면 S 를 만든 뒤(적용 전 정본 기준) C 를 읽어 범위 밖이 그대로인지 확인하고 S 를 읽는다.
+            // U3·7단계 A: 범위 표시가 있으면 S 를 만든 뒤(적용 전 정본 기준) S 를 읽고, 그 문서가 범위 밖이 그대로인지 확인한다.
             p.entries.forEach((e, index) => {
               if (e?.kind !== 'state') return engine.replay([e]);
               const S = rewriteState(e.data);
-              if (e.range) checkRangeHint(e);
-              doc.collabLoadState(S ?? b64ToBytes(e.data));
+              const bytes = S ?? b64ToBytes(e.data);
+              if (e.range) loadHinted(e, bytes);
+              else doc.collabLoadState(bytes);
               if (S) replaced.push({ index, data: Buffer.from(S).toString('base64') });
             });
           } else if (owner !== null && p.entries.some((e) => OWNED_MEMO_OPS.has(e?.m))) {

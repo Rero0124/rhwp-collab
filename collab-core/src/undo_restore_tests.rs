@@ -444,12 +444,12 @@ fn docinfo_item_bytes_are_stable_across_repeated_state_reloads() {
 /// 서버 정본 흐름(canonical-worker 와 같은 순서): 적용 전 스냅샷 → S = 다시 쓰기(적용 전 정본 기준) → C 읽기 → 범위 표시 확인
 /// → S 읽기. 확인 결과를 돌려준다.
 fn canonical_apply_hinted(canon: &mut CollabCore, c_bytes: &[u8], hint: &Value) -> Value {
+    // 정본 흐름(7단계 A): 스냅샷 → S = rewrite(C) → S 읽기 → S 를 읽은 문서로 범위 확인
     let pre = canon.snapshot_save();
     let s_bytes = canon.rewrite_state(c_bytes).unwrap();
-    canon.load_state(c_bytes).unwrap();
+    canon.load_state(&s_bytes).unwrap();
     let v = canon.check_range_hint(pre, hint).unwrap();
     canon.snapshot_discard(pre);
-    canon.load_state(&s_bytes).unwrap();
     v
 }
 
@@ -710,4 +710,23 @@ fn state_range_hint_refuses_changed_or_added_bin_data() {
     // 그림이 그대로면 표시
     let v = hint_after(&mut c, |c| { c.insert_text_native(0, 1, 0, "z").unwrap(); });
     assert_eq!(v["range"], json!({ "section": 0, "lo": 1, "before": 1, "after": 1 }), "{v}");
+}
+
+#[test]
+fn canonical_flow_checks_the_hint_on_the_rewritten_bytes() {
+    // 7단계 A 정본 흐름(스냅샷 → S = rewrite(C) → S 읽기 → 확인): 참인 표시는 지나고, 거짓 표시·범위 밖을 몰래 고친 state 는
+    // S 를 읽은 문서에서도 걸린다
+    let (mut canon, c_bytes, hint) = server_case();
+    let start = canon.snapshot_save();
+    assert_eq!(canonical_apply_hinted(&mut canon, &c_bytes, &hint), json!({ "ok": true }));
+    canon.snapshot_restore(start).unwrap();
+    let lo = hint["lo"].as_u64().unwrap();
+    let bad = json!({ "section": 0, "lo": lo + 2, "before": hint["before"], "after": hint["after"] });
+    assert_eq!(canonical_apply_hinted(&mut canon, &c_bytes, &bad)["reason"], json!("range"));
+    canon.snapshot_restore(start).unwrap();
+    let mut sneaky = CollabCore::new(blank());
+    sneaky.load_state(&c_bytes).unwrap();
+    sneaky.insert_text_native(0, 0, 0, "몰래").unwrap();
+    assert_eq!(canonical_apply_hinted(&mut canon, &sneaky.export_state().unwrap(), &hint)["reason"], json!("range"));
+    canon.snapshot_discard(start);
 }

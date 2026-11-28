@@ -5,10 +5,17 @@
  */
 
 export interface RoundtripLost { kind: string; count: number; detail?: string }
-export interface RoundtripResult { ok: boolean; lost: RoundtripLost[]; irDiff: number }
+/** ok: true 통과 · false 경고 · null 점검 못 함(reason: 'timeout' 시간 상한을 넘음 · 'error' 점검 워커 실패) */
+export interface RoundtripResult { ok: boolean | null; lost: RoundtripLost[]; irDiff: number; reason?: string }
+/** POST /rooms 응답(warn): 점검이 뒤에서 도는 중 — 결과는 방에 들어가면 welcome·roundtrip 알림으로 온다 */
+export interface RoundtripPending { pending: true }
+export const isRoundtripPending = (rt: unknown): rt is RoundtripPending => (rt as { pending?: unknown } | null)?.pending === true;
 
 export const ROUNDTRIP_OK_TEXT = 'rhwp 가 이 문서를 그대로 다룰 수 있습니다';
 export const ROUNDTRIP_EDIT_WARNING = '이 부분이 있는 쪽을 편집하면 사라질 수 있습니다';
+export const ROUNDTRIP_PENDING_TEXT = 'rhwp 가 이 문서를 다룰 수 있는지 점검하고 있습니다. 결과는 방에 들어가면 보입니다';
+const UNKNOWN_REASON: Record<string, string> = { timeout: '시간 초과', error: '오류' };
+const unknownReason = (rt: RoundtripResult) => UNKNOWN_REASON[rt.reason ?? ''] ?? rt.reason ?? '알 수 없음';
 
 /**
  * 점검이 알려 주는 종류(collab-core `roundtrip_check`)의 이름. 모르는 종류는 그대로 보인다.
@@ -34,12 +41,14 @@ export function roundtripLostText(rt: RoundtripResult): string {
 /** 방을 만든 사람에게 보이는 결과 문구 */
 export function roundtripText(rt: RoundtripResult): string {
   if (rt.ok) return ROUNDTRIP_OK_TEXT;
+  if (rt.ok === null) return `왕복 점검 못 함(${unknownReason(rt)}) — rhwp 가 이 문서의 모든 부분을 다룰 수 있는지 확인하지 못했습니다. ${ROUNDTRIP_EDIT_WARNING}`;
   const lost = roundtripLostText(rt);
   return `이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다${lost ? `: ${lost}` : ''}. ${ROUNDTRIP_EDIT_WARNING}`;
 }
 
 /** COLLAB_ROUNDTRIP=block 서버가 방을 만들지 않았을 때 */
 export function roundtripBlockedText(rt: RoundtripResult | null | undefined): string {
+  if (rt?.ok === null) return `왕복 점검을 끝내지 못해(${unknownReason(rt)}) 방을 만들지 않았습니다`;
   const lost = rt ? roundtripLostText(rt) : '';
   return `rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다${lost ? `: ${lost}` : ''}`;
 }

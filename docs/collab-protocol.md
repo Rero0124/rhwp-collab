@@ -152,7 +152,7 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 
 | `type` | 필드 | 설명 |
 |---|---|---|
-| `welcome` | `seq`, `base`, `log`, `maxMessageBytes`, `generation?`, `user?`, `resync?`, `encryptedSource?`, `allowEncrypted?`, `roundtrip?` | 방에 들어옴. `base` = 기준점(gzip 바이트의 base64) 또는 `null`(첫 참여자 — `base` 를 보내야 함). `log` = 기준점 뒤 묶음들. `generation` 은 0 이면 없다. `user` 는 인증을 켠 서버만 `{sub, name, scope}`. `encryptedSource: true` 는 원래 암호 문서였던 방(참여자에게 한 번 알린다), `roundtrip` 은 방을 열 때의 왕복 점검에 경고가 있던 방의 요약(§5 — 참여자에게 한 번 알린다), `allowEncrypted: true` 는 `base: null` 일 때 서버가 암호 문서를 받는다는 뜻(§4.1). 기록이 길면 나눠 보낸다(아래) |
+| `welcome` | `seq`, `base`, `log`, `maxMessageBytes`, `generation?`, `user?`, `resync?`, `encryptedSource?`, `allowEncrypted?`, `roundtrip?` | 방에 들어옴. `base` = 기준점(gzip 바이트의 base64) 또는 `null`(첫 참여자 — `base` 를 보내야 함). `log` = 기준점 뒤 묶음들. `generation` 은 0 이면 없다. `user` 는 인증을 켠 서버만 `{sub, name, scope}`. `encryptedSource: true` 는 원래 암호 문서였던 방(참여자에게 한 번 알린다), `roundtrip` 은 방을 열 때의 왕복 점검이 통과가 아니던(경고 또는 점검 못 함) 방의 결과(§5 — 참여자에게 한 번 알린다), `allowEncrypted: true` 는 `base: null` 일 때 서버가 암호 문서를 받는다는 뜻(§4.1). 기록이 길면 나눠 보낸다(아래) |
 | `catchup` | `seq`, `log`, `maxMessageBytes`, `user?`, `cont?` | 다시 붙은 참여자에게 끊긴 동안의 묶음만(§4.6). `cont: true` 는 나눠 보낸 `welcome` 의 이어지는 조각 |
 | `ops` | `seq`, `clientId`, `entries`, `batchId?`, `sub?`, `replaced?` | 확정된 묶음. 모두에게 보낸다. 보낸 사람에게는 확정(ack)이다. `replaced: true` 면 서버가 묶음 안의 `state` 를 다시 쓴 바이트로 바꿨다(§4.2) |
 | `reject` | `seq`, `batchId?` | 묶음의 `base` 가 서버 seq 와 다르다. 보낸 사람에게만 |
@@ -164,6 +164,7 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 | `diverged` | `seq` | 그 seq 의 digest 가 정본과 다르다(정본이 없는 서버는 처음 보고와 다르면 방 전체에) |
 | `cursor` | `clientId`, `name`, `seq`, `caret` | 다른 참여자의 캐럿. `name` 은 서버가 정한 표시 이름 |
 | `cursor-leave` | `clientId` | 참여자가 나감 |
+| `roundtrip` | `roundtrip` | 방을 연 뒤 뒤에서 끝난 왕복 점검이 통과가 아니다(경고 `ok: false` 또는 점검 못 함 `ok: null`, §5). 그때 방에 있던 참여자에게 한 번. 그 뒤 들어오는 참여자는 `welcome.roundtrip` 으로 받는다 |
 | `error` | `error` | 규약 위반(형식이 틀림, hello 전 메시지 등). 연결은 둔다 |
 
 **`welcome` 나눠 보내기:** 기준점 + 기록이 상한을 넘으면 첫 조각은 `welcome`(그 `seq` 는 첫 조각의 마지막 seq), 나머지는
@@ -325,11 +326,18 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
   기록하지 않는다.
 - **왕복 점검(6단계 S2):** rhwp 는 저장할 때 손대지 않은 부분의 원본 바이트를 그대로 쓴다. 그래서 "저장 후 비교"는 rhwp 가
   모르는 기능이 있어도 통과하고, 문제는 그 부분을 편집해 모델에서 다시 쓸 때 생긴다. 서버는 방을 만들 때 정본으로 **모든
-  부분을 모델에서 다시 쓴 결과**를 원본과 한 번 견주고(`collabRoundtripCheck`), 결과 `roundtrip: {ok, lost: [{kind, count,
-  detail?}], irDiff}` 를 응답과 방 메타에 싣는다. `ok: false` 면 그 방의 `welcome` 에도 요약을 실어 참여자가 처음 들어올 때
-  한 번 알린다("이 부분이 있는 쪽을 편집하면 사라질 수 있습니다"). 서버 설정 `COLLAB_ROUNDTRIP`: `warn`(기본 — 알리고 방은
-  만든다) | `block`(통과하지 못하면 방을 만들지 않는다 — `422 {error: "roundtrip", reason: "roundtrip", roundtrip}`) |
-  `off`. 점검 보조가 없는 서버는 점검하지 않고 `roundtrip` 을 싣지 않는다.
+  부분을 모델에서 다시 쓴 결과**를 원본과 한 번 견준다(`collabRoundtripCheck`). 결과는 `roundtrip: {ok, lost: [{kind, count,
+  detail?}], irDiff, reason?}` — `ok: true` 통과, `false` 경고, `null` 점검 못 함(`reason: "timeout"` 시간 상한을 넘음,
+  `"error"` 점검 워커 실패). 통과가 아니면 그 방의 `welcome` 에 결과를 실어 참여자가 처음 들어올 때 한 번 알린다("이 부분이
+  있는 쪽을 편집하면 사라질 수 있습니다").
+  - 점검은 방의 정본 워커가 아닌 **따로 둔 워커**에서 돈다(큰 표 문서는 수십 초 걸린다 — 그동안 정본 편집이 멈추지 않게).
+    열기 + 점검에 시간 상한 `COLLAB_ROUNDTRIP_TIMEOUT_MS`(기본 15000)를 두고, 넘으면 그 워커를 버린다.
+  - `COLLAB_ROUNDTRIP=warn`(기본): 응답을 점검 때문에 붙잡지 않는다. 방을 먼저 만들고 응답에는 `roundtrip: {pending: true}`
+    를 싣는다. 점검이 끝나면 결과를 방 메타에 남기고, 통과가 아니면 그때 방에 있는 참여자에게 `roundtrip` 메시지(§3.2)를 한
+    번 보낸다.
+  - `block`: 상한까지 기다린다. 통과면 응답에 결과를 싣고, 아니면 방을 만들지 않는다 — 경고는 `422 {error: "roundtrip",
+    reason: "roundtrip", roundtrip}`, 점검 못 함은 `reason: "roundtrip-timeout"`·`"roundtrip-error"`(모르는 위험은 막는다).
+  - `off`: 점검하지 않는다. 점검 보조가 없는 서버도 점검하지 않고 `roundtrip` 을 싣지 않는다.
 - 같은 출처가 아닌 브라우저 요청은 Origin 허용 목록을 따른다. CORS 는 열지 않는다(바깥 시스템은 서버끼리 부른다).
 
 ### `GET /rooms/{room}/document` — 최신 문서 파일

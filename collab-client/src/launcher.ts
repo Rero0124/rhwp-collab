@@ -15,7 +15,7 @@
  * studio 를 import 하지 않는다 — 타입만(`plugin/types.ts`).
  */
 import type { PluginHost, PluginSurface, StudioPlugin } from '@/plugin/types';
-import { roundtripBlockedText, roundtripText, type RoundtripResult } from './session/roundtrip.ts';
+import { ROUNDTRIP_PENDING_TEXT, isRoundtripPending, roundtripBlockedText, roundtripText, type RoundtripPending, type RoundtripResult } from './session/roundtrip.ts';
 
 /** studio 개발 서버(`COLLAB_DEV_SERVER`)의 공동편집 서버 ws 주소 — 빌드·시험에서는 비거나 없다(같은 출처). */
 declare const __CC_RHWP_COLLAB_DEV_WS__: string | undefined;
@@ -78,7 +78,7 @@ export function takeCreateToken(hash: string, store: StoreLike | null, replace: 
   try { return store?.getItem(CREATE_TOKEN_KEY) || null; } catch { return null; }
 }
 
-export interface CreatedRoom { room: string; invite?: Record<string, string>; inviteExpiresAt?: string; roundtrip?: RoundtripResult }
+export interface CreatedRoom { room: string; invite?: Record<string, string>; inviteExpiresAt?: string; roundtrip?: RoundtripResult | RoundtripPending }
 export interface InviteLink { scope: string; label: string; hint: string; url: string }
 
 /**
@@ -245,8 +245,12 @@ export const collabLauncherPlugin = {
           body.append(row);
         }
         if (created.inviteExpiresAt) body.append(el('p', { style: 'color:#666' }, `링크는 ${new Date(created.inviteExpiresAt).toLocaleString()}까지 쓸 수 있습니다.`));
-        // 6단계 S2: 왕복 점검 결과(서버에 보조가 있을 때만 온다)
-        if (created.roundtrip) body.append(el('p', { 'data-collab': 'launcher-roundtrip', style: created.roundtrip.ok ? 'color:#666' : 'color:#a60' }, roundtripText(created.roundtrip)));
+        // 6단계 S2: 왕복 점검 결과(서버에 보조가 있을 때만 온다). warn 서버는 기다리지 않고 {pending} — 결과는 방에 들어가면 보인다.
+        if (created.roundtrip) {
+          const rt = created.roundtrip;
+          const text = isRoundtripPending(rt) ? ROUNDTRIP_PENDING_TEXT : roundtripText(rt);
+          body.append(el('p', { 'data-collab': 'launcher-roundtrip', style: isRoundtripPending(rt) || rt.ok ? 'color:#666' : 'color:#a60' }, text));
+        }
         const enter = el('button', { type: 'button', 'data-collab': 'launcher-enter' }, '이 방으로 들어가기');
         const edit = links.find((l) => l.scope === 'edit') ?? links[0];
         enter.addEventListener('click', () => {

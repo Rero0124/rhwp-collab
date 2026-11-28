@@ -568,7 +568,7 @@ export class CollabSession {
   private async onWelcome(msg: WelcomeMessage): Promise<void> {
     this.onAdmitted(msg.user);
     if (msg.encryptedSource) this.noticeEncrypted();
-    if (msg.roundtrip && !msg.roundtrip.ok) this.noticeRoundtrip(msg.roundtrip);
+    if (msg.roundtrip && msg.roundtrip.ok !== true) this.noticeRoundtrip(msg.roundtrip);
     if (typeof msg.maxMessageBytes === 'number') this.maxMessageBytes = msg.maxMessageBytes;
     if (typeof msg.generation === 'number') this.generation = msg.generation;
     // S3-4: 다시 붙었는데 서버가 따라잡기를 못 해 주면(기준점이 그 뒤로 옮겨 감) 재동기화와 같다 — 미확정을 버린다.
@@ -838,6 +838,10 @@ export class CollabSession {
       }
       case 'cursor-leave':
         if (this._cursors.delete(msg.clientId)) this.emit({ type: 'cursors' });
+        return;
+      case 'roundtrip':
+        // 6단계 S2: 방을 연 뒤 뒤에서 끝난 왕복 점검(경고·점검 못 함). welcome 에서 이미 받았으면 다시 알리지 않는다.
+        if (msg.roundtrip && msg.roundtrip.ok !== true) this.noticeRoundtrip(msg.roundtrip);
         return;
       case 'error': this.log('info', `서버 오류: ${msg.error}`); return;
     }

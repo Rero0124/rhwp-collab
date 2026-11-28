@@ -38,23 +38,26 @@ const list = files(dir).slice(0, values.limit ? Number(values.limit) : undefined
 const results = [];
 for (const file of list) {
   const rel = path.relative(dir, file);
+  const bytes = statSync(file).size;
   let doc;
+  const o0 = performance.now();
   try {
     doc = new wasm.HwpDocument(readFileSync(file));
   } catch (error) {
     const reason = String(error?.message ?? error);
-    results.push({ file: rel, status: /비밀번호가 필요한 암호 문서/.test(reason) ? 'encrypted' : 'unreadable', reason: reason.slice(0, 120) });
+    results.push({ file: rel, bytes, status: /비밀번호가 필요한 암호 문서/.test(reason) ? 'encrypted' : 'unreadable', reason: reason.slice(0, 120) });
     continue;
   }
+  const openMs = Math.round((performance.now() - o0) * 10) / 10;
   try {
     const t0 = performance.now();
     const raw = doc.collabRoundtripCheck();
     const ms = performance.now() - t0;
     const r = typeof raw === 'string' ? JSON.parse(raw) : raw;
     const lost = Array.isArray(r?.lost) ? r.lost : [];
-    results.push({ file: rel, status: r?.ok === true && lost.length === 0 ? 'ok' : 'warn', ms: Math.round(ms * 10) / 10, lost, irDiff: r?.irDiff ?? 0 });
+    results.push({ file: rel, bytes, openMs, status: r?.ok === true && lost.length === 0 ? 'ok' : 'warn', ms: Math.round(ms * 10) / 10, lost, irDiff: r?.irDiff ?? 0 });
   } catch (error) {
-    results.push({ file: rel, status: 'error', reason: String(error?.message ?? error).slice(0, 120) });
+    results.push({ file: rel, bytes, openMs, status: 'error', reason: String(error?.message ?? error).slice(0, 120) });
   } finally {
     doc.free();
   }
@@ -64,12 +67,18 @@ const by = (s) => results.filter((r) => r.status === s);
 const times = results.filter((r) => typeof r.ms === 'number').map((r) => r.ms).sort((a, b) => a - b);
 const pct = (p) => (times.length ? times[Math.min(times.length - 1, Math.floor((p / 100) * times.length))] : 0);
 const kinds = new Map();
-for (const r of by('warn')) for (const l of r.lost) kinds.set(l.kind, (kinds.get(l.kind) ?? 0) + 1);
+const kindCounts = new Map();
+for (const r of by('warn')) for (const l of r.lost) { kinds.set(l.kind, (kinds.get(l.kind) ?? 0) + 1); kindCounts.set(l.kind, (kindCounts.get(l.kind) ?? 0) + (l.count ?? 0)); }
+const mb = (b) => `${(b / 1048576).toFixed(1)}MB`;
 
 console.log(`샘플 ${results.length}개 (${dir})`);
 console.log(`  통과 ${by('ok').length} · 경고 ${by('warn').length} · 점검 오류 ${by('error').length} · 암호 ${by('encrypted').length} · 못 읽음 ${by('unreadable').length}`);
 console.log(`  걸린 시간(ms): 중앙값 ${pct(50)} · p95 ${pct(95)} · 최대 ${times.at(-1) ?? 0}`);
-console.log(`  경고 종류(문서 수): ${[...kinds].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(', ') || '없음'}`);
+console.log(`  경고 종류(문서 수 / 개수 합): ${[...kinds].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}/${kindCounts.get(k)}`).join(', ') || '없음'}`);
+const big = results.filter((r) => typeof r.ms === 'number').sort((a, b) => b.bytes - a.bytes).slice(0, 5);
+console.log(`  큰 문서(열기 + 점검 ms): ${big.map((r) => `${mb(r.bytes)} ${r.openMs}+${r.ms}`).join(' · ')}`);
+const slow = results.filter((r) => typeof r.ms === 'number').sort((a, b) => b.ms - a.ms).slice(0, 5);
+console.log(`  느린 점검: ${slow.map((r) => `${r.file} (${mb(r.bytes)}) ${r.ms}ms`).join(' · ')}`);
 for (const r of by('warn').slice(0, 20)) {
   console.log(`  경고 ${r.file}: ${r.lost.map((l) => `${l.kind}×${l.count}${l.detail ? `(${String(l.detail).slice(0, 60)})` : ''}`).join(', ') || `IR 차이 ${r.irDiff}`}`);
 }

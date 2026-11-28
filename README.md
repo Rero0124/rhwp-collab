@@ -183,7 +183,8 @@ COLLAB_DATA_DIR=./data node server/server.mjs
 | `COLLAB_ROLE_MAP` | 없음 | 바깥 시스템의 역할 이름 → 권한 매핑표(JSON 파일, 예: `{"작성자":"edit","검토자":"comment","열람자":"view"}`). 표에 모르는 권한 이름이 있으면 시작하지 않습니다 |
 | `COLLAB_EMBED_ONLY` | 없음 | `1` 이면 부품 전용 모드: 편집기는 `COLLAB_EMBED_ORIGINS` 의 페이지 안(iframe)에서만 열리고, 업로드 페이지와 "공동편집 시작" 메뉴는 꺼집니다 |
 | `COLLAB_EMBED_ORIGINS` | 없음 | 편집기를 넣을 수 있는 부모 페이지 출처(쉼표로 구분, 예: `https://docs.example.com`) |
-| `COLLAB_ROUNDTRIP` | `warn` | 파일로 방을 만들 때 rhwp 가 문서의 모든 부분을 다룰 수 있는지 점검합니다. `warn` 은 결과를 알리고 방을 만들고, `block` 은 통과하지 못한 문서로 방을 만들지 않고, `off` 는 점검하지 않습니다 |
+| `COLLAB_ROUNDTRIP` | `warn` | 파일로 방을 만들 때 rhwp 가 문서의 모든 부분을 다룰 수 있는지 점검합니다. `warn` 은 방을 먼저 만들고 뒤에서 점검해 결과를 방에 알리고, `block` 은 점검이 끝날 때까지 기다려 통과하지 못한(또는 시간 안에 끝나지 않은) 문서로 방을 만들지 않고, `off` 는 점검하지 않습니다 |
+| `COLLAB_ROUNDTRIP_TIMEOUT_MS` | `15000` | 왕복 점검 시간 상한(ms). 점검은 따로 둔 작업자에서 돌고, 넘으면 "점검 못 함(시간 초과)"으로 둡니다 |
 | `COLLAB_ALLOW_ENCRYPTED` | 없음 | `1` 이면 암호 문서로도 방을 엽니다. 문서 암호는 방을 만들 때 요청 머리 `X-Collab-Document-Password` 로 한 번 받고 저장하지 않습니다. 역방향 프록시가 요청 머리를 기록하지 않게 설정하세요. 그 방의 문서는 암호가 풀린 상태로 저장되고 오갑니다(기본은 거절) |
 | `COLLAB_ALLOWED_ORIGINS` | 없음 | 쉼표로 구분한 출처 목록. 있으면 그 밖의 브라우저 출처에서 오는 WebSocket·방 만들기를 거절합니다. 같은 출처는 언제나 허용합니다 |
 | `COLLAB_TLS_CERT`, `COLLAB_TLS_KEY` | 없음 | PEM 인증서와 키 파일. 둘 다 있으면 HTTPS/wss 로 뜹니다 |

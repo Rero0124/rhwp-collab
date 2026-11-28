@@ -1805,10 +1805,11 @@ fn layout_verdict_follows_the_upstream_render_diff_gate() {
 }
 
 #[test]
-fn layout_check_catches_char_shape_bits_the_model_rewrite_changes_and_s2_does_not_see() {
-    // multi-table-001(업스트림 샘플, 읽기만): 글자 모양 몇 개의 attr 밑줄 종류·취소선 비트(0x3C0400F8)가 모델에서 다시 쓰면
-    // 0x3C0000F0 이 된다 — 업스트림 글자 모양 저장기의 충실도 결함(2026-11-28 조사). 셀 글줄 높이가 4.41px 줄어든다.
-    // 왕복 점검(S2)의 IR 차이는 attr 비트를 보지 않아 통과다 — 배치 점검이 잡는다. 업스트림이 고치면 이 시험을 고친다.
+fn layout_check_catches_the_line_cache_marker_relayout_s2_does_not_see() {
+    // multi-table-001(업스트림 샘플, 읽기만): 본문 구역을 모델에서 다시 쓰면 업스트림 저장기가 `/RhwpLineSegTags`(업스트림 #8939)에
+    // 그 구역을 rhwp 관리 줄 캐시로 표지하고, 다시 읽으면 표 칸 줄을 지금 메트릭으로 다시 잰다 — 한/글이 저장한 줄 높이 대신 rhwp 값.
+    // 2쪽 표 칸 글줄 높이가 4.41px 줄어든다(이 스트림만 지우면 0px, 2026-11-28 다시 잼 — 처음 적은 글자 모양 attr 비트는 원인이 아님).
+    // 왕복 점검(S2)은 조판을 보지 않아 통과다 — 배치 점검이 잡는다. 업스트림이 고치면 이 시험을 고친다.
     let mut c = CollabCore::new(DocumentCore::from_bytes(&sample("samples/multi-table-001.hwp")).unwrap());
     let s2 = c.roundtrip_check().unwrap();
     assert_eq!(s2["ok"], true, "{s2}");

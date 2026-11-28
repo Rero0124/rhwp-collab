@@ -36,7 +36,10 @@ export interface StateRange {
   after: number;
 }
 
-/** 4단계 U3: 범위 복원 지정 — studio 스냅샷의 `src` 문단을 지금 문서의 `dst` 와 바꾼다. */
+/** 4단계 U3: 범위 복원의 원본 — studio 스냅샷(U3) 또는 삭제 조각(U3-b, 실행 직후 뜬 DocInfo 표시와 함께). */
+export type RangeRestoreSource = { snapshot: number } | { fragment: number; mark: string };
+
+/** 4단계 U3: 범위 복원 지정 — 원본(스냅샷·조각)의 `src` 문단을 지금 문서의 `dst` 와 바꾼다. */
 export interface RangeRestoreSpec {
   section: number;
   src: { lo: number; n: number };
@@ -73,6 +76,12 @@ export interface EngineDoc {
   collabUndoReapplyRange?(recipeId: number, specJson: string): void;
   collabUndoRecipeDiscard?(recipeId: number): void;
   collabUndoRecipeCount?(): number;
+  /** 4단계 U3-b: 지금 DocInfo 의 표시(JSON) — 조각 명령의 되돌리기 전제 */
+  collabDocInfoMark?(): string;
+  /** 4단계 U3-b: 조각 복원을 범위로 할 수 있는가 */
+  collabUndoFragmentCheck?(fragmentId: number, specJson: string, markJson: string): string;
+  /** 4단계 U3-b: 조각 복원을 범위로(조각 소비, 기록 훅 밖) — 복원 재료 번호 */
+  collabUndoRestoreFragment?(fragmentId: number, specJson: string, markJson: string): number;
   /** 5단계 D4 클라이언트 문: 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가. */
   collabFieldContains?(method: string, argsJson: string, activeFieldJson: string): boolean;
   /** D6: 메모 목록(작성자 확인) — 업스트림 `getMemoList` */
@@ -507,13 +516,16 @@ export class CollabEngine {
   }
 
   /**
-   * 4단계 U3: 범위 복원(collab 보조 — 기록 훅 밖)을 하고 그 결과를 **범위 표시가 붙은 state** 로 직접 기록한다. 순서는
+   * 4단계 U3·U3-b: 범위 복원(collab 보조 — 기록 훅 밖)을 하고 그 결과를 **범위 표시가 붙은 state** 로 직접 기록한다. 순서는
    * intercept 의 state 와 같다: 권한 문 → 확정 상태 스냅샷(바꾸기 전에) → 복원 → 내보내기·다시 읽기 → 기록. 복원이
    * 실패하면 문서를 바꾸지 않고 던진다.
    */
-  recordRangeRestore(snapshotId: number, spec: RangeRestoreSpec): void {
+  recordRangeRestore(source: RangeRestoreSource, spec: RangeRestoreSpec): void {
     const doc = this.doc;
-    if (!doc?.collabUndoRestoreRange) throw new Error('범위 복원 보조가 없습니다');
+    const restore = 'snapshot' in source
+      ? doc?.collabUndoRestoreRange && ((d: EngineDoc) => d.collabUndoRestoreRange!(source.snapshot, JSON.stringify(spec)))
+      : doc?.collabUndoRestoreFragment && ((d: EngineDoc) => d.collabUndoRestoreFragment!(source.fragment, JSON.stringify(spec), source.mark));
+    if (!doc || !restore) throw new Error('범위 복원 보조가 없습니다');
     if (this.scope) {
       const denied = this.scope.form ? DENIED_TEXT.form : this.scope.comment ? DENIED_TEXT.comment : DENIED_TEXT.view;
       this.onDenied(denied, 'collabUndoRestoreRange');
@@ -523,7 +535,7 @@ export class CollabEngine {
     const created = this.ensureSnapshot(doc);
     let recipe: number;
     try {
-      recipe = doc.collabUndoRestoreRange(snapshotId, JSON.stringify(spec));
+      recipe = restore(doc);
     } catch (error) {
       if (created) this.dropSnapshotIfIdle(doc);
       throw error;
@@ -920,6 +932,18 @@ export class CollabEngine {
     const doc = this.doc;
     if (!doc?.collabUndoRangeCheck) return { ok: false, reason: 'unsupported' };
     return JSON.parse(doc.collabUndoRangeCheck(snapshotId, JSON.stringify(spec)));
+  }
+
+  /** 4단계 U3-b: 지금 DocInfo 의 표시(조각 명령의 되돌리기 전제). WASM 이 모르면 `null`. */
+  docInfoMark(): string | null {
+    return this.doc?.collabDocInfoMark?.() ?? null;
+  }
+
+  /** 4단계 U3-b: 조각 복원을 범위로 할 수 있는가. */
+  undoFragmentCheck(fragmentId: number, spec: RangeRestoreSpec & { counts?: boolean }, mark: string): { ok: boolean; reason?: string; detail?: string } {
+    const doc = this.doc;
+    if (!doc?.collabUndoFragmentCheck) return { ok: false, reason: 'unsupported' };
+    return JSON.parse(doc.collabUndoFragmentCheck(fragmentId, JSON.stringify(spec), mark));
   }
 
   /** 시험용: 살아 있는 복원 재료 수(WASM 이 모르면 0). */

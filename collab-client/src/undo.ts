@@ -22,6 +22,9 @@
  *   state** 로 기록한다(받는 쪽은 그 범위의 구조 편집으로 보고 보정하므로 왕복 중이던 남의 입력이 취소되지 않는다). 막힘은
  *   범위로 정한다: 범위 안을 남이 고쳤으면 막고, 범위 밖 구조 편집은 번호만 옮긴다. 전제: 스냅샷의 DocInfo 목록이 지금
  *   문서의 앞부분과 같다(덧붙이기만) — 아니면 따로 안내하고 막는다.
+ * - U3-b: 삭제 조각으로 되돌리는 명령(본문 선택 삭제, 덮어쓰기·예약 글자 모양 입력, 링크·메모 앵커를 걸친 삭제)도 같은 범위
+ *   복원으로 되돌린다 — 실행 직후 조각과 범위를 대조해 맞을 때만, DocInfo 전제는 실행 직후 뜬 표시로. 다시 하기는 지금처럼
+ *   조각을 새로 잡아 op 로 지우므로 U1 규칙 그대로다(되돌린 뒤 범위를 비우고, 다시 한 뒤 새로 정한다).
  *
  * studio 를 import 하지 않는다(플러그인 규약) — 히스토리 조작과 위치 표는 host 가 넘긴다.
  */
@@ -43,6 +46,8 @@ interface Descriptor {
   sections?: number[];
   /** U3 `store === 'snapshot'`: studio 스냅샷 번호(명령 전 / 되돌리기 직전) */
   snapshot?: { before(): number | null; after(): number | null };
+  /** U3-b `store === 'fragment'`: 되돌리기가 쓸 삭제 조각 번호(없으면 `null`) */
+  fragment?: { id(): number | null };
 }
 export interface UndoController {
   stacks(): { undo: readonly object[]; redo: readonly object[] };
@@ -74,6 +79,10 @@ interface RangeMeta {
   after: Span | null;
   /** 남의 기록이 범위에 닿은 첫 사유 */
   hit: string | null;
+  /** 원본: studio 스냅샷(U3) / 삭제 조각(U3-b — 되돌리기만) */
+  source: 'snapshot' | 'fragment';
+  /** U3-b: 실행 직후 뜬 DocInfo 표시(조각은 DocInfo 를 들고 있지 않다) */
+  mark: string | null;
 }
 
 interface Meta {
@@ -101,6 +110,11 @@ interface Meta {
 /** U3: 범위 안의 자리인가(셀 자리는 표를 품은 본문 문단으로). 구역 단위 자리는 범위로 특정할 수 없어 같은 구역이면 겹침. */
 const inRange = (p: UndoPosition, r: RangeMeta): boolean =>
   p.section === r.section && (Boolean(p.scope) || (r.cur.lo <= p.para && p.para < r.cur.lo + r.cur.n));
+/** 범위 [lo, lo+cur.n) 을 newN 개 문단으로 바꾼 지도(지도 전용 기록 — ot 의 발자국 span) */
+const undoFoot = (r: RangeMeta, newN: number): Entry => ({ kind: 'op', m: '__undoFoot', a: [r.section, r.cur.lo, null], meta: { pd: newN - r.cur.n, span: r.cur.n } });
+/** 범위의 문단들을 발자국 자리로(범위를 이어 가지 못한 병합이 앞 범위를 발자국으로 넘길 때). */
+const spanItems = (r: RangeMeta): UndoPosition[] =>
+  Array.from({ length: r.cur.n }, (_, i) => ({ section: r.section, para: r.cur.lo + i, offset: 0 }));
 const rangesMeet = (a: RangeMeta, b: RangeMeta): boolean =>
   a.section === b.section && a.cur.lo < b.cur.lo + b.cur.n && b.cur.lo < a.cur.lo + a.cur.n;
 
@@ -181,8 +195,13 @@ export class CollabUndo {
         rangeMode: false,
       };
       m.fragment = this.fragmentAnchorOf(command);
-      // U3: 스냅샷 명령의 기록이 한 구역의 문단 범위로 모이면 범위로 다룬다(발자국 대신 범위가 막힘을 정한다)
+      // U3: 스냅샷·조각 명령의 기록이 한 구역의 문단 범위로 모이면 범위로 다룬다(발자국 대신 범위가 막힘을 정한다).
+      // 병합(덮어쓰기 연속 입력)은 새 기록이 앞 범위 안이면 범위를 이어 간다. 못 이으면 앞 범위를 발자국으로 넘긴다.
       if (!replaced) m.range = this.rangeOf(command, entries);
+      else if (prev?.range) {
+        m.range = this.mergedRangeOf(command, prev.range, entries);
+        if (!m.range) m.foot = dedupe([...m.foot, ...spanItems(prev.range)]);
+      }
       if (m.range) {
         m.foot = [];
         m.whole = false;
@@ -211,7 +230,9 @@ export class CollabUndo {
     undone: (command: object): void => this.afterJump(command, 'undo'),
     redone: (command: object): void => this.afterJump(command, 'redo'),
     /** U3: 막힘 판정이 범위 복원으로 정한 명령이면 그 범위만 되살리고(범위 표시 state 로 기록) 맡는다. */
-    restoreSnapshot: (command: object, dir: 'undo' | 'redo', id: number): boolean => this.restoreRange(command, dir, id),
+    restoreSnapshot: (command: object, dir: 'undo' | 'redo', id: number): boolean => this.restoreRange(command, dir, id, 'snapshot'),
+    /** U3-b: 조각 복원도 같다(되돌리기만 — 다시 하기는 조각을 새로 잡아 op 로 지운다). */
+    restoreDeleteFragment: (command: object, dir: 'undo' | 'redo', id: number): boolean => this.restoreRange(command, dir, id, 'fragment'),
   };
 
   // ── 원격 수신 (플러그인이 receiveRemote 뒤에 부른다) ─────────────────
@@ -284,11 +305,21 @@ export class CollabUndo {
     const items = this.engine.drainLocalLog();
     const entries = items.map((i) => i.entry);
     const m = this.meta.get(command);
-    if (m?.range) return this.afterRangeJump(command, m, m.range, dir, items.map((i) => i.lid));
-    this.mapLocal(entries, new Set([command]));
+    if (m?.range?.source === 'snapshot') return this.afterRangeJump(command, m, m.range, dir, items.map((i) => i.lid));
+    // U3-b: 범위를 아는 조각 명령의 되돌리기는 다른 명령을 "범위 → 명령 전 개수" 지도로 옮긴다 — 업스트림 조각 복원으로
+    // 물러섰으면 결과가 보통 state 라 지도가 없다(실행 때 그 삭제로 당겨 둔 아래 명령의 번호가 되돌아오지 않는다)
+    const undone = m?.range?.source === 'fragment' && dir === 'undo' ? m.range : null;
+    this.mapLocal(undone ? [undoFoot(undone, undone.before.n)] : entries, new Set([command]));
     if (!m) return;
+    if (undone) {
+      // 다시 하기는 명령의 조각 기준 자리(선택 삭제의 시작 문단, 입력·삭제의 위치)에서 조각을 새로 잡는다 — 되살린 범위의
+      // 시작으로 맞춘다(따로 옮겨진 자리와 범위가 어긋나면 엉뚱한 문단을 지운다)
+      const anchor = this.controller?.describe(command)?.fragmentAnchor;
+      const at = anchor?.get();
+      if (anchor && at && !at.scope && at.section === undone.section) anchor.set({ ...at, para: undone.cur.lo });
+    }
     // 새 구간: 이제부터 들어오는 남의 기록이 다음 다시 하기/되돌리기를 막는다
-    const fp = this.footprintOf(entries);
+    const fp = undone ? { items: spanItems({ ...undone, cur: { lo: undone.cur.lo, n: undone.before.n } }), whole: false, nested: false } : this.footprintOf(entries);
     // 다시 하기 뒤에는 다음 되돌리기를 위해 지킴을 다시 건다(되돌리기 뒤의 다시 하기는 새로 캡처한다)
     m.foot = dir === 'redo' ? dedupe([...fp.items, ...this.guardsOf(command)]) : fp.items;
     m.whole = fp.whole;
@@ -303,6 +334,16 @@ export class CollabUndo {
       m.undoLids = new Set();
       m.fragment = this.fragmentAnchorOf(command);
     }
+    // U3-b: 조각 명령 — 되돌리면 조각을 다 썼으니 범위를 비우고(다시 하기는 U1 규칙), 다시 하면 새 조각으로 범위를 정한다
+    if (this.controller?.describe(command)?.store === 'fragment') {
+      m.range = dir === 'redo' ? this.rangeOf(command, entries) : null;
+      m.rangeMode = false;
+      if (m.range) {
+        m.foot = [];
+        m.whole = false;
+        m.nested = false;
+      }
+    }
   }
 
   private blockReason(command: object, dir: 'undo' | 'redo'): string | null {
@@ -310,7 +351,7 @@ export class CollabUndo {
     const message = dir === 'undo' ? UNDO_BLOCKED_NOTICE : REDO_BLOCKED_NOTICE;
     if (!m) return null;
     const d = this.controller?.describe(command) ?? null;
-    if (m.range && d?.store === 'snapshot') return this.rangeBlockReason(m, m.range, d, dir);
+    if (m.range && (d?.store === 'snapshot' || (d?.store === 'fragment' && dir === 'undo'))) return this.rangeBlockReason(m, m.range, d, dir);
     // 다시 하기에서 조각은 쓰지 않는다(조각 명령의 다시 하기는 새로 잡아 지운다). 스냅샷은 양쪽 모두 문서 전체.
     const strict = !d || d.store === 'snapshot' || m.nested || m.whole || d.slots.some((s) => s.get() === null);
     if (strict) return m.remoteSeen ? message : null;
@@ -326,18 +367,41 @@ export class CollabUndo {
 
   // ── U3: 스냅샷 명령의 문단 범위 ────────────────────────────────────
 
-  /** 실행 직후: 기록 열이 한 구역의 문단 범위로 모이고, 스냅샷과 문단 수·DocInfo 가 그 범위와 맞으면 범위. */
+  /**
+   * 실행 직후: 기록 열이 한 구역의 문단 범위로 모이고, 원본과 맞으면 범위. 스냅샷 명령은 스냅샷과 문단 수·DocInfo 가, 조각
+   * 명령(U3-b)은 조각의 구역·시작 문단·문단 수와 캡처 때 문단 수가 범위와 맞아야 한다(DocInfo 는 지금 표시를 떠 둔다).
+   */
   private rangeOf(command: object, entries: readonly Entry[]): RangeMeta | null {
     const d = this.controller?.describe(command);
-    const snap = d?.store === 'snapshot' ? d.snapshot?.before() ?? null : null;
-    if (snap === null) return null;
+    if (d?.store !== 'snapshot' && d?.store !== 'fragment') return null;
+    const id = d.store === 'snapshot' ? d.snapshot?.before() ?? null : d.fragment?.id() ?? null;
+    if (id === null) return null;
     const r = this.engine.undoRange(entries);
     if (!r) return null;
     const before = { lo: r.lo, n: r.before };
     const cur = { lo: r.lo, n: r.after };
-    // 명령이 기존 DocInfo 항목을 고쳤으면(범위 복원은 DocInfo 를 되돌리지 않는다) 여기서 걸러진다
-    const v = this.engine.undoRangeCheck(snap, { section: r.section, src: before, dst: cur, counts: true });
-    return v.ok ? { section: r.section, cur, before, after: null, hit: null } : null;
+    const spec = { section: r.section, src: before, dst: cur, counts: true };
+    if (d.store === 'snapshot') {
+      // 명령이 기존 DocInfo 항목을 고쳤으면(범위 복원은 DocInfo 를 되돌리지 않는다) 여기서 걸러진다
+      const v = this.engine.undoRangeCheck(id, spec);
+      return v.ok ? { section: r.section, cur, before, after: null, hit: null, source: 'snapshot', mark: null } : null;
+    }
+    const mark = this.engine.docInfoMark();
+    if (!mark) return null;
+    const v = this.engine.undoFragmentCheck(id, spec, mark);
+    return v.ok ? { section: r.section, cur, before, after: null, hit: null, source: 'fragment', mark } : null;
+  }
+
+  /** U3-b 병합(덮어쓰기 연속 입력): 새 기록이 앞 범위 안이면 범위를 이어 간다(조각은 첫 조각 — 병합 전체를 되돌릴 기준). */
+  private mergedRangeOf(command: object, prev: RangeMeta, entries: readonly Entry[]): RangeMeta | null {
+    const d = this.controller?.describe(command);
+    const id = d?.store === 'fragment' ? d.fragment?.id() ?? null : null;
+    if (prev.source !== 'fragment' || id === null || !prev.mark) return null;
+    const r = this.engine.undoRange(entries);
+    if (!r || r.section !== prev.section || r.lo < prev.cur.lo || r.lo + r.before > prev.cur.lo + prev.cur.n) return null;
+    const cur = { lo: prev.cur.lo, n: prev.cur.n + r.after - r.before };
+    const v = this.engine.undoFragmentCheck(id, { section: prev.section, src: prev.before, dst: cur, counts: true }, prev.mark);
+    return v.ok ? { ...prev, cur } : null;
   }
 
   private rangeBlockReason(m: Meta, r: RangeMeta, d: Descriptor, dir: 'undo' | 'redo'): string | null {
@@ -346,13 +410,14 @@ export class CollabUndo {
     if (r.hit) return message;
     // 스위치 `remote`: 남의 기록이 없으면 문서 전체 복원(그대로 정확)
     if (!m.remoteSeen && this.rangeRestore === 'remote') return null;
-    const snap = dir === 'undo' ? d.snapshot?.before() ?? null : d.snapshot?.after() ?? null;
+    const id = r.source === 'fragment' ? d.fragment?.id() ?? null : dir === 'undo' ? d.snapshot?.before() ?? null : d.snapshot?.after() ?? null;
     const src = dir === 'undo' ? r.before : r.after;
-    // 원본 스냅샷이 없으면 범위로 할 수 없다 — 남의 기록이 없을 때만 문서 전체 복원
-    if (snap === null || !src) return m.remoteSeen ? message : null;
-    const v = this.engine.undoRangeCheck(snap, { section: r.section, src, dst: r.cur });
+    // 원본(스냅샷·조각)이 없으면 범위로 할 수 없다 — 남의 기록이 없을 때만 업스트림 복원
+    if (id === null || !src || (r.source === 'fragment' && !r.mark)) return m.remoteSeen ? message : null;
+    const spec = { section: r.section, src, dst: r.cur };
+    const v = r.source === 'fragment' ? this.engine.undoFragmentCheck(id, spec, r.mark!) : this.engine.undoRangeCheck(id, spec);
     if (!v.ok) {
-      if (!m.remoteSeen) return null; // 남의 기록이 없으면 문서 전체 복원이 정확하다
+      if (!m.remoteSeen) return null; // 남의 기록이 없으면 업스트림 복원(문서 전체·조각)이 정확하다
       if (v.reason === 'docinfo') return dir === 'undo' ? UNDO_DOCINFO_NOTICE : REDO_DOCINFO_NOTICE;
       return message;
     }
@@ -360,18 +425,22 @@ export class CollabUndo {
     return null;
   }
 
-  /** 히스토리의 `restoreSnapshot` 다리: 범위 복원으로 정한 명령이면 맡는다(엔진이 범위 표시 state 로 기록). */
-  private restoreRange(command: object, dir: 'undo' | 'redo', id: number): boolean {
+  /** 히스토리의 `restoreSnapshot`·`restoreDeleteFragment` 다리: 범위 복원으로 정한 명령이면 맡는다(엔진이 범위 표시 state 로 기록). */
+  private restoreRange(command: object, dir: 'undo' | 'redo', id: number, kind: 'snapshot' | 'fragment'): boolean {
     const m = this.meta.get(command);
-    if (!m?.range || !m.rangeMode) return false;
+    if (!m?.range || !m.rangeMode || m.range.source !== kind) return false;
     m.rangeMode = false;
     const r = m.range;
     const d = this.controller?.describe(command);
-    const expect = dir === 'undo' ? d?.snapshot?.before() : d?.snapshot?.after();
+    const expect = kind === 'fragment' ? d?.fragment?.id() : dir === 'undo' ? d?.snapshot?.before() : d?.snapshot?.after();
     const src = dir === 'undo' ? r.before : r.after;
-    // 판정 때 본 스냅샷이 아니면 문서 전체 복원으로 물러서지 않는다(그사이 남의 편집까지 지운다) — 실패로 버리게 던진다
-    if (id !== expect || !src) throw new Error(`범위 복원: 스냅샷 번호가 판정 때와 다름 (${id} ≠ ${String(expect)})`);
-    this.engine.recordRangeRestore(id, { section: r.section, src, dst: { ...r.cur } });
+    // 판정 때 본 원본이 아니면 업스트림 복원으로 물러서지 않는다(그사이 남의 편집까지 지우거나 엉뚱한 자리에 끼운다) — 실패로
+    // 버리게 던진다
+    if (id !== expect || !src || (kind === 'fragment' && (dir !== 'undo' || !r.mark))) {
+      throw new Error(`범위 복원: 원본 번호가 판정 때와 다름 (${id} ≠ ${String(expect)})`);
+    }
+    const spec = { section: r.section, src, dst: { ...r.cur } };
+    this.engine.recordRangeRestore(kind === 'fragment' ? { fragment: id, mark: r.mark! } : { snapshot: id }, spec);
     return true;
   }
 
@@ -383,8 +452,7 @@ export class CollabUndo {
   private afterRangeJump(command: object, m: Meta, r: RangeMeta, dir: 'undo' | 'redo', lids: number[]): void {
     const oldN = r.cur.n;
     const newN = dir === 'undo' ? r.before.n : r.after?.n ?? r.cur.n;
-    const map: Entry = { kind: 'op', m: '__undoFoot', a: [r.section, r.cur.lo, null], meta: { pd: newN - oldN, span: oldN } };
-    this.mapLocal([map], new Set([command]));
+    this.mapLocal([undoFoot(r, newN)], new Set([command]));
     r.after = dir === 'undo' ? { lo: r.cur.lo, n: oldN } : null;
     r.cur = { lo: r.cur.lo, n: newN };
     r.hit = null;

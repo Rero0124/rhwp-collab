@@ -466,7 +466,7 @@ async function runRealisticSeed(seed, base) {
 
 // ── 4단계 U3: 되돌리기(범위 복원) ─────────────────────────────────────────
 
-/** studio CommandHistory 의 훅 순서와 다리(`restoreSnapshot` 만 훅에 먼저 묻는다)를 흉내 낸 작은 히스토리 */
+/** studio CommandHistory 의 훅 순서와 다리(`restoreSnapshot`·`restoreDeleteFragment` 만 훅에 먼저 묻는다)를 흉내 낸 작은 히스토리 */
 class SimHistory {
   constructor(doc) { this.doc = doc; this.undoStack = []; this.redoStack = []; this.hook = null; }
   bridge(cmd, dir) {
@@ -474,6 +474,7 @@ class SimHistory {
     return new Proxy(this.doc, {
       get(target, key) {
         if (key === 'restoreSnapshot') return (id) => { if (!hook.restoreSnapshot(cmd, dir, id)) target.restoreSnapshot(id); };
+        if (key === 'restoreDeleteFragment') return (id) => (hook.restoreDeleteFragment(cmd, dir, id) ? '{"ok":true}' : target.restoreDeleteFragment(id));
         const v = Reflect.get(target, key, target);
         return typeof v === 'function' ? v.bind(target) : v;
       },
@@ -501,7 +502,9 @@ class SimHistory {
     if (why !== null) { from.pop(); cmd.discard(this.doc); this.hook.rejected(cmd, dir, why); return 'blocked'; }
     try {
       if (dir === 'undo') cmd.undo(this.bridge(cmd, 'undo')); else cmd.execute(this.bridge(cmd, 'redo'));
-    } catch {
+    } catch (error) {
+      const info = this.describeTop?.(dir) ?? '';
+      this.failures?.push(`${dir} ${cmd.type}${info}: ${String(error?.message ?? error).slice(0, 60)}`);
       from.pop();
       cmd.discard(this.doc);
       this.hook.settled();
@@ -511,6 +514,10 @@ class SimHistory {
     to.push(cmd);
     if (dir === 'undo') this.hook.undone(cmd); else this.hook.redone(cmd);
     return 'ok';
+  }
+  clearRedo() {
+    for (const c of this.redoStack) c.discard(this.doc);
+    this.redoStack = [];
   }
   controller() {
     return {
@@ -550,6 +557,32 @@ const snapshotTable = (p, o) => ({
   },
 });
 
+/** U3-b: studio FragmentDeleteCommand(본문 선택 삭제) — 조각 캡처 → deleteRange, 되돌리기는 조각 복원 */
+const fragmentDelete = (s, so, e, eo) => ({
+  type: 'deleteSelection', sectionIdx: 0, startPara: s, endPara: e,
+  cursorBefore: { sectionIndex: 0, paragraphIndex: s, charOffset: so }, cursorAfter: { sectionIndex: 0, paragraphIndex: s, charOffset: so }, fragmentId: null,
+  execute(doc) {
+    this.fragmentId = doc.captureDeleteRange(0, this.startPara, this.endPara);
+    try { doc.deleteRange(0, this.startPara, so, this.endPara, eo); } catch (error) { this.discard(doc); throw error; }
+  },
+  undo(doc) { doc.restoreDeleteFragment(this.fragmentId); this.fragmentId = null; },
+  discard(doc) { if (this.fragmentId !== null) { doc.discardDeleteFragment(this.fragmentId); this.fragmentId = null; } },
+});
+/** U3-b: studio InsertTextCommand 수정(덮어쓰기) 모드 — 캐럿 문단 조각 → 덮어쓴 글자 지우고 입력 */
+const overwriteText = (p, o, text, n) => ({
+  type: 'insertText', position: { sectionIndex: 0, paragraphIndex: p, charOffset: o }, text, fragmentIds: [],
+  execute(doc) {
+    const q = this.position;
+    this.fragmentIds = [doc.captureDeleteRange(0, q.paragraphIndex, q.paragraphIndex)];
+    try {
+      if (n > 0) doc.deleteText(0, q.paragraphIndex, q.charOffset, n);
+      doc.insertText(0, q.paragraphIndex, q.charOffset, this.text);
+    } catch (error) { this.discard(doc); throw error; }
+  },
+  undo(doc) { const [id, ...rest] = this.fragmentIds; doc.restoreDeleteFragment(id); this.fragmentIds = rest; this.discard(doc); },
+  discard(doc) { for (const id of this.fragmentIds) doc.discardDeleteFragment(id); this.fragmentIds = []; },
+});
+
 /** 클라이언트에 되돌리기를 붙인다(플러그인처럼: 원격 수신·서버가 다시 쓴 확정마다 스택을 옮기고, welcome 이면 비운다). */
 function withUndo(c, stats) {
   c.engine.drainLocalLog(); // 붙이기 전의 기록은 어느 명령 것도 아니다
@@ -562,6 +595,15 @@ function withUndo(c, stats) {
     return v;
   };
   c.history = new SimHistory(c.doc);
+  c.history.failures = stats.failures;
+  c.history.describeTop = (dir) => {
+    const e = c.undo.debug()[dir === 'undo' ? 'undo' : 'redo'].at(-1);
+    const cmd = (dir === 'undo' ? c.history.undoStack : c.history.redoStack).at(-1);
+    const id = describeCollabUndo(cmd)?.fragment?.id() ?? null;
+    const r = e?.range;
+    const v = r && id !== null ? c.engine.undoFragmentCheck(id, { section: r.section, src: r.before, dst: r.cur }, r.mark) : null;
+    return ` [범위 ${r ? '있음' : '없음'}, 남의 기록 ${e?.remoteSeen ? '봄' : '안 봄'}, 확인 ${v ? (v.ok ? 'ok' : v.reason) : '-'}]`;
+  };
   c.undo = new CollabUndo(c.engine, (t) => { stats.notices[t] = (stats.notices[t] ?? 0) + 1; });
   c.undo.attach(c.history.controller());
   c.history.hook = c.undo.hook;
@@ -580,11 +622,29 @@ function rangeStep(r, c, stats) {
   if (y < 0.4) {
     const s = survey(c.doc);
     const p = r.int(s.paras);
-    const ok = c.history.execute(snapshotTable(p, offsetIn(r, s.lens[p])));
+    const z = r.next();
+    let cmd;
+    let kind;
+    if (z < 0.5) {
+      cmd = snapshotTable(p, offsetIn(r, s.lens[p]));
+      kind = 'snapshot:createTable';
+    } else if (z < 0.85) {
+      // 선택 삭제: p 부터 0~2 문단 뒤까지(같은 문단이면 앞뒤 오프셋 순서)
+      const e = Math.min(s.paras - 1, p + r.int(3));
+      let so = offsetIn(r, s.lens[p]);
+      let eo = offsetIn(r, s.lens[e]);
+      if (e === p) { if (so === eo) return null; if (so > eo) [so, eo] = [eo, so]; }
+      cmd = fragmentDelete(p, so, e, eo);
+      kind = 'fragment:deleteSelection';
+    } else {
+      const o = offsetIn(r, s.lens[p]);
+      cmd = overwriteText(p, o, word(r, 2), Math.min(2, s.lens[p] - o));
+      kind = 'fragment:overwrite';
+    }
+    const ok = c.history.execute(cmd);
     stats.executed += ok ? 1 : 0;
-    const top = c.history.undoStack.at(-1);
     if (ok && c.undo.debug().undo.at(-1)?.range) stats.ranged += 1;
-    return ok && top ? 'snapshot:createTable' : null;
+    return ok ? kind : null;
   }
   const dir = y < 0.85 ? 'undo' : 'redo';
   const res = c.history.jump(dir);
@@ -649,7 +709,7 @@ async function runSeed(seed, base) {
   const r = prng(seed);
   const server = new Server(base, { canonical: S3 || RANGE_UNDO, rewriteState: REWRITE_STATE || RANGE_UNDO });
   const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(String.fromCharCode(65 + i), base, server, { fast: FAST, verifyFast: VERIFY_FAST }));
-  rangeStats = { executed: 0, ranged: 0, notices: {}, docinfo: {} };
+  rangeStats = { executed: 0, ranged: 0, notices: {}, docinfo: {}, failures: [] };
   if (RANGE_UNDO) for (const c of clients) withUndo(c, rangeStats);
   const made = {};
   let edits = 0;
@@ -664,8 +724,10 @@ async function runSeed(seed, base) {
       } else if (x < 0.5) {
         const k = gen(r, c.doc);
         if (k) { made[k] = (made[k] ?? 0) + 1; edits += 1; }
-        // 히스토리 밖 편집도 명령 경계다(studio 에서는 모든 편집이 명령) — 그 기록으로 스택 위치를 옮긴다
+        // 히스토리 밖 편집도 명령 경계다(studio 에서는 모든 편집이 명령) — 그 기록으로 스택 위치를 옮기고, 새 명령처럼
+        // 다시 하기 스택을 비운다(studio 규칙 — 남겨 두면 다시 하기 대상이 바뀐 문서 위에서 돌게 된다)
         c.undo?.hook.settled();
+        if (k && c.history) c.history.clearRedo();
       } else if (x < 0.7) {
         c.flush();
       } else if (S3 && x < 0.73) {
@@ -721,6 +783,7 @@ for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
     for (const [k, v] of Object.entries(res.range)) {
       if (k === 'notices') for (const [t, n] of Object.entries(v)) total.range[`알림 ${t}`] = (total.range[`알림 ${t}`] ?? 0) + n;
       else if (k === 'docinfo') for (const [t, n] of Object.entries(v)) total.range[`DocInfo ${t}`] = (total.range[`DocInfo ${t}`] ?? 0) + n;
+      else if (k === 'failures') for (const t of v) total.range[`실패 ${t.replace(/\d+/g, 'N')}`] = (total.range[`실패 ${t.replace(/\d+/g, 'N')}`] ?? 0) + 1;
       else total.range[k] = (total.range[k] ?? 0) + v;
     }
   }

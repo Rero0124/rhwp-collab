@@ -1,7 +1,8 @@
 // 4단계 U1 브라우저 확인 (docs/collab-stage4.md): 공동편집 중 되돌리기 — 내 편집만, 남이 같은 자리를 고쳤으면 막힘.
 // 같은 headless Chrome 의 두 탭(A, B)이 지연 서버(300ms)에서 편집하고 A 가 studio 의 되돌리기 명령(edit:undo)을
 // 누른다. 단계마다 두 탭의 digest 일치·desync·재동기화 0 과, 되돌린 결과(내 편집만 빠짐) 또는 막힘(알림·문서
-// 그대로)을 본다. U3 의 전체 시나리오 중 기본형(①~④, ⑪·⑫)과 U2 머리말(⑬·⑭ — studio 의 실제 머리말 명령).
+// 그대로)을 본다. U3 의 전체 시나리오 중 기본형(①~④, ⑪·⑫ — ⑫ 는 U3-b 에서 막힘 → 허용)과 U2 머리말(⑬·⑭ — studio 의 실제
+// 머리말 명령).
 //
 // 준비: COLLAB_DELAY_MS=300 PORT=8788 node server/server.mjs + (cd upstream/rhwp/rhwp-studio && npx vite) (7700)
 // 실행: node collab-client/e2e/u1-undo.mjs
@@ -176,21 +177,21 @@ try {
   texts = await paragraphs(B);
   record('⑪ 선택 삭제 되돌리기(같은 구역 다른 문단 편집 뒤)', s.ok && texts[1] === beforeDel[1] && texts[2] === beforeDel[2] && texts[0].endsWith(' B0'), JSON.stringify(texts));
 
-  // ⑫ ⑪에서 B 가 A 보다 앞 문단에서 Enter → A 되돌리기 막힘
+  // ⑫ ⑪에서 B 가 A 보다 앞 문단에서 Enter → A 되돌리기 허용(4단계 U3-b: 조각 복원도 범위 복원 — U1 의 "조각 문단이
+  // 옮겨지면 막음"을 풂), 원래 내용·B 의 Enter 유지
+  const beforeDel12 = await paragraphs(A);
   await selectRange(A, [2, 2], [3, 3]);
   await A.keyboard.press('Delete');
   await same(pages);
   await caretAt(B, 0, 2);
   await B.keyboard.press('Enter');
   await same(pages);
-  const before12 = await paragraphs(A);
   await A.bringToFront();
   await exec(A, 'edit:undo');
-  await sleep(300);
-  const n12 = await notices(A);
-  s = await same(pages, { advance: false });
-  const after12 = await paragraphs(A);
-  record('⑫ 앞 문단 Enter 뒤 선택 삭제 되돌리기 막힘', s.ok && JSON.stringify(after12) === JSON.stringify(before12) && n12.includes(BLOCKED), `알림 ${JSON.stringify(n12)} 문단 ${JSON.stringify(after12)}`);
+  s = await same(pages);
+  const after12 = await paragraphs(B);
+  const expect12 = [beforeDel12[0].slice(0, 2), beforeDel12[0].slice(2), ...beforeDel12.slice(1)];
+  record('⑫ 앞 문단 Enter 뒤 선택 삭제 되돌리기 허용(U3-b), 원래 내용·남의 Enter 유지', s.ok && JSON.stringify(after12) === JSON.stringify(expect12), `문단 ${JSON.stringify(after12)}`);
 
   // ⑬ U2 머리말: A 머리말에 한 글자, B 본문 입력·Enter → A 되돌리기 허용(머리말 발자국은 구역 단위라 본문 글자에 막히지 않음)
   await exec(A, 'page:header-create');

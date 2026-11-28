@@ -131,6 +131,16 @@ fn map_ranges_moves_outside_edits_and_marks_inside() {
     let m = mapped(&[hinted(0, 1, 3)], 2, 5);
     assert_eq!((span(&m), hit(&m)), ((4, 7), Value::Null));
     assert_eq!(hit(&mapped(&[hinted(4, 2, 1)], 2, 5)), json!("structural"));
+    // 닿은 기록도 범위를 품도록 넓혀 문단 수를 맞춘다(내 기록으로 옮길 때 범위가 지금 문서와 맞아야 한다): 범위 안 선택
+    // 삭제(3..4) → [2,4), 범위 첫 문단을 앞에 합침 → [1,4), 범위 안 Enter → [2,6), 범위 끝 문단의 표 만들기 → 넓어짐
+    let del = |sp: usize, ep: usize| json!({ "kind": "op", "m": "deleteRange", "a": [0, sp, 0, ep, 0], "meta": {} });
+    let m = mapped(&[del(3, 4)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((2, 4), json!("touched")));
+    assert_eq!(span(&mapped(&[merge(2, 1)], 2, 5)), (1, 4));
+    assert_eq!(span(&mapped(&[split(3, 1)], 2, 5)), (2, 6));
+    assert_eq!(span(&mapped(&[table(4, 2)], 2, 5)), (2, 7));
+    // 닿은 뒤의 기록도 계속 옮긴다
+    assert_eq!(span(&mapped(&[del(3, 4), split(0, 1)], 2, 5)), (3, 5));
 }
 
 // ── 범위 표시 state 의 보정 (ot) ──────────────────────────────────────────
@@ -492,4 +502,94 @@ fn range_restore_of_a_deleted_file_table_keeps_its_raw_bytes_through_the_rewrite
     let mut back = open();
     back.load_state(&canon.export_state().unwrap()).unwrap();
     assert_eq!(back.digest(), fresh.digest(), "지우기 전 문서와 같다");
+}
+
+// ── U3-b: 삭제 조각의 범위 복원 ─────────────────────────────────────────────
+
+/// 선택 삭제(studio FragmentDeleteCommand 순서): 조각 캡처 [s..=e] → deleteRange. 기록과 조각 번호, DocInfo 표시를 돌려준다.
+fn select_delete(c: &mut CollabCore, s: usize, so: usize, e: usize, eo: usize) -> (Value, u32, Value) {
+    let frag = c.capture_delete_range_native(0, s, e).unwrap();
+    c.delete_range_native(0, s, so, e, eo, None).unwrap();
+    let rec = json!({ "kind": "op", "m": "deleteRange", "a": [0, s, so, e, eo], "meta": {} });
+    (rec, frag, c.docinfo_mark())
+}
+
+#[test]
+fn fragment_restore_puts_back_the_deleted_paragraphs_where_the_range_moved() {
+    let mut c = doc_with(6);
+    let (rec, frag, mark) = select_delete(&mut c, 1, 1, 3, 1);
+    assert_eq!(texts(&c), vec!["p0", "p3", "p4", "p5"], "p1 의 앞 글자와 p3 의 뒤 글자가 합쳐짐");
+    let r = range_of(&[rec], &cat());
+    assert_eq!(r, json!({ "section": 0, "lo": 1, "before": 3, "after": 1 }));
+    let mut first = spec(0, (1, 3), (1, 1));
+    first["counts"] = json!(true);
+    assert_eq!(c.undo_fragment_check(frag, &first, &mark).unwrap(), json!({ "ok": true }), "실행 직후 조각과 범위가 맞다");
+    // 남의 편집: 범위 앞 Enter(업스트림 U1 은 조각이 옮겨졌다고 막음), 범위 뒤 Enter(업스트림 복원은 문단 수 전제에 걸려 실패)
+    let remote = vec![split(0, 1), split(4, 1)];
+    c.split_paragraph_native(0, 0, 1, None).unwrap();
+    c.split_paragraph_native(0, 4, 1, None).unwrap();
+    let m = map_ranges(&remote, &cat(), &[json!({ "section": 0, "lo": 1, "hi": 2 })])[0].clone();
+    assert_eq!((m["lo"].clone(), m["hit"].clone()), (json!(2), Value::Null));
+    let n0 = recipe_count();
+    let recipe = c.undo_restore_fragment(frag, &spec(0, (1, 3), (2, 1)), &mark).unwrap();
+    assert_eq!(texts(&c), vec!["p", "0", "p1", "p2", "p3", "p4", "p", "5"], "지운 문단만 돌아오고 남의 Enter 둘은 그대로");
+    assert!(c.fragment_of(frag).is_none(), "조각을 소비한다(업스트림 복원과 같은 계약)");
+    assert_eq!(recipe_count(), n0 + 1);
+    recipe_discard(recipe);
+    // 소비한 조각으로는 다시 못 한다
+    assert_eq!(c.undo_fragment_check(frag, &spec(0, (1, 3), (2, 1)), &mark).unwrap()["reason"], json!("fragment"));
+}
+
+#[test]
+fn fragment_check_refuses_mismatches_and_changed_docinfo() {
+    let mut c = doc_with(4);
+    let (_, frag, mark) = select_delete(&mut c, 1, 0, 2, 1);
+    // 조각과 다른 범위
+    assert_eq!(c.undo_fragment_check(frag, &spec(0, (0, 2), (1, 1)), &mark).unwrap()["reason"], json!("fragment"));
+    assert_eq!(c.undo_fragment_check(frag, &spec(0, (1, 3), (1, 1)), &mark).unwrap()["reason"], json!("fragment"));
+    // 명령 직후 문단 수가 범위와 안 맞음
+    let mut counts = spec(0, (1, 2), (1, 2));
+    counts["counts"] = json!(true);
+    assert_eq!(c.undo_fragment_check(frag, &counts, &mark).unwrap()["reason"], json!("counts"));
+    // DocInfo: 덧붙이기는 통과, 기존 항목 바뀜은 막힘, 표시 형식이 틀리면 막힘
+    let extra = c.document.doc_info.para_shapes[0].clone();
+    c.document.doc_info.para_shapes.push(extra);
+    assert_eq!(c.undo_fragment_check(frag, &spec(0, (1, 2), (1, 1)), &mark).unwrap(), json!({ "ok": true }));
+    c.document.doc_info.para_shapes[1].indent += 10;
+    let v = c.undo_fragment_check(frag, &spec(0, (1, 2), (1, 1)), &mark).unwrap();
+    assert_eq!(v["reason"], json!("docinfo"), "{v}");
+    assert_eq!(c.undo_fragment_check(frag, &spec(0, (1, 2), (1, 1)), &json!({})).unwrap()["reason"], json!("docinfo"));
+    let before = texts(&c);
+    assert!(c.undo_restore_fragment(frag, &spec(0, (1, 2), (1, 1)), &mark).is_err());
+    assert_eq!(texts(&c), before, "막히면 문서를 바꾸지 않는다");
+    assert!(c.fragment_of(frag).is_some(), "막히면 조각을 남긴다");
+}
+
+#[test]
+fn docinfo_mark_round_trips_and_sees_shrinking_lists() {
+    let mut c = doc_with(2);
+    let mark = DocInfoMark::of(&c.document);
+    assert_eq!(DocInfoMark::parse(&mark.json()), Some(mark.clone()));
+    assert_eq!(mark.matches(&c.document), Ok(()));
+    c.document.doc_info.char_shapes.pop();
+    assert!(mark.matches(&c.document).is_err(), "목록이 줄면 어긋남");
+}
+
+#[test]
+fn fragment_restore_state_passes_the_server_range_check() {
+    // 보낸 쪽 조각 복원 결과(state)에 범위 표시를 달면 정본의 확인을 지난다
+    let base = doc_with(5).export_state().unwrap();
+    let open = || {
+        let mut c = CollabCore::new(blank());
+        c.load_state(&base).unwrap();
+        c
+    };
+    let (mut canon, mut client) = (open(), open());
+    let (_, frag, mark) = select_delete(&mut client, 1, 1, 3, 1);
+    canon.delete_range_native(0, 1, 1, 3, 1, None).unwrap();
+    assert_eq!(canon.digest(), client.digest());
+    recipe_discard(client.undo_restore_fragment(frag, &spec(0, (1, 3), (1, 1)), &mark).unwrap());
+    let hint = json!({ "section": 0, "lo": 1, "before": 1, "after": 3 });
+    assert_eq!(canonical_apply_hinted(&mut canon, &client.export_state().unwrap(), &hint), json!({ "ok": true }));
+    assert_eq!(texts(&canon), vec!["p0", "p1", "p2", "p3", "p4"]);
 }

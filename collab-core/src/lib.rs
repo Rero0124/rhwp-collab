@@ -283,6 +283,15 @@ fn summarize(items: impl Iterator<Item = String>, max: usize) -> String {
     s
 }
 
+/// 6단계 S2: 내용(압축을 푼 뒤)이 빈 BinData 는 잃을 것이 없다 — 원본 쪽 지문에서 그 열쇠만 지운다. 열쇠는 업스트림
+/// `hwp5_roundtrip_batch::bindata_fingerprint` 와 같은 방식(`DefaultHasher` 에 내용 바이트 — `Vec<u8>` 과 `[u8]` 의 해시는
+/// 같다)으로 센다. 업스트림이 해시 방식을 바꾸면 빈 항목이 다시 경고로 드러난다(조용히 놓치는 쪽이 아니다).
+/// 예: HWP3 파서가 연결 그림 자리에 채워 둔 빈 항목(id 0)을 HWP5 저장기가 쓴 `BIN0000.` 스트림(hwp3-sample10) — 그 저장본을
+/// 다시 읽으면 아무 레코드도 가리키지 않아 사라진다.
+fn drop_empty_bindata(fingerprint: &mut std::collections::BTreeMap<u64, usize>) {
+    fingerprint.remove(&bytes_hash(&[]));
+}
+
 fn bytes_hash(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1078,7 +1087,8 @@ impl CollabCore {
     ///   캐시는 빼고 견준다). `count` = `irDiff`, `detail` = 앞의 몇 건.
     /// - `record`(HWP): 스트림(DocInfo·구역)마다 레코드 태그 멀티셋에서 사라진 레코드 — 파서가 모델에 남기지 않는 레코드.
     ///   `detail` = 태그별 개수.
-    /// - `bindata`: 그림·첨부 데이터의 내용 멀티셋에서 사라진 것(HWP 는 업스트림 `hwp5_roundtrip_batch` 의 검사).
+    /// - `bindata`: 그림·첨부 데이터의 내용 멀티셋에서 사라진 것(HWP 는 업스트림 `hwp5_roundtrip_batch` 의 검사). 내용이 빈
+    ///   항목은 잃을 것이 없어 뺀다([`drop_empty_bindata`]).
     /// - `ole-clsid`(HWP): BinData 안 OLE 개체의 루트 CLSID 가 사라진 것(같은 검사 — 한컴이 개체를 알아보지 못한다).
     /// - `cfb`(HWP): 저장본 CFB 구조(필수 스트림·구역 수). `package`(HWPX): 패키지 구조(업스트림 `check_package`).
     ///
@@ -1126,7 +1136,8 @@ impl CollabCore {
         } else {
             let (records, detail) = lost_records(&before, &after);
             push("record", records, detail);
-            if let (Some(a), Some(b)) = (bindata_fingerprint(&orig), bindata_fingerprint(&out)) {
+            if let (Some(mut a), Some(b)) = (bindata_fingerprint(&orig), bindata_fingerprint(&out)) {
+                drop_empty_bindata(&mut a);
                 let n = multiset_lost(&a, &b);
                 push("bindata", n, format!("{n}/{}", a.values().sum::<usize>()));
             }

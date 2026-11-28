@@ -10,6 +10,14 @@
 #       예: scripts/update-patch.sh 0002-studio-collab-plugin.patch rhwp-studio/src/main.ts
 #
 # 빌드 산출물(rhwp-studio/public/rhwp.js 등 업스트림이 추적하는 파일)은 패치에 넣지 않는다.
+#
+# bootstrap.sh 의 적용 기록(upstream/rhwp/.git/cc-applied: series + 패치 사본)도 맞춘다. 여기서 쓴 패치는 트리에서 뽑은
+# 것이라 트리는 이미 그 패치를 적용한 상태다. 기록 사본이 옛 판으로 남으면, 그 뒤 다른 패치가 바뀐 커밋을 받았을 때
+# bootstrap 이 트리("옛 0001 + 새 0002")를 알아보지 못하고 멈춘다.
+#
+# 처음에 적용 기록이 지금 patches/ 와 같은지(이름·순서·내용) 본다. 다르면 patches/ 가 트리보다 새롭다(새 커밋을 받고
+# bootstrap 을 아직 안 함). 그 트리에서 패치를 뽑으면 새 패치를 옛 판으로 조용히 덮어쓰므로, 아무것도 쓰지 않고 멈춘다.
+# 기록이 없는 체크아웃(이 기능 전)은 확인할 수 없어 경고만 하고 진행한다.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -44,11 +52,51 @@ if [ $# -gt 0 ]; then
   case "${target_patch}" in *.patch) ;; *) die "패치 이름은 .patch 로 끝나야 합니다";; esac
   [ $# -gt 0 ] || die "<경로>를 하나 이상 주세요"
   extra_paths=("$@")
+fi
+
+# ── 트리가 지금 patches/ 의 판인가(bootstrap 의 적용 기록으로 본다) ──
+record_dir="$(cd "$(git rev-parse --git-dir)" && pwd)/cc-applied"
+if [ -f "${record_dir}/series" ]; then
+  shopt -s nullglob
+  current=()
+  for f in "${patch_dir}"/*.patch; do current+=("$(basename "${f}")"); done
+  shopt -u nullglob
+  recorded=()
+  while IFS= read -r n; do [ -n "${n}" ] && recorded+=("${n}"); done < "${record_dir}/series"
+  stale=()
+  if [ "${current[*]-}" != "${recorded[*]-}" ]; then
+    stale+=("적용 순서: 기록 [${recorded[*]-}] / patches/ [${current[*]-}]")
+  fi
+  for n in ${current[@]+"${current[@]}"}; do
+    cmp -s "${patch_dir}/${n}" "${record_dir}/${n}" 2>/dev/null || stale+=("${n}")
+  done
+  if [ "${#stale[@]}" -gt 0 ]; then
+    printf '  %s\n' "${stale[@]}" >&2
+    die "patches/ 가 트리보다 새롭습니다(위 패치가 upstream/rhwp 에 적용된 판과 다름 — 새 커밋을 받고 bootstrap 을 하지 않은 듯합니다). 먼저 scripts/bootstrap.sh 를 실행하세요. 아무것도 쓰지 않았습니다"
+  fi
+else
+  echo "update-patch: 경고: 적용 기록(upstream/rhwp/.git/cc-applied)이 없어 트리가 지금 patches/ 의 판인지 확인하지 못했습니다(scripts/bootstrap.sh 를 한 번 실행하면 생깁니다)" >&2
+fi
+# 새 패치 파일은 확인을 지난 뒤에 만든다
+if [ -n "${target_patch}" ]; then
   [ -e "${patch_dir}/${target_patch}" ] || : > "${patch_dir}/${target_patch}"
 fi
 
 claimed="$(mktemp)"
 trap 'rm -f "${claimed}"' EXIT
+
+# bootstrap 의 적용 기록 — 패치 사본을 트리에 적용된 판(= 방금 쓴 패치)으로
+synced=()
+sync_record() {
+  local name
+  name="$(basename "$1")"
+  mkdir -p "${record_dir}"
+  if ! cmp -s "$1" "${record_dir}/${name}" 2>/dev/null; then
+    cp "$1" "${record_dir}/${name}.tmp"
+    mv "${record_dir}/${name}.tmp" "${record_dir}/${name}"
+  fi
+  synced+=("${name}")
+}
 
 shopt -s nullglob
 for patch in "${patch_dir}"/*.patch; do
@@ -81,8 +129,15 @@ for patch in "${patch_dir}"/*.patch; do
     printf '%s\n' "${new}" > "${patch}"
     echo "update-patch: 갱신: ${name} ($(printf '%s\n' "${new}" | grep -c '^diff --git') 파일)"
   fi
+  # 그대로여도 맞춘다 — 이 수정 전에 남은 옛 사본도 고쳐진다
+  sync_record "${patch}"
 done
 shopt -u nullglob
+# 적용 순서 = patches/ 의 이름 순서(bootstrap 과 같다). 모든 패치를 트리에서 뽑았으니 트리에는 이 패치들이 적용돼 있다.
+if [ "${#synced[@]}" -gt 0 ]; then
+  printf '%s\n' "${synced[@]}" > "${record_dir}/series.tmp"
+  mv "${record_dir}/series.tmp" "${record_dir}/series"
+fi
 
 unclaimed=()
 while IFS= read -r p; do

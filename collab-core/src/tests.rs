@@ -1719,3 +1719,29 @@ fn hancom_paste_fragments_are_escaped_xml_rhwp_builds_not_a_raw_channel() {
         Err(_) => assert_eq!(d.digest(), before, "실패하면 문서는 그대로"),
     }
 }
+
+#[test]
+fn roundtrip_check_ignores_empty_bin_data_hwp3_link_placeholders_leave() {
+    // hwp3-sample10: 그림 셋이 연결(Link) 그림이라 내용이 없고, HWP3 파서가 채워 둔 빈 자리(id 0)를 HWP5 저장기가 빈 deflate
+    // `BIN0000.` 스트림으로 쓴다 — 다시 읽으면 아무 레코드도 가리키지 않아 사라지지만 잃는 내용은 없다(거짓 경고였다).
+    let bytes = sample("samples/hwp3-sample10.hwp");
+    let c = CollabCore::new(DocumentCore::from_bytes(&bytes).unwrap());
+    let saved = c.export_hwp_native().unwrap();
+    let fp = crate::diagnostics::hwp5_roundtrip_batch::bindata_fingerprint(&saved).expect("CFB");
+    assert_eq!(fp.get(&super::bytes_hash(&[])), Some(&1), "저장본에 빈 BinData 하나(전제): {fp:?}");
+    let v = c.roundtrip_check().unwrap();
+    assert!(!v["lost"].as_array().unwrap().iter().any(|l| l["kind"] == "bindata"), "{v}");
+}
+
+#[test]
+fn empty_bin_data_is_dropped_from_the_original_fingerprint_only() {
+    use crate::diagnostics::hwp5_roundtrip_batch::multiset_lost;
+    let empty = super::bytes_hash(&[]);
+    let image = super::bytes_hash(b"PNG...");
+    let mut orig = std::collections::BTreeMap::from([(empty, 1), (image, 2)]);
+    super::drop_empty_bindata(&mut orig);
+    assert_eq!(orig, std::collections::BTreeMap::from([(image, 2)]));
+    // 내용 있는 항목이 사라진 것은 그대로 센다
+    assert_eq!(multiset_lost(&orig, &std::collections::BTreeMap::from([(image, 1)])), 1);
+    assert_eq!(multiset_lost(&orig, &std::collections::BTreeMap::new()), 2);
+}

@@ -17,6 +17,7 @@ import type { EngineDoc, TextCaret } from './engine/engine.ts';
 import { CATALOG } from './engine/catalog.ts';
 import { FONT_POLICY } from './engine/types.ts';
 import { CollabUndo } from './undo.ts';
+import { closeModal, focusInput, markModal, shieldInput } from './overlay.ts';
 import {
   CollabSession, DISCONNECT_BANNER, PHASE_TEXT, desyncedBannerText, leftBanner, noticeTexts,
   type CaretSnapshot, type CollabHost, type SessionEvent, type TokenProvider, type Transport, type TransportFactory,
@@ -132,6 +133,7 @@ const NAME_PANEL_STYLE = 'background:#fff;color:#222;border-radius:8px;box-shado
 function showNamePrompt(onAnswer: (name: string) => void): () => void {
   const root = document.createElement('div');
   root.dataset.collab = 'name-prompt';
+  markModal(root);
   root.setAttribute('role', 'dialog');
   root.setAttribute('aria-modal', 'true');
   root.setAttribute('aria-label', NAME_PROMPT_TEXT);
@@ -158,21 +160,19 @@ function showNamePrompt(onAnswer: (name: string) => void): () => void {
   form.append(label, input, actions);
   root.appendChild(form);
   document.body.appendChild(root);
-  // studio 의 단축키·입력 처리가 이 칸의 키를 가져가지 않게(기본 동작 — 글자 넣기·Enter 로 보내기 — 은 그대로)
-  for (const type of ['keydown', 'keypress', 'keyup', 'beforeinput', 'input', 'compositionstart', 'compositionupdate', 'compositionend']) {
-    input.addEventListener(type, (e) => e.stopPropagation());
-  }
+  // studio 의 단축키·입력 처리와 포커스 되가져가기가 이 칸을 건드리지 않게(./overlay.ts)
+  shieldInput(input);
   let done = false;
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     if (done) return;
     done = true;
-    root.remove();
+    closeModal(root);
     onAnswer(input.value.trim());
   });
   root.addEventListener('mousedown', (e) => { if (e.target === root) { e.preventDefault(); input.focus(); } });
-  setTimeout(() => input.focus(), 0);
-  return () => { done = true; root.remove(); };
+  focusInput(input);
+  return () => { done = true; closeModal(root); };
 }
 
 /** studio 의 토큰 공급자: 링크로 받은 토큰을 그대로. 링크 하나로는 새 토큰을 받을 길이 없다(만료면 다시 열어야 함). */

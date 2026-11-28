@@ -52,7 +52,8 @@ export class Canonical {
         if (!this.pending.delete(id)) return;
         this.log(`정본 워커가 ${this.timeoutMs}ms 안에 답하지 않음(${op}) — 버림`);
         if (this.worker === worker) { this.worker = null; worker.terminate(); }
-        resolve({ ok: false, panic: true, reason: `정본 워커 시간 초과(${op})` });
+        // timeout: 시간 제한을 넘겼다(패닉과 달리 문서가 커서 오래 걸리는 경우가 대부분 — 호출한 쪽이 안내를 고른다)
+        resolve({ ok: false, panic: true, timeout: true, reason: `정본 워커 시간 초과(${op})` });
       }, this.timeoutMs);
       this.pending.set(id, { resolve, timer });
       worker.postMessage({ id, op, ...payload });

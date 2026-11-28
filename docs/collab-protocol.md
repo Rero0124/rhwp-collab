@@ -49,6 +49,9 @@
 
 `name` 이 없는 토큰(예: 서버가 만든 초대 토큰)은 여러 사람이 나눠 쓴다. 그래서 표시 이름은 `hello.name`(사용자가 입력한
 값, **확인되지 않은 표시용**)을 쓰고, `sub` 에는 서버가 연결마다 다른 꼬리를 붙인다(`invite~1a2b3c4d`).
+studio 는 이름이 없는 초대 링크로 들어올 때 화면 안 입력 칸으로 이름을 한 번 묻고 그 기기에 기억한다(묻는 동안은 연결하지
+않는다, 부품 전용 서버에서는 묻지 않는다). launcher 의 "이 방으로 들어가기"는 만들기 토큰에 `name` 이 있으면 그 이름을 편집
+링크의 주소 조각(`#name=`)에 실어 다시 묻지 않는다 — 나눠 주는 링크에는 싣지 않는다.
 
 **입장 이름.** 서버는 `hello` 때 이름(토큰의 `name`, 없으면 `hello.name`)을 한 번 다듬어 그 연결의 이름으로 정한다. 규칙은
 rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자르고, `/`·`\`·`;`·제어 문자를 빼고, 64 UTF-16 단위로 자른다
@@ -152,7 +155,7 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 
 | `type` | 필드 | 설명 |
 |---|---|---|
-| `welcome` | `seq`, `base`, `log`, `maxMessageBytes`, `generation?`, `user?`, `resync?`, `encryptedSource?`, `allowEncrypted?`, `roundtrip?` | 방에 들어옴. `base` = 기준점(gzip 바이트의 base64) 또는 `null`(첫 참여자 — `base` 를 보내야 함). `log` = 기준점 뒤 묶음들. `generation` 은 0 이면 없다. `user` 는 인증을 켠 서버만 `{sub, name, scope}`. `encryptedSource: true` 는 원래 암호 문서였던 방(참여자에게 한 번 알린다), `roundtrip` 은 방을 열 때의 왕복 점검에 경고가 있던 방의 요약(§5 — 참여자에게 한 번 알린다), `allowEncrypted: true` 는 `base: null` 일 때 서버가 암호 문서를 받는다는 뜻(§4.1). 기록이 길면 나눠 보낸다(아래) |
+| `welcome` | `seq`, `base`, `log`, `maxMessageBytes`, `generation?`, `user?`, `resync?`, `encryptedSource?`, `allowEncrypted?`, `roundtrip?` | 방에 들어옴. `base` = 기준점(gzip 바이트의 base64) 또는 `null`(첫 참여자 — `base` 를 보내야 함). `log` = 기준점 뒤 묶음들. `generation` 은 0 이면 없다. `user` 는 인증을 켠 서버만 `{sub, name, scope}`. `encryptedSource: true` 는 원래 암호 문서였던 방(참여자에게 한 번 알린다), `roundtrip` 은 방을 열 때의 왕복 점검이 통과가 아니던(경고 또는 점검 못 함) 방의 결과(§5 — 참여자에게 한 번 알린다), `allowEncrypted: true` 는 `base: null` 일 때 서버가 암호 문서를 받는다는 뜻(§4.1). 기록이 길면 나눠 보낸다(아래) |
 | `catchup` | `seq`, `log`, `maxMessageBytes`, `user?`, `cont?` | 다시 붙은 참여자에게 끊긴 동안의 묶음만(§4.6). `cont: true` 는 나눠 보낸 `welcome` 의 이어지는 조각 |
 | `ops` | `seq`, `clientId`, `entries`, `batchId?`, `sub?`, `replaced?` | 확정된 묶음. 모두에게 보낸다. 보낸 사람에게는 확정(ack)이다. `replaced: true` 면 서버가 묶음 안의 `state` 를 다시 쓴 바이트로 바꿨다(§4.2) |
 | `reject` | `seq`, `batchId?` | 묶음의 `base` 가 서버 seq 와 다르다. 보낸 사람에게만 |
@@ -164,6 +167,7 @@ rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자
 | `diverged` | `seq` | 그 seq 의 digest 가 정본과 다르다(정본이 없는 서버는 처음 보고와 다르면 방 전체에) |
 | `cursor` | `clientId`, `name`, `seq`, `caret` | 다른 참여자의 캐럿. `name` 은 서버가 정한 표시 이름 |
 | `cursor-leave` | `clientId` | 참여자가 나감 |
+| `roundtrip` | `roundtrip` | 방을 연 뒤 뒤에서 끝난 왕복 점검이 통과가 아니다(경고 `ok: false` 또는 점검 못 함 `ok: null`, §5). 그때 방에 있던 참여자에게 한 번. 그 뒤 들어오는 참여자는 `welcome.roundtrip` 으로 받는다 |
 | `error` | `error` | 규약 위반(형식이 틀림, hello 전 메시지 등). 연결은 둔다 |
 
 **`welcome` 나눠 보내기:** 기준점 + 기록이 상한을 넘으면 첫 조각은 `welcome`(그 `seq` 는 첫 조각의 마지막 seq), 나머지는
@@ -336,7 +340,7 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
 - `201 {room, invite?, inviteExpiresAt?}`. 서버가 토큰을 만들 수 있으면(`hs256`) `invite` 에 그 방 전용 초대 토큰을 권한마다
   하나씩 준다: `{edit, view, form, comment}`. 초대 토큰은 `room` = 새 방, `scope` = 그 권한, `sub: "invite"`, `name` 없음,
   수명 `COLLAB_INVITE_TTL`(기본 24시간)이다. `url` 방식은 `{room}` 만 주고, 토큰은 바깥 시스템이 발급한다.
-- 실패: 415(HWP·HWPX 가 아님), 422(정본이 열지 못함), 413(메시지 상한을 넘음 — `welcome` 에 실을 수 있어야 한다), 501(정본이 꺼짐).
+- 실패: 415(HWP·HWPX 가 아님), 422(정본이 열지 못함 — `invalid-document`; 여는 데 정본 워커 시간 제한 `COLLAB_CANONICAL_TIMEOUT_MS` 를 넘기면 `{error: "too-slow", reason: "too-slow"}` — 대개 문서가 커서다, 업로드 페이지·launcher 는 "문서가 커서 여는 데 너무 오래 걸립니다"로 알린다), 413(메시지 상한을 넘음 — `welcome` 에 실을 수 있어야 한다), 501(정본이 꺼짐).
 - **암호 문서:** 기본으로 받지 않는다 — `400 {error: "encrypted", reason: "encrypted", allowed: false}`(rhwp 의 "암호 필요"
   오류를 일반 오류 422 와 구분한다). 서버가 `COLLAB_ALLOW_ENCRYPTED=1` 이면 `allowed: true` 로 답하고, 요청 머리
   `X-Collab-Document-Password` 로 문서 암호를 주면 그 암호로 열어 **암호 없는 바이트**를 방의 처음 기준점으로 쓴다(틀리면
@@ -344,11 +348,18 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
   기록하지 않는다.
 - **왕복 점검(6단계 S2):** rhwp 는 저장할 때 손대지 않은 부분의 원본 바이트를 그대로 쓴다. 그래서 "저장 후 비교"는 rhwp 가
   모르는 기능이 있어도 통과하고, 문제는 그 부분을 편집해 모델에서 다시 쓸 때 생긴다. 서버는 방을 만들 때 정본으로 **모든
-  부분을 모델에서 다시 쓴 결과**를 원본과 한 번 견주고(`collabRoundtripCheck`), 결과 `roundtrip: {ok, lost: [{kind, count,
-  detail?}], irDiff}` 를 응답과 방 메타에 싣는다. `ok: false` 면 그 방의 `welcome` 에도 요약을 실어 참여자가 처음 들어올 때
-  한 번 알린다("이 부분이 있는 쪽을 편집하면 사라질 수 있습니다"). 서버 설정 `COLLAB_ROUNDTRIP`: `warn`(기본 — 알리고 방은
-  만든다) | `block`(통과하지 못하면 방을 만들지 않는다 — `422 {error: "roundtrip", reason: "roundtrip", roundtrip}`) |
-  `off`. 점검 보조가 없는 서버는 점검하지 않고 `roundtrip` 을 싣지 않는다.
+  부분을 모델에서 다시 쓴 결과**를 원본과 한 번 견준다(`collabRoundtripCheck`). 결과는 `roundtrip: {ok, lost: [{kind, count,
+  detail?}], irDiff, reason?}` — `ok: true` 통과, `false` 경고, `null` 점검 못 함(`reason: "timeout"` 시간 상한을 넘음,
+  `"error"` 점검 워커 실패). 통과가 아니면 그 방의 `welcome` 에 결과를 실어 참여자가 처음 들어올 때 한 번 알린다("이 부분이
+  있는 쪽을 편집하면 사라질 수 있습니다").
+  - 점검은 방의 정본 워커가 아닌 **따로 둔 워커**에서 돈다(큰 표 문서는 수십 초 걸린다 — 그동안 정본 편집이 멈추지 않게).
+    열기 + 점검에 시간 상한 `COLLAB_ROUNDTRIP_TIMEOUT_MS`(기본 15000)를 두고, 넘으면 그 워커를 버린다.
+  - `COLLAB_ROUNDTRIP=warn`(기본): 응답을 점검 때문에 붙잡지 않는다. 방을 먼저 만들고 응답에는 `roundtrip: {pending: true}`
+    를 싣는다. 점검이 끝나면 결과를 방 메타에 남기고, 통과가 아니면 그때 방에 있는 참여자에게 `roundtrip` 메시지(§3.2)를 한
+    번 보낸다.
+  - `block`: 상한까지 기다린다. 통과면 응답에 결과를 싣고, 아니면 방을 만들지 않는다 — 경고는 `422 {error: "roundtrip",
+    reason: "roundtrip", roundtrip}`, 점검 못 함은 `reason: "roundtrip-timeout"`·`"roundtrip-error"`(모르는 위험은 막는다).
+  - `off`: 점검하지 않는다. 점검 보조가 없는 서버도 점검하지 않고 `roundtrip` 을 싣지 않는다.
 - 같은 출처가 아닌 브라우저 요청은 Origin 허용 목록을 따른다. CORS 는 열지 않는다(바깥 시스템은 서버끼리 부른다).
 
 ### `GET /rooms/{room}/document` — 최신 문서 파일
@@ -445,43 +456,151 @@ window.addEventListener('message', async (event) => {
 
 ## 8. 알려진 한계
 
-### 8.1 서버가 결과(`state`)를 다시 써도 남는 자리
+### 8.1 서버가 결과(`state`)를 다시 쓸 때의 날 바이트 자리
 
-서버는 `edit` 연결이 보낸 `state` 를 바뀐 부분만 모델에서 다시 쓴다(§4.2). 그래도 아래 자리는 남는다. rhwp 가 한컴 원본을
-잃지 않으려고 **해석하지 않은 바이트를 모델에 그대로 들고 있다가 저장기가 다시 쓰는 곳**이다. 편집 권한자가 여기 넣은 바이트는
-서버가 다시 쓴 바이트 S 에도 남고, 모든 참여자와 저장본에 간다(기존 코드 세션 조사, 2026-11-27).
+서버는 `edit` 연결이 보낸 `state` 를 바뀐 부분만 모델에서 다시 쓴다(§4.2). rhwp 는 한컴 원본을 잃지 않으려고 **해석하지 않은
+바이트를 모델에 그대로 들고 있다가 저장기가 다시 쓰는 자리**를 많이 갖고 있다. 다시 쓸 때 이 자리를 아래처럼 다룬다(6단계 결과
+다시 쓰기 강화, `collab-core/src/rewrite_raw.rs`). 원본 바이트를 그대로 쓰는 구역·DocInfo(정본의 봉인된 바이트와 같다)는
+그 날 바이트도 정본 것이라 건드리지 않는다. 봉인은 기준이 되지 못한다 — 읽을 때 그 바이트로 다시 계산되어 보낸 사람의 바이트를
+보증해 버린다.
 
-(가) HWP, 구역 스트림
+**방식**
 
-- 문단: `Paragraph.raw_header_extra`, `Paragraph.ctrl_data_records`
-- 구역 정의: `SectionDef.raw_ctrl_extra`, `SectionDef.extra_child_records`
+- **사양 모양(숫자 필드만 남긴다):** 문단 머리 꼬리 `Paragraph.raw_header_extra` 는 길이 0·10·12(더 길면 자른다), 렌더링 행렬
+  `ShapeComponentAttr.raw_rendering` 은 길이가 정확히 50 + 96N(N = 앞 u16)일 때만, 문서 속성 `raw_data` 는 26바이트면 그대로.
+- **정본이 본 내용일 때만 둔다:** 그 밖의 자리. 자리 종류마다 **문서 전체에서 같은 내용**을 찾는다(개수는 보지 않는다 — 이미
+  문서에 있는 바이트를 같은 종류의 다른 자리로 옮기는 것은 새 내용이 아니다. 종류를 넘나들지는 않는다). 없으면 비워 저장기가
+  모델에서 다시 만들거나 기본값을 쓴다. 저장기·정상 편집이 고쳐 쓰는 숫자 바이트는 가리고 견준다: 그림 꼬리 1..5(개체 번호),
+  구역 정의 꼬리 2..4(바탕쪽 목록 수)·6..8(메모 모양 번호), 바탕쪽 목록 머리 18..20, 셀 꼬리 0..4(글 영역 너비).
+- **정본이 본 내용**은 방이 살아 있는 동안 모은다: 정본을 열 때(재시작 복원 포함, 기록 재생 전 — `collabTrackRawSeen`), 결과를
+  읽을 때마다(읽기 전·후 문서), 다시 쓰기 직전의 정본. 되돌리기 계열 `state`(`restoreSnapshot` 등)가 지금 정본에 없는 옛 내용을
+  되살려도 잃지 않는다.
+
+**자리**
+
+(가) HWP, 구역 스트림 — 정본이 본 내용일 때만
+
+- 문단 `Paragraph.ctrl_data_records`, 묶음 자식 `ShapeComponentAttr.ctrl_data`
+- 구역 정의 `SectionDef.raw_ctrl_extra`, `SectionDef.extra_child_records`(레코드 단위 — 원본 바탕쪽 목록에 모르는 것이 있으면
+  그 범위를 모두 버려 모델이 바탕쪽을 쓴다)
 - 머리말·꼬리말 `Header`/`Footer.raw_ctrl_extra`, 바탕쪽 `MasterPage.raw_list_header`
-- 표 `Table.raw_ctrl_data`·`raw_table_record_extra`, 셀 `Cell.raw_list_extra`
+- 표 머리 `Table.raw_ctrl_data`·수식 머리 `Equation.raw_ctrl_data`(비우면 `common` 으로 다시 쓴다 — 잃는 것이 없다),
+  `Table.raw_table_record_extra`, 셀 `Cell.raw_list_extra`
 - 그림 `Picture.raw_picture_extra`, 개체 공통 `CommonObjAttr.raw_extra`
-- 도형 `ShapeComponentAttr.raw_rendering`, 글상자 `TextBox.raw_list_header_extra`, 연결선 `ConnectorData.raw_trailing`,
-  다각형 `PolygonShape.raw_trailing`
-- 차트 `ChartShape.raw_chart_data`, OLE `OleShape.raw_tag_data`, 수식 `Equation.raw_ctrl_data`
+- 글상자 `TextBox.raw_list_header_extra`, 연결선 `ConnectorData.raw_trailing`, 다각형 `PolygonShape.raw_trailing`
+- 차트 `ChartShape.raw_chart_data`, OLE `OleShape.raw_tag_data`
 
-(나) HWP, DocInfo 항목
+(나) HWP, DocInfo 항목 — 정본이 본 내용일 때만
 
-- 글꼴, 글자 모양, 문단 모양, 번호, 글머리표, 탭, 스타일, 테두리·배경, BinData 항목, 문서 속성의 `raw_data`.
-- 항목마다 봉인이 지금 모델과 맞으면 저장기가 원본 레코드를 그대로 쓴다. 그래서 레코드 안의, 해석 범위 밖 꼬리가 남는다.
+- 글꼴, 글자 모양, 문단 모양, 번호, 글머리표, 탭, 스타일, 테두리·배경, BinData 항목의 `raw_data`(문서 속성은 위 사양 모양)
+- DocInfo 의 모르는 레코드 `extra_records`(레코드 단위, 개수까지)와 구역 끝 목록 `trailing_lists`(묶음 단위 — 메모·확장
+  바탕쪽 목록은 버리면 모델에서 다시 쓴다)는 6단계 S1 결정 (C)대로
 
-(다) HWPX, 원문 그대로 다시 넣는 XML 조각
+(다) HWPX, 원문 그대로 다시 넣는 XML 조각 — 정본이 본 내용일 때만
 
-- `DocInfo.memo_properties_xml`, `Field.raw_parameters_xml`, `Numbering.raw_para_heads`·`Bullet.raw_para_head`
+- `DocInfo.memo_properties_xml`(비우면 메모 모양 레코드로 다시 쓴다), `DocInfo.hwpx_head_tail`(비우면 기본 문서 설정),
+  `Numbering.raw_para_heads`, `Bullet.raw_para_head`(비울 때 그림 번호를 모델 필드로 옮긴다), `Field.raw_parameters_xml`
 
-(라) 성격상 불투명한 내용
+(라) 성격상 불투명한 내용 — 그대로
 
-- 참조되는 BinData 바이트(그림·OLE). 참조되지 않는 것은 버린다.
+- 참조되는 BinData 바이트(그림·OLE). 참조되지 않는 것은 버린다. 받는 쪽 프로그램이 그 내용을 다루는 방식의 문제다.
 
-**막힌 것(참고):**
+**op 인자로 들어오는 날 바이트**(다시 쓰기로는 막지 못한다 — op 는 모든 참여자가 그대로 적용한다): 정본 워커가 적용하기 전에
+`collabCheckOpArgs` 로 본다. 문단 나누기 다섯 함수(`splitParagraph`·`…InCell`·`…InCellByPath`·`…InFootnote`·
+`…InHeaderFooter`)의 `removedParaMeta.raw_header_extra` 는 길이 0·10·12 만 받고 아니면 `invalid`.
 
-- 파서가 모델에 남기지 않는 레코드
-- DocInfo 의 모르는 레코드, 구역 끝 목록에 끼운 내용(정본에 같은 내용이 없으면)
-- 부속 스트림, HWPX 부속 항목, 미리보기, 파일 머리(정본 것을 쓴다)
-- 참조되지 않는 BinData
+**한컴 조각 붙여넣기(`pasteHwpJson`, op):** 한컴 조각은 rhwp가 JSON에서 이스케이프해 만든 XML이라 원문·날 바이트 통로가
+아니다. 남는 위험은 변환기 이스케이프 결함이고, 시험으로 지킨다(`collab-core` `hancom_paste_fragments_are_escaped_xml_rhwp_builds_not_a_raw_channel`).
+JSON 모델에서 XML 을 거치지 않고 문서로 가는 것은 그림 바이트(`bins`, (라)와 같다)뿐이다.
 
-**다음 후보:** 위 (가)~(다)의 자리도 막는다. 해석하지 않은 바이트를 그대로 들고 있는 대신, 정본에 같은 자리의 같은 바이트가
-있을 때만 그 바이트를 쓰고 아니면 버리거나 모델에서 다시 만든다(구역 끝 목록에 쓴 방식과 같다). (라)는 그림·OLE 내용 자체라
-막을 수 없고, 받는 쪽 프로그램이 그 내용을 다루는 방식의 문제다.
+**한계**
+
+- 정본이 본 내용의 기록은 방 메타에 남기지 않는다. 재시작 복원은 "기준점 + 그 뒤 기록 재생"이라 재생 중에 `state` 를 읽을
+  때마다 모으면 그 세대 동안 정본이 가졌던 것이 다시 모인다. 세대 전환은 방이 비었을 때만 일어나고, 그 뒤 들어오는 사람은
+  welcome 으로 되돌리기 스택이 비워지므로 앞 세대의 내용으로 되돌릴 사람이 없다.
+- op 로 생겼다가 결과를 읽기 전에 지워진 날 바이트는 기록에 없을 수 있다. op 가 만드는 날 바이트(책갈피·누름틀 CTRL_DATA,
+  표 머리 등)는 비워도 모델에서 다시 만들어진다.
+- 정본이 본 적 없는 날 바이트는 비우므로, 모델이 다 표현하지 못하는 자리(그림 효과, OLE 속성, 차트, 그림 링크·누름틀 이름의
+  CTRL_DATA 등)에 그런 바이트가 오면 그 내용은 사라진다. 정상 편집은 이런 바이트를 새로 만들지 않는다(조사, 2026-11-27).
+  `importParagraphBlock`(state)이 다른 문서에서 가져온 번호·글머리표 원문 조각은 버려지고 모델에서 다시 쓴다(`checkable` 같은
+  모델 밖 속성을 잃는다). 그림 글머리표의 BinData 번호가 255 를 넘으면 원문 조각을 비울 때 그림을 잃는다.
+- 숫자 비트 자리(`raw_attr`, `raw_break_type` 등)는 내용을 싣지 못해 다루지 않는다.
+- (참고) 업스트림 HWPX 파서는 글머리표 `char` 속성을 이스케이프를 풀지 않고 읽는다 — `"`·`&`·`<` 글머리표 글자가 `&` 로
+  읽힌다(통로는 아니다, 충실도 결함).
+
+## 9. 다른 플랫폼에서 클라이언트 만들기 (6단계 N1)
+
+§4 의 클라이언트 동작(연결·hello·welcome/catchup·재접속·보내기·재동기화·digest·커서·권한)은 플랫폼 중립 세션
+`collab-client/src/session/` 의 `CollabSession` 이 한다. DOM·studio 를 쓰지 않는다(시험이 `window`·`document`·`location`·
+`localStorage`·`sessionStorage`·`DecompressionStream` 이 없는지 본다). 다른 편집기·플랫폼은 아래 넷을 넘겨 같은 세션을 쓴다.
+studio 어댑터 `collab-client/src/plugin.ts` 가 예다.
+
+**현재 한계:** 편집 기록 엔진(`CollabEngine`, `collab-client/src/engine/`)이 TypeScript 다. 세션은 그 엔진을 만들어 쓰므로,
+JS 런타임이 없는 네이티브 클라이언트는 엔진을 옮기거나 같은 규약(§3·§4, 기록 형태와 되감기·보정 규칙)을 따로 구현해야
+한다. 엔진의 조율 부분을 Rust(`collab-core`)로 옮기는 일은 아직 정하지 않았다. 문서 자체는 rhwp(WASM 또는 네이티브)다.
+
+### 9.1 넘기는 것
+
+- **`Transport`(연결 하나):** `TransportFactory(events) → { isOpen, send(text), close() }`. 사건은 `open()`, `message(text)`
+  (서버 메시지 하나, JSON 문자열), `close()`(닫힘·오류 모두, 한 번)이고, 만든 함수가 돌아온 뒤에 부른다. 세션은 재접속마다
+  새로 만들고 옛 연결의 사건은 버린다. `send` 는 열려 있지 않으면 버린다. 브라우저는 WebSocket 을 그대로 감싼다.
+- **`CollabHost`(편집기):**
+
+  | 메서드 | 하는 일 |
+  |---|---|
+  | `doc()` | 지금 문서(rhwp 문서 핸들). 없으면 null |
+  | `ensureDoc()` | 첫 참여자: 열린 문서가 없으면 빈 문서를 만든다 |
+  | `isEncrypted()` | 지금 문서가 암호 문서인가(§4.1, 모르면 false) |
+  | `exportState()` | `base` 로 올릴 바이트(`collabExportState`, gzip) |
+  | `openDoc(bytes)` | 받은 바이트로 문서를 연다(gzip 이면 풀어서, 확인 창 없이) |
+  | `layoutPolicyHolds(doc)` | 모두 같은 조판 규칙(글꼴 정책)이 걸렸나 — 아니면 세션이 나간다 |
+  | `applyExternal(kind, fn)` | 원격 반영 구역(`resync`·`replay`·`remote`·`replaced`). 그 안의 변경은 사용자 편집이 아니다(기록·되돌리기·자동 저장 밖), 끝나면 화면을 갱신한다 |
+  | `captureCaret()` / `restoreCaret(snap, moved)` | 캐럿 스냅숏. `text` 는 엔진 좌표(못 바꾸면 null), 나머지는 편집기 좌표. 원격 반영 뒤 `moved`(없으면 원래 자리)에 놓는다. 스냅숏이 null 이면 캐럿 없음 |
+  | `isComposing()` | 입력기 조합 중인가(조합 중에는 원격을 보류하고 보내지 않는다) |
+  | `event(e)` | 세션이 알리는 일(§9.2) |
+  | `log(level, msg)` | 개발자 진단(선택) |
+
+- **`TokenProvider`:** §2.1 그대로(`connect`·`reconnect`·`expired`). 세션 안의 `AuthSession` 이 부른다.
+- **`Clock`:** `now`·`setTimeout`·`clearTimeout`·`setInterval`·`clearInterval`(기본 globalThis — 시험에서 바꿔 끼운다).
+
+편집기는 세션에 이런 일을 알린다: 문서 호출을 `session.engine.intercept(...)` 로 가로채 기록, 내 편집이 기록됨
+`edited()`, 문서 표시가 바뀜 `changed()`, 조합 끝 `compositionEnded()`, 편집기가 문서를 바꿈 `documentSwapped()`(세션이 일으킨
+것이 아니면 방을 나간다). 되돌리기를 붙이면 `setUndo({ onRemote, clear })`(start 전). 이탈 확인은 `hasUnconfirmedEdits()`.
+권한 문(`engine.setScope`)과 메모 작성자(`engine.setMemoAuthor`)는 세션이 입장 때 건다 — 편집기가 하지 않는다.
+
+### 9.2 세션이 알리는 것
+
+문구는 정하지 않고 이유 코드로 넘긴다. 기본 한국어 문구는 `session/texts.ts`(`noticeTexts`·`leaveText`·`leftBanner`·
+`resyncCauseText`·`PHASE_TEXT`)에 있고, 편집기는 그대로 쓰거나 덮어쓴다.
+
+| 사건 | 뜻 | 편집기가 할 일(studio 예) |
+|---|---|---|
+| `status` | 상태가 바뀜(`session.phase`·`lastSeq`·`name`) | 상태 표시 |
+| `cursors` | 다른 사람 커서가 바뀜(`session.cursors`, 엔진 좌표) | 커서 그리기 |
+| `notice` | 안내 하나(아래 코드) | 잠깐 보이는 안내 |
+| `disconnected` / `reconnected` | 방에 들어간 뒤 끊김 / 다시 붙음 | 배너 / 걷기 |
+| `admitted` | 확인된 사용자·권한(`welcome.user`) | 화면 일(양식 모드 등) |
+| `desynced` | 동기화가 깨져 멈춤(까닭 코드) | 새로고침 안내 |
+| `left` | 방에서 나옴(까닭 코드) | 빌린 자원을 풀고 안내 |
+
+- **안내(`notice.code`):** `joined`, `resynced`, `resume-fallback`, `reconnected{received}`, `long-disconnect`,
+  `dropped{count}`, `too-large`, `invalid`, `forbidden{reason}`, `denied{message}`(엔진 권한 문), `view-only`,
+  `encrypted-source`, `roundtrip{result}`.
+- **재동기화 까닭(`ResyncCause`):** `seq-gap{expected, got, during}`, `apply-failed{error, during}`, `diverged{seq}`,
+  `invalid{reason}`, `forbidden{reason}`, `too-large{limit, side}`, `error{error}`, `limit{limit, last}`(1분 3회를 넘음 —
+  `desynced` 에서만).
+- **나온 까닭(`LeaveReason`):** `swapped`, `incompatible`, `encrypted`, `base-too-large`, `base-invalid{reason}`,
+  `base-forbidden`, `font-policy`, `unauthorized{reason, unsent}`, `host{detail}`(편집기가 `leave` 로 나가게 함).
+- **상태(`session.phase`):** `left` > `desynced` > `connecting` > `closed` > `resyncing` > `loading` > `sending` > `synced`
+  (앞의 것이 이긴다). `session.status()` 는 진단용 전체 상태다(studio 의 `__collab.status()`).
+
+```ts
+const session = new CollabSession({ room, name, transport, host, getToken });
+editor.onCall((method, args, invoke, target) => session.engine.intercept(method, args, invoke, target));
+editor.on('mutated', () => session.edited());
+editor.on('changed', () => session.changed());
+editor.on('composition-end', () => session.compositionEnded());
+editor.on('document-swapped', () => session.documentSwapped());
+session.start();
+// 내릴 때: session.dispose()
+```

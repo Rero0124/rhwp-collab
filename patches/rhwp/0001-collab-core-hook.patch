@@ -1,3 +1,47 @@
+diff --git a/src/diagnostics/hwp5_roundtrip_batch.rs b/src/diagnostics/hwp5_roundtrip_batch.rs
+index a336a515..822c9c59 100644
+--- a/src/diagnostics/hwp5_roundtrip_batch.rs
++++ b/src/diagnostics/hwp5_roundtrip_batch.rs
+@@ -45,7 +45,8 @@ fn page_count_of(bytes: &[u8]) -> Option<u32> {
+ }
+ 
+ /// C4 — 저장본 CFB 구조 검사: 필수 스트림 존재 + 섹션 수 = IR.
+-fn cfb_structure_ok(out: &[u8], expected_sections: usize) -> (bool, String) {
++// cc-rhwp 다운스트림 패치(0001): 공동편집 왕복 점검(6단계 S2, collab-core `roundtrip_check`)이 같은 검사를 쓴다 — 보이기만 바꾼다.
++pub(crate) fn cfb_structure_ok(out: &[u8], expected_sections: usize) -> (bool, String) {
+     let reader = match CfbReader::open(out) {
+         Ok(r) => r,
+         Err(e) => return (false, format!("CFB 열기 실패: {e}")),
+@@ -69,7 +70,8 @@ fn cfb_structure_ok(out: &[u8], expected_sections: usize) -> (bool, String) {
+ /// 각 스트림은 raw deflate 해제 시도 후 실패 시 raw 바이트를 사용한다(압축 플래그 무관 정규화:
+ /// 한쪽이 압축·다른쪽이 비압축으로 같은 이미지를 저장해도 내용이 일치하면 동일 지문).
+ /// CFB 가 아니거나 열 수 없으면 `None`(검사 생략).
+-fn bindata_fingerprint(bytes: &[u8]) -> Option<BTreeMap<u64, usize>> {
++// cc-rhwp 다운스트림 패치(0001): 공동편집 왕복 점검(6단계 S2, collab-core `roundtrip_check`)이 같은 검사를 쓴다 — 보이기만 바꾼다.
++pub(crate) fn bindata_fingerprint(bytes: &[u8]) -> Option<BTreeMap<u64, usize>> {
+     let mut reader = CfbReader::open(bytes).ok()?;
+     let names = reader.list_bin_data();
+     let mut multiset: BTreeMap<u64, usize> = BTreeMap::new();
+@@ -98,7 +100,8 @@ fn bindata_fingerprint(bytes: &[u8]) -> Option<BTreeMap<u64, usize>> {
+ ///
+ /// BinData OLE 스토리지는 4바이트 LE 크기 prefix 뒤에 CFB 가 온다(#3547) — prefix 유무
+ /// 두 형태를 모두 인식한다. CFB 가 아닌 BinData(그림 등)는 건너뛴다.
+-fn nested_ole_clsid_fingerprint(bytes: &[u8]) -> Option<BTreeMap<[u8; 16], usize>> {
++// cc-rhwp 다운스트림 패치(0001): 공동편집 왕복 점검(6단계 S2, collab-core `roundtrip_check`)이 같은 검사를 쓴다 — 보이기만 바꾼다.
++pub(crate) fn nested_ole_clsid_fingerprint(bytes: &[u8]) -> Option<BTreeMap<[u8; 16], usize>> {
+     const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+     let mut reader = CfbReader::open(bytes).ok()?;
+     let names = reader.list_bin_data();
+@@ -127,7 +130,8 @@ fn nested_ole_clsid_fingerprint(bytes: &[u8]) -> Option<BTreeMap<[u8; 16], usize
+ /// orig 멀티셋에서 rt 가 덮지 못한 항목 수(= 소실된 항목 수).
+ /// rt 가 더 많이 가진 항목(gained)은 손실이 아니므로 무시한다.
+ /// C2(BinData 내용 해시)와 C2b(중첩 CLSID)가 공유한다.
+-fn multiset_lost<K: Ord>(orig: &BTreeMap<K, usize>, rt: &BTreeMap<K, usize>) -> usize {
++// cc-rhwp 다운스트림 패치(0001): 공동편집 왕복 점검(6단계 S2, collab-core `roundtrip_check`)이 같은 검사를 쓴다 — 보이기만 바꾼다.
++pub(crate) fn multiset_lost<K: Ord>(orig: &BTreeMap<K, usize>, rt: &BTreeMap<K, usize>) -> usize {
+     let mut lost = 0;
+     for (key, &cnt) in orig {
+         let have = rt.get(key).copied().unwrap_or(0);
 diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
 index d47217e2..f6f03075 100644
 --- a/src/document_core/mod.rs

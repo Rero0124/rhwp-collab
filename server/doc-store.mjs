@@ -21,7 +21,7 @@ import path from 'node:path';
 /**
  * @typedef {{ seq: number, clientId: string, entries: unknown[], batchId?: string }} LogItem
  * @typedef {{ room: string, generation: number, baseSeq: number, engine: string, baseFormat: 'hwp'|'hwpx',
- *   docSeq: number|null, docFormat: 'hwp'|'hwpx'|null, encryptedSource?: true, savedAt: string }} Meta
+ *   docSeq: number|null, docFormat: 'hwp'|'hwpx'|null, encryptedSource?: true, roundtrip?: object, savedAt: string }} Meta
  * @typedef {{ meta: Meta, base: Buffer, log: LogItem[], doc: Buffer|null }} Saved
  *
  * @typedef {object} DocStore
@@ -151,6 +151,13 @@ export class LocalDocStore {
     const meta = { room, generation, baseSeq, engine, baseFormat, docSeq: prev?.docSeq ?? null, docFormat: prev?.docFormat ?? null, ...(enc ? { encryptedSource: true } : {}), ...(rt ? { roundtrip: rt } : {}), savedAt: new Date().toISOString() };
     await writeAtomic(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 1));
     await writeAtomic(path.join(dir, 'log.jsonl'), '');
+    return meta;
+  }
+
+  /** 6단계 S2: 뒤에서 끝난 왕복 점검 결과를 meta 에(방을 만든 뒤에 온다) */
+  async setRoundtrip(room, roundtrip) {
+    const meta = { ...(await this.readMeta(room)), roundtrip, savedAt: new Date().toISOString() };
+    await writeAtomic(path.join(this.dir(room), 'meta.json'), JSON.stringify(meta, null, 1));
     return meta;
   }
 

@@ -126,8 +126,35 @@ impl HwpDocument {
     /// 6단계 S1(서버 정본): 받은 결과 C(gzip)를 바뀐 부분만 모델에서 다시 쓴 바이트 S(gzip)로 바꾼다. 이 문서(정본)는
     /// 바꾸지 않는다 — 부른 쪽이 S 를 `collabLoadState` 로 읽는다.
     #[wasm_bindgen(js_name = collabRewriteState)]
-    pub fn collab_rewrite_state(&self, state: &[u8]) -> Result<Vec<u8>, JsValue> {
+    pub fn collab_rewrite_state(&mut self, state: &[u8]) -> Result<Vec<u8>, JsValue> {
         self.rewrite_state(state).map_err(js_err)
+    }
+
+    /// 6단계 결과 다시 쓰기 강화(결정 2, 서버 정본): 이 문서를 정본으로 쓴다 — 지금 날 바이트를 모으고 이후 결과를 읽을
+    /// 때마다 더 모은다. 정본 워커가 문서를 열자마자(기록 재생 전) 부른다. 여러 번 불러도 된다.
+    #[wasm_bindgen(js_name = collabTrackRawSeen)]
+    pub fn collab_track_raw_seen(&mut self) {
+        self.track_raw_seen();
+    }
+
+    /// 6단계 결과 다시 쓰기 강화(결정 3, 서버 정본): op 항목의 인자(`args_json` = 인자 배열 JSON)에 실려 오는 날 바이트를
+    /// 적용하기 전에 본다. 반환 JSON 문자열 `{ok:true}` 또는 `{ok:false, reason}`.
+    #[wasm_bindgen(js_name = collabCheckOpArgs)]
+    pub fn collab_check_op_args(&mut self, method: &str, args_json: &str) -> String {
+        let verdict = serde_json::from_str::<serde_json::Value>(args_json)
+            .map_err(|e| format!("인자 JSON 을 읽지 못함 ({e})"))
+            .and_then(|args| self.check_op_args(method, &args));
+        match verdict {
+            Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+            Err(reason) => serde_json::json!({ "ok": false, "reason": reason }).to_string(),
+        }
+    }
+
+    /// 6단계 S2(서버 정본, 방을 열 때 한 번): 원본 바이트 캐시를 모두 버리고 모델에서만 쓴 결과를 지금 저장본과 견준다.
+    /// 반환 JSON 문자열 `{ok, lost: [{kind, count, detail?}], irDiff}`. 이 문서는 바꾸지 않는다.
+    #[wasm_bindgen(js_name = collabRoundtripCheck)]
+    pub fn collab_roundtrip_check(&self) -> Result<String, JsValue> {
+        self.roundtrip_check().map(|v| v.to_string()).map_err(js_err)
     }
 
     /// 5단계 D4(클라이언트 문): 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가.

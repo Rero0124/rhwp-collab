@@ -241,6 +241,8 @@ export class Server {
   /** 정본 문서: 기준점 + 기록 재생(S3-3 복원과 같다) */
   openCanonical() {
     const doc = new wasm.HwpDocument(this.base);
+    // 결과 다시 쓰기 강화(결정 2): 정본은 열자마자(기록 재생 전) 본 날 바이트를 모은다 — 서버 정본 워커와 같다
+    doc.collabTrackRawSeen?.();
     const engine = new CollabEngine();
     engine.attach(doc);
     engine.replayAll(this.log);

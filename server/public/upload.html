@@ -86,14 +86,22 @@
   const $ = (id) => document.getElementById(id);
   const STORE_KEY = 'collab-create-token';
   // 6단계 S2 왕복 점검 문구 — collab-client/src/session/roundtrip.ts 와 같은 규칙(바꾸면 함께 바꾼다)
-  const KIND_LABELS = { bindata: '그림·첨부 데이터', ole: 'OLE 개체', 'ole-clsid': 'OLE 개체', record: 'rhwp 가 모르는 레코드', ir: '내용', cfb: '파일 구조' };
+  // kind: collab-core roundtrip_check 가 알려 주는 종류. ir 의 count 는 차이 수(곳)
+  const KIND_LABELS = { ir: '내용 차이', record: 'rhwp 가 모르는 레코드', bindata: '그림·첨부 데이터', 'ole-clsid': 'OLE 개체', cfb: '파일 구조', package: '파일 구조' };
   const lostText = (rt) => {
-    const parts = (rt?.lost ?? []).map((l) => `${KIND_LABELS[l.kind] ?? l.kind} ${l.count}개`);
+    const parts = (rt?.lost ?? []).map((l) => `${KIND_LABELS[l.kind] ?? l.kind} ${l.count}${l.kind === 'ir' ? '곳' : '개'}`);
     if (parts.length === 0 && rt?.irDiff > 0) parts.push(`내용 차이 ${rt.irDiff}곳`);
     return parts.join(', ');
   };
-  const roundtripText = (rt) => (rt.ok ? 'rhwp 가 이 문서를 그대로 다룰 수 있습니다'
-    : `이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다${lostText(rt) ? `: ${lostText(rt)}` : ''}. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다`);
+  // ok: true 통과 · false 경고 · null 점검 못 함(reason timeout·error). warn 서버의 응답은 기다리지 않고 {pending: true}.
+  const UNKNOWN_REASON = { timeout: '시간 초과', error: '오류' };
+  const unknownReason = (rt) => UNKNOWN_REASON[rt?.reason] ?? rt?.reason ?? '알 수 없음';
+  const roundtripText = (rt) => (rt.pending ? 'rhwp 가 이 문서를 다룰 수 있는지 점검하고 있습니다. 결과는 방에 들어가면 보입니다'
+    : rt.ok ? 'rhwp 가 이 문서를 그대로 다룰 수 있습니다'
+      : rt.ok === null ? `왕복 점검 못 함(${unknownReason(rt)}) — rhwp 가 이 문서의 모든 부분을 다룰 수 있는지 확인하지 못했습니다. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다`
+        : `이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다${lostText(rt) ? `: ${lostText(rt)}` : ''}. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다`);
+  const roundtripBlockedText = (rt) => (rt?.ok === null ? `왕복 점검을 끝내지 못해(${unknownReason(rt)}) 방을 만들지 않았습니다`
+    : `rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다${lostText(rt) ? `: ${lostText(rt)}` : ''}`);
   const LABELS = { edit: ['편집', '문서를 고칠 수 있습니다'], view: ['보기', '문서와 다른 사람 커서만 봅니다'], form: ['양식 입력', '누름틀과 양식 칸만 채웁니다'], comment: ['메모', '메모만 달 수 있습니다'] };
   const safeGet = (k) => { try { return sessionStorage.getItem(k); } catch { return null; } };
   const safeSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch { /* 저장소를 쓸 수 없음 */ } };
@@ -191,8 +199,13 @@
         status($('status'), why, 'err');
         return;
       }
+      // 서버가 문서를 여는 데 시간 제한을 넘겼다(launcher 의 TOO_SLOW_TEXT 와 같은 문구)
+      if (body.error === 'too-slow') {
+        status($('status'), '문서가 커서 여는 데 너무 오래 걸립니다. 공동편집으로 쓰기 어렵습니다', 'err');
+        return;
+      }
       if (body.error === 'roundtrip') {
-        status($('status'), `rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다${lostText(body.roundtrip) ? `: ${lostText(body.roundtrip)}` : ''}`, 'err');
+        status($('status'), roundtripBlockedText(body.roundtrip), 'err');
         return;
       }
       if (!res.ok) {
@@ -205,7 +218,7 @@
       renderLinks();
       const rt = $('roundtrip');
       rt.hidden = !created.roundtrip;
-      if (created.roundtrip) { rt.textContent = roundtripText(created.roundtrip); rt.style.color = created.roundtrip.ok ? '' : 'var(--err)'; }
+      if (created.roundtrip) { rt.textContent = roundtripText(created.roundtrip); rt.style.color = created.roundtrip.pending || created.roundtrip.ok ? '' : 'var(--err)'; }
       $('result').hidden = false;
       status($('status'), `방을 만들었습니다: ${file.name}`, 'ok');
     } catch (error) {

@@ -82,8 +82,10 @@ function createRoom(name) {
     broken: null,
     /** 5단계 D5: 원래 암호 문서였다(COLLAB_ALLOW_ENCRYPTED 로 받음) — 방의 문서는 암호 없이 오가고 저장된다 */
     encryptedSource: false,
-    /** 6단계 S2: 방을 열 때의 왕복 점검 결과 {ok, lost, irDiff} (점검하지 않았으면 null) */
+    /** 6단계 S2: 방을 열 때의 왕복 점검 결과 {ok, lost, irDiff} — 못 했으면 {ok: null, reason}(시간 초과·오류). 점검하지 않았거나 도는 중이면 null */
     roundtrip: null,
+    /** 6단계 S2: 뒤에서 도는 왕복 점검(warn) — 끝나면 풀린다 */
+    roundtripCheck: null,
   };
 }
 
@@ -100,6 +102,8 @@ function summarizeRoundtrip(r) {
   const irDiff = Number.isFinite(r?.irDiff) ? r.irDiff : 0;
   return { ok: r?.ok === true && lost.length === 0, lost, irDiff };
 }
+/** 6단계 S2: 점검을 끝내지 못했다(시간 초과·워커 오류) — 결과를 모르므로 통과가 아니다 */
+const roundtripUnknown = (reason) => ({ ok: null, reason, lost: [], irDiff: 0 });
 
 /** 5단계 D6: 메모를 만드는 함수와 그 작성자 인자(`json` = {author, text}) */
 const MEMO_CREATE = ['insertMemo', 'insertMemoByPath', 'insertMemoReply'];
@@ -176,6 +180,8 @@ export function startServer({
   allowEncrypted = process.env.COLLAB_ALLOW_ENCRYPTED === '1',
   // 6단계 S2: 파일로 방을 만들 때 왕복 점검 — warn(결과를 알림) | block(통과하지 못하면 422) | off
   roundtripMode = process.env.COLLAB_ROUNDTRIP || 'warn',
+  /** 6단계 S2: 왕복 점검 시간 상한(ms). 넘으면 점검 워커를 버리고 {ok: null, reason: 'timeout'} */
+  roundtripTimeoutMs = Number(process.env.COLLAB_ROUNDTRIP_TIMEOUT_MS ?? 15_000),
   // 6단계 S3 부품 전용 모드: 바깥 시스템의 iframe 안에서만 쓰인다(허용 출처 목록이 필요하다)
   embedOnly = process.env.COLLAB_EMBED_ONLY === '1',
   embedOrigins = process.env.COLLAB_EMBED_ORIGINS ? process.env.COLLAB_EMBED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean) : [],
@@ -193,6 +199,7 @@ export function startServer({
     }
   }
   if (!['warn', 'block', 'off'].includes(roundtripMode)) throw new Error(`COLLAB_ROUNDTRIP 은 warn | block | off 중 하나다 (지금 ${roundtripMode})`);
+  if (!(Number.isFinite(roundtripTimeoutMs) && roundtripTimeoutMs > 0)) throw new Error(`COLLAB_ROUNDTRIP_TIMEOUT_MS 는 양수(ms)다 (지금 ${roundtripTimeoutMs})`);
   if (allowEncrypted) log('경고: COLLAB_ALLOW_ENCRYPTED=1 — 암호 문서로 방을 열면 암호가 풀린 상태로 서버 디스크·모든 참여자·내려받은 파일에 남는다');
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map();
@@ -244,8 +251,8 @@ export function startServer({
     send(ws, { type: 'welcome', seq: chunks.length > 1 ? firstSeq : room.seq, base, log: first, ...(room.generation ? { generation: room.generation } : {}), maxMessageBytes, ...userOf(ws),
       // D5: 원래 암호 문서였으면 알린다(참여자가 경고를 한 번 띄운다). base 담당(base null)에게는 암호 문서를 받는지 알린다.
       ...(room.encryptedSource ? { encryptedSource: true } : {}),
-      // S2: 왕복 점검에 경고가 있는 방이면 요약을 싣는다(참여자가 처음 들어올 때 한 번 알린다)
-      ...(room.roundtrip && room.roundtrip.ok === false ? { roundtrip: room.roundtrip } : {}), ...(base === null && allowEncrypted ? { allowEncrypted: true } : {}), ...extra });
+      // S2: 왕복 점검에 경고가 있거나 점검을 끝내지 못한 방이면 결과를 싣는다(참여자가 처음 들어올 때 한 번 알린다)
+      ...(room.roundtrip && room.roundtrip.ok !== true ? { roundtrip: room.roundtrip } : {}), ...(base === null && allowEncrypted ? { allowEncrypted: true } : {}), ...extra });
     for (const chunk of chunks.slice(1)) send(ws, { type: 'catchup', seq: seqOf(chunk), log: chunk, cont: true, maxMessageBytes });
     log(`[${room.name}] welcome${extra.resync ? '(resync)' : ''} ${who(ws)} seq=${room.seq} base=${base === null ? 'null (담당)' : `${base.length}B64`} log=${logItems.length}${chunks.length > 1 ? ` (${chunks.length}조각)` : ''} 세대 ${room.generation} 참여자=${room.clients.size}`);
   };
@@ -772,6 +779,70 @@ export function startServer({
     return { invite, inviteExpiresAt: new Date(exp * 1000).toISOString() };
   };
 
+  // ── 6단계 S2 왕복 점검 ──
+  /** 빌드에 점검 보조가 있는가(한 번 묻고 기억한다) */
+  let roundtripSupported = null;
+  const roundtripAvailable = async (room) => {
+    if (roundtripSupported === null) {
+      const caps = await room.canonical.call('capabilities');
+      if (!caps.ok) return false;
+      roundtripSupported = caps.roundtripCheck === true;
+    }
+    return roundtripSupported;
+  };
+  /** 돌고 있는 점검 워커(서버를 닫을 때 버린다) */
+  const roundtripCheckers = new Set();
+  /**
+   * 왕복 점검을 따로 둔 워커에서 돌린다 — 방의 정본 워커는 붙잡지 않는다(큰 표 문서는 수십 초 걸린다). 열기 + 점검이 상한
+   * (roundtripTimeoutMs)을 넘으면 그 워커를 버리고 {ok: null, reason: 'timeout'}, 워커가 실패하면 {ok: null, reason: 'error'}.
+   */
+  const checkRoundtrip = async (name, packed) => {
+    const t0 = Date.now();
+    // 워커 자체의 호출 시간 제한은 상한보다 길게 — 상한은 아래 deadline 이 지킨다
+    const checker = new Canonical({ pkg, timeoutMs: roundtripTimeoutMs + 60_000, log: (m) => log(`[${name}] 점검 워커: ${m}`) });
+    roundtripCheckers.add(checker);
+    let timer;
+    const deadline = new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), roundtripTimeoutMs); });
+    const work = (async () => {
+      const loaded = await checker.load(packed);
+      return loaded.ok ? checker.roundtrip() : loaded;
+    })();
+    try {
+      const rt = await Promise.race([work, deadline]);
+      if (rt.timeout) {
+        log(`[${name}] 왕복 점검 시간 초과(${roundtripTimeoutMs}ms) — 점검 워커를 버림`);
+        return roundtripUnknown('timeout');
+      }
+      if (!rt.ok) {
+        log(`[${name}] 왕복 점검 실패: ${rt.reason}`);
+        return roundtripUnknown('error');
+      }
+      if (!rt.supported) return null;
+      const result = summarizeRoundtrip(rt.result);
+      log(`[${name}] 왕복 점검 ${result.ok ? '통과' : `경고 ${result.lost.map((l) => `${l.kind}×${l.count}`).join(', ') || `IR 차이 ${result.irDiff}`}`} (점검 ${rt.ms}ms, 열기 포함 ${Date.now() - t0}ms)`);
+      return result;
+    } finally {
+      clearTimeout(timer);
+      roundtripCheckers.delete(checker);
+      await checker.terminate();
+    }
+  };
+  /**
+   * warn: 방을 만든 뒤 뒤에서 점검한다. 결과는 방 메타에 남기고, 통과가 아니면(경고·점검 못 함) 지금 방에 있는 참여자에게
+   * `roundtrip` 알림을 한 번 보낸다 — 그 뒤 들어오는 참여자는 welcome 에서 받는다. 그 사이 방을 메모리에서 내렸다 다시
+   * 올렸어도 지금 방에 반영한다.
+   */
+  const roundtripInBackground = (room, packed) => checkRoundtrip(room.name, packed).then((result) => enqueue(room, async () => {
+    room.roundtripCheck = null;
+    if (!result || closed) return;
+    const targets = new Set([room, rooms.get(room.name)].filter(Boolean));
+    for (const r of targets) r.roundtrip = result;
+    if (store) {
+      try { await store.setRoundtrip(room.name, result); } catch (error) { log(`[${room.name}] 왕복 점검 결과를 저장하지 못함: ${error?.message ?? error}`); }
+    }
+    if (result.ok !== true) for (const r of targets) broadcast(r, { type: 'roundtrip', roundtrip: result });
+  }));
+
   /** POST /rooms: 정본으로 열어 검사한 뒤 새 방(0세대 기준점 = 올린 바이트 그대로)을 만든다. */
   const createRoomFromFile = async (req, raw) => {
     const user = await authorizeHttp(req, null, ['create']);
@@ -807,21 +878,22 @@ export function startServer({
     }
     if (!res.ok) {
       await room.canonical.terminate();
+      // 여는 데 정본 워커 시간 제한(COLLAB_CANONICAL_TIMEOUT_MS)을 넘겼다 — 대개 문서가 커서다. 사람이 알아들을 까닭으로 따로 알린다.
+      if (res.timeout) throw new HttpError(422, 'too-slow', `문서를 여는 데 ${canonicalTimeoutMs}ms 를 넘겼다(문서가 커서 공동편집으로 쓰기 어렵다)`, { reason: 'too-slow' });
       throw new HttpError(422, 'invalid-document', `문서를 열지 못했다: ${res.reason}`);
     }
     // S2 왕복 점검: rhwp 가 모든 부분을 모델에서 다시 쓴 결과를 원본과 견준다. 손대지 않은 부분은 원본 바이트를 그대로 쓰므로
     // "저장 후 비교"로는 드러나지 않는 것(그 부분을 편집하면 사라질 것)을 방을 만들 때 알린다. 보조가 없으면 건너뛴다.
-    if (roundtripMode !== 'off') {
-      const rt = await room.canonical.roundtrip();
-      if (rt.ok && rt.supported) {
-        room.roundtrip = summarizeRoundtrip(rt.result);
-        log(`[${name}] 왕복 점검 ${room.roundtrip.ok ? '통과' : `경고 ${room.roundtrip.lost.map((l) => `${l.kind}×${l.count}`).join(', ') || `IR 차이 ${room.roundtrip.irDiff}`}`} (${rt.ms}ms)`);
-        if (!room.roundtrip.ok && roundtripMode === 'block') {
-          await room.canonical.terminate();
-          throw new HttpError(422, 'roundtrip', 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았다(COLLAB_ROUNDTRIP=block)', { reason: 'roundtrip', roundtrip: room.roundtrip });
-        }
-      } else if (!rt.ok) {
-        log(`[${name}] 왕복 점검 실패: ${rt.reason}`);
+    // 점검은 따로 둔 워커에서(정본 워커를 붙잡지 않는다), 상한 COLLAB_ROUNDTRIP_TIMEOUT_MS. warn 은 방을 먼저 만들고 뒤에서,
+    // block 은 상한까지 기다리고 통과가 아니면(경고·시간 초과·오류) 만들지 않는다.
+    const roundtripLater = roundtripMode === 'warn' && await roundtripAvailable(room);
+    if (roundtripMode === 'block' && await roundtripAvailable(room)) {
+      room.roundtrip = await checkRoundtrip(name, packed);
+      if (room.roundtrip && room.roundtrip.ok !== true) {
+        await room.canonical.terminate();
+        const reason = room.roundtrip.ok === null ? `roundtrip-${room.roundtrip.reason}` : 'roundtrip';
+        const why = room.roundtrip.ok === null ? `왕복 점검을 끝내지 못해(${room.roundtrip.reason})` : 'rhwp 가 이 문서의 일부를 다루지 못해';
+        throw new HttpError(422, 'roundtrip', `${why} 방을 만들지 않았다(COLLAB_ROUNDTRIP=block)`, { reason, roundtrip: room.roundtrip });
       }
     }
     try {
@@ -837,7 +909,8 @@ export function startServer({
     rooms.set(name, room);
     scheduleUnload(room);
     log(`[${name}] 방 생성(파일 ${raw.length}B, ${formatOf(raw)})${user.sub ? ` by ${user.sub}` : ''} 정본 ${res.digest.slice(0, 12)}${store ? ' (저장)' : ''}${room.encryptedSource ? ' — 경고: 원래 암호 문서, 암호 없이 보관' : ''}`);
-    return { room: name, ...makeInvites(name), ...(room.roundtrip ? { roundtrip: room.roundtrip } : {}) };
+    if (roundtripLater) room.roundtripCheck = roundtripInBackground(room, packed);
+    return { room: name, ...makeInvites(name), ...(roundtripLater ? { roundtrip: { pending: true } } : room.roundtrip ? { roundtrip: room.roundtrip } : {}) };
   };
 
   /** GET /rooms/{room}/document: 정본을 내보낸 최신 문서(원본 형식). 메모리에 없으면 저장소에서 연다. */
@@ -955,6 +1028,7 @@ export function startServer({
       for (const ws of wss.clients) ws.terminate();
       if (store) await Promise.all([...rooms.values()].map((room) => enqueue(room, () => saveDoc(room, '서버 종료'))));
       for (const room of rooms.values()) { clearTimeout(room.docTimer); clearTimeout(room.generationTimer); await room.canonical?.terminate(); }
+      await Promise.all([...roundtripCheckers].map((c) => c.terminate()));
       await new Promise((resolve) => wss.close(() => resolve()));
       if (httpServer.listening) {
         const done = new Promise((resolve) => httpServer.close(() => resolve()));
@@ -963,7 +1037,12 @@ export function startServer({
       }
     },
     /** 시험용: 방의 처리 사슬이 빌 때까지 */
-    settle: (name) => rooms.get(name)?.queue ?? Promise.resolve(),
+    settle: async (name) => {
+      const room = rooms.get(name);
+      if (!room) return;
+      await room.roundtripCheck; // 6단계 S2: 뒤에서 도는 왕복 점검까지
+      await room.queue;
+    },
     /** 시험용: 지금 세대를 바꾼다(원래는 방이 10분 빈 뒤에만). 그 앞 세대에서 끊긴 참여자는 welcome 을 받는다. */
     changeGeneration: (name) => { const room = rooms.get(name); return room ? enqueue(room, () => changeGeneration(room, '요청')) : Promise.resolve(); },
     /** 시험용: 지금 저장본을 쓴다 */

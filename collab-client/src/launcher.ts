@@ -15,7 +15,7 @@
  * studio 를 import 하지 않는다 — 타입만(`plugin/types.ts`).
  */
 import type { PluginHost, PluginSurface, StudioPlugin } from '@/plugin/types';
-import { roundtripBlockedText, roundtripText, type RoundtripResult } from './session/roundtrip.ts';
+import { ROUNDTRIP_PENDING_TEXT, isRoundtripPending, roundtripBlockedText, roundtripText, type RoundtripPending, type RoundtripResult } from './session/roundtrip.ts';
 
 /** studio 개발 서버(`COLLAB_DEV_SERVER`)의 공동편집 서버 ws 주소 — 빌드·시험에서는 비거나 없다(같은 출처). */
 declare const __CC_RHWP_COLLAB_DEV_WS__: string | undefined;
@@ -25,6 +25,8 @@ export const LAUNCHER_COMMAND = 'ext:collab.start';
 const CREATE_TOKEN_KEY = 'collab-create-token';
 export const ENCRYPTED_TEXT = '암호 문서는 공동편집할 수 없습니다';
 export const ENCRYPTED_ALLOWED_TEXT = '원래 암호가 걸린 문서입니다. 공동편집 중에는 암호가 풀린 상태로 서버에 저장됩니다';
+/** 6단계: 서버가 문서를 여는 데 시간 제한을 넘겼다(`422 {error: 'too-slow'}`) */
+export const TOO_SLOW_TEXT = '문서가 커서 여는 데 너무 오래 걸립니다. 공동편집으로 쓰기 어렵습니다';
 /** 업로드 페이지와 같은 이름·설명 */
 export const SCOPE_LABELS: Record<string, [string, string]> = {
   edit: ['편집', '문서를 고칠 수 있습니다'],
@@ -78,7 +80,31 @@ export function takeCreateToken(hash: string, store: StoreLike | null, replace: 
   try { return store?.getItem(CREATE_TOKEN_KEY) || null; } catch { return null; }
 }
 
-export interface CreatedRoom { room: string; invite?: Record<string, string>; inviteExpiresAt?: string; roundtrip?: RoundtripResult }
+/**
+ * hs256 토큰(JWT)의 표시 이름(payload 의 `name`) — 서명은 확인하지 않는다(서버가 한다). 방을 만든 사람이 "이 방으로
+ * 들어가기"로 들어갈 때 이름을 다시 묻지 않게 편집 링크에 싣는 데만 쓴다. 읽을 수 없거나 없으면 null.
+ */
+export function tokenName(token: string | null): string | null {
+  const part = token?.split('.')[1];
+  if (!part) return null;
+  try {
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((part.length + 3) % 4);
+    const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)))) as { name?: unknown };
+    return typeof payload?.name === 'string' && payload.name.trim() ? payload.name.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 링크의 주소 조각에 이름을 더한다(들어가기 전용 — 나눠 주는 링크에는 넣지 않는다) */
+export function withName(url: string, name: string): string {
+  const i = url.indexOf('#');
+  const frag = new URLSearchParams(i < 0 ? '' : url.slice(i + 1));
+  frag.set('name', name);
+  return `${i < 0 ? url : url.slice(0, i)}#${frag}`;
+}
+
+export interface CreatedRoom { room: string; invite?: Record<string, string>; inviteExpiresAt?: string; roundtrip?: RoundtripResult | RoundtripPending }
 export interface InviteLink { scope: string; label: string; hint: string; url: string }
 
 /**
@@ -109,6 +135,7 @@ export function createErrorText(status: number, body: { error?: string; reason?:
   // 6단계 S2: COLLAB_ROUNDTRIP=block 서버는 rhwp 가 다 다루지 못하는 문서로 방을 만들지 않는다
   if (body?.error === 'roundtrip') return roundtripBlockedText(body.roundtrip);
   if (status === 413) return '문서가 너무 커서 방을 만들 수 없습니다';
+  if (body?.error === 'too-slow' || body?.reason === 'too-slow') return TOO_SLOW_TEXT;
   if (status === 415 || status === 422) return '문서를 열지 못해 방을 만들 수 없습니다';
   return `방을 만들지 못했습니다(${status}${body?.message ? `: ${body.message}` : ''})`;
 }
@@ -221,10 +248,11 @@ export const collabLauncherPlugin = {
         const res = await createRoom(fetch.bind(window), origin, bytes, token);
         if (!res.ok) { status.textContent = res.text; create.removeAttribute('disabled'); return; }
         if (token && tokenInput) { try { store?.setItem(CREATE_TOKEN_KEY, token); } catch { /* 없음 */ } createToken.value = token; }
-        showLinks(res.created);
+        showLinks(res.created, tokenName(token));
       });
 
-      const showLinks = (created: CreatedRoom) => {
+      /** creatorName: 만들기 토큰의 이름 — 있으면 "이 방으로 들어가기" 링크에만 실어 이름을 다시 묻지 않는다 */
+      const showLinks = (created: CreatedRoom, creatorName: string | null) => {
         body.replaceChildren();
         actions.replaceChildren();
         const links = inviteLinks(editor, created, devWs());
@@ -245,14 +273,18 @@ export const collabLauncherPlugin = {
           body.append(row);
         }
         if (created.inviteExpiresAt) body.append(el('p', { style: 'color:#666' }, `링크는 ${new Date(created.inviteExpiresAt).toLocaleString()}까지 쓸 수 있습니다.`));
-        // 6단계 S2: 왕복 점검 결과(서버에 보조가 있을 때만 온다)
-        if (created.roundtrip) body.append(el('p', { 'data-collab': 'launcher-roundtrip', style: created.roundtrip.ok ? 'color:#666' : 'color:#a60' }, roundtripText(created.roundtrip)));
+        // 6단계 S2: 왕복 점검 결과(서버에 보조가 있을 때만 온다). warn 서버는 기다리지 않고 {pending} — 결과는 방에 들어가면 보인다.
+        if (created.roundtrip) {
+          const rt = created.roundtrip;
+          const text = isRoundtripPending(rt) ? ROUNDTRIP_PENDING_TEXT : roundtripText(rt);
+          body.append(el('p', { 'data-collab': 'launcher-roundtrip', style: isRoundtripPending(rt) || rt.ok ? 'color:#666' : 'color:#a60' }, text));
+        }
         const enter = el('button', { type: 'button', 'data-collab': 'launcher-enter' }, '이 방으로 들어가기');
         const edit = links.find((l) => l.scope === 'edit') ?? links[0];
         enter.addEventListener('click', () => {
           // 문서는 방에 올라가 있다 — studio 의 "저장하지 않은 변경" 확인을 띄우지 않고 편집 링크로 간다
           host.guardUnload(() => false);
-          window.location.assign(edit.url);
+          window.location.assign(creatorName ? withName(edit.url, creatorName) : edit.url);
         });
         const done = el('button', { type: 'button' }, '닫기');
         done.addEventListener('click', close);

@@ -102,9 +102,25 @@ function rewriteState(dataB64) {
 /** 판정 보조가 있는지 — 없으면 적용해 보지도 않고 거절한다. */
 const confinedSupported = () => typeof doc?.collabCheckConfined === 'function';
 
+/**
+ * 6단계 결과 다시 쓰기 강화(결정 3): op 인자로 들어오는 날 바이트(문단 나누기의 removedParaMeta 등)를 적용하기 전에 본다 —
+ * 결과(state) 다시 쓰기로는 막지 못한다(op 는 모든 참여자가 그대로 적용한다). 걸리면 그 까닭, 보조가 없으면 null.
+ */
+function opArgsViolation(entries) {
+  if (typeof doc?.collabCheckOpArgs !== 'function') return null;
+  for (const e of entries) {
+    if (e?.kind !== 'op') continue;
+    const verdict = JSON.parse(doc.collabCheckOpArgs(String(e.m), JSON.stringify(Array.isArray(e.a) ? e.a : [])));
+    if (!verdict.ok) return `op 인자: ${verdict.reason}`;
+  }
+  return null;
+}
+
 function open(base) {
   const raw = gunzipSync(Buffer.from(base, 'base64'));
   const next = new wasm.HwpDocument(raw);
+  // 결과 다시 쓰기 강화(결정 2): 정본은 열자마자(기록 재생 전) 본 날 바이트를 모은다 — 되돌리기가 되살린 옛 바이트를 받으려고
+  next.collabTrackRawSeen?.();
   engine?.detach();
   doc?.free();
   doc = next;
@@ -152,6 +168,8 @@ parentPort.on('message', ({ id, op, ...p }) => {
         }
         const bad = validate(p.entries);
         if (bad) return reply({ ok: false, reason: bad });
+        const argsBad = opArgsViolation(p.entries);
+        if (argsBad) return reply({ ok: false, reason: argsBad });
         const confine = Array.isArray(p.confine) && p.confine.length ? p.confine : null;
         if (confine && !confinedSupported()) return reply({ ok: false, forbidden: true, reason: 'unsupported', detail: 'collabCheckConfined 가 없다' });
         // D4: 스냅샷 → 적용 → 판정 → 벗어나면 복원. 복원 뒤 정본 digest 가 적용 전과 같은지 확인한다.

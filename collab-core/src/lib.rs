@@ -538,6 +538,13 @@ impl CollabCore {
         }
     }
 
+    /// 6단계 결과 다시 쓰기 강화(결정 3): op 인자로 들어오는 날 바이트 문 — 서버 정본이 op 를 적용하기 전에 부른다
+    /// (`args` 는 기록 항목의 인자 배열). 통과하지 못하면 그 까닭. 처음 부르면 본 바이트 기록을 켠다.
+    pub fn check_op_args(&mut self, method: &str, args: &Value) -> Result<(), String> {
+        self.track_raw_seen();
+        rewrite_raw::check_op_args(method, args, self.raw_seen.as_ref().expect("track_raw_seen 뒤"))
+    }
+
     /// 시험·진단: 모은 날 바이트 수(켜지지 않았으면 None)
     pub fn raw_seen_len(&self) -> Option<usize> {
         self.raw_seen.as_ref().map(rewrite_raw::Seen::len)

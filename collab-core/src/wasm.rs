@@ -137,6 +137,19 @@ impl HwpDocument {
         self.track_raw_seen();
     }
 
+    /// 6단계 결과 다시 쓰기 강화(결정 3, 서버 정본): op 항목의 인자(`args_json` = 인자 배열 JSON)에 실려 오는 날 바이트를
+    /// 적용하기 전에 본다. 반환 JSON 문자열 `{ok:true}` 또는 `{ok:false, reason}`.
+    #[wasm_bindgen(js_name = collabCheckOpArgs)]
+    pub fn collab_check_op_args(&mut self, method: &str, args_json: &str) -> String {
+        let verdict = serde_json::from_str::<serde_json::Value>(args_json)
+            .map_err(|e| format!("인자 JSON 을 읽지 못함 ({e})"))
+            .and_then(|args| self.check_op_args(method, &args));
+        match verdict {
+            Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+            Err(reason) => serde_json::json!({ "ok": false, "reason": reason }).to_string(),
+        }
+    }
+
     /// 6단계 S2(서버 정본, 방을 열 때 한 번): 원본 바이트 캐시를 모두 버리고 모델에서만 쓴 결과를 지금 저장본과 견준다.
     /// 반환 JSON 문자열 `{ok, lost: [{kind, count, detail?}], irDiff}`. 이 문서는 바꾸지 않는다.
     #[wasm_bindgen(js_name = collabRoundtripCheck)]

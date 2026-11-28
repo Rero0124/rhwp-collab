@@ -437,46 +437,77 @@ window.addEventListener('message', async (event) => {
 
 ## 8. 알려진 한계
 
-### 8.1 서버가 결과(`state`)를 다시 써도 남는 자리
+### 8.1 서버가 결과(`state`)를 다시 쓸 때의 날 바이트 자리
 
-서버는 `edit` 연결이 보낸 `state` 를 바뀐 부분만 모델에서 다시 쓴다(§4.2). 그래도 아래 자리는 남는다. rhwp 가 한컴 원본을
-잃지 않으려고 **해석하지 않은 바이트를 모델에 그대로 들고 있다가 저장기가 다시 쓰는 곳**이다. 편집 권한자가 여기 넣은 바이트는
-서버가 다시 쓴 바이트 S 에도 남고, 모든 참여자와 저장본에 간다(기존 코드 세션 조사, 2026-11-27).
+서버는 `edit` 연결이 보낸 `state` 를 바뀐 부분만 모델에서 다시 쓴다(§4.2). rhwp 는 한컴 원본을 잃지 않으려고 **해석하지 않은
+바이트를 모델에 그대로 들고 있다가 저장기가 다시 쓰는 자리**를 많이 갖고 있다. 다시 쓸 때 이 자리를 아래처럼 다룬다(6단계 결과
+다시 쓰기 강화, `collab-core/src/rewrite_raw.rs`). 원본 바이트를 그대로 쓰는 구역·DocInfo(정본의 봉인된 바이트와 같다)는
+그 날 바이트도 정본 것이라 건드리지 않는다. 봉인은 기준이 되지 못한다 — 읽을 때 그 바이트로 다시 계산되어 보낸 사람의 바이트를
+보증해 버린다.
 
-(가) HWP, 구역 스트림
+**방식**
 
-- 문단: `Paragraph.raw_header_extra`, `Paragraph.ctrl_data_records`
-- 구역 정의: `SectionDef.raw_ctrl_extra`, `SectionDef.extra_child_records`
+- **사양 모양(숫자 필드만 남긴다):** 문단 머리 꼬리 `Paragraph.raw_header_extra` 는 길이 0·10·12(더 길면 자른다), 렌더링 행렬
+  `ShapeComponentAttr.raw_rendering` 은 길이가 정확히 50 + 96N(N = 앞 u16)일 때만, 문서 속성 `raw_data` 는 26바이트면 그대로.
+- **정본이 본 내용일 때만 둔다:** 그 밖의 자리. 자리 종류마다 **문서 전체에서 같은 내용**을 찾는다(개수는 보지 않는다 — 이미
+  문서에 있는 바이트를 같은 종류의 다른 자리로 옮기는 것은 새 내용이 아니다. 종류를 넘나들지는 않는다). 없으면 비워 저장기가
+  모델에서 다시 만들거나 기본값을 쓴다. 저장기·정상 편집이 고쳐 쓰는 숫자 바이트는 가리고 견준다: 그림 꼬리 1..5(개체 번호),
+  구역 정의 꼬리 2..4(바탕쪽 목록 수)·6..8(메모 모양 번호), 바탕쪽 목록 머리 18..20, 셀 꼬리 0..4(글 영역 너비).
+- **정본이 본 내용**은 방이 살아 있는 동안 모은다: 정본을 열 때(재시작 복원 포함, 기록 재생 전 — `collabTrackRawSeen`), 결과를
+  읽을 때마다(읽기 전·후 문서), 다시 쓰기 직전의 정본. 되돌리기 계열 `state`(`restoreSnapshot` 등)가 지금 정본에 없는 옛 내용을
+  되살려도 잃지 않는다.
+
+**자리**
+
+(가) HWP, 구역 스트림 — 정본이 본 내용일 때만
+
+- 문단 `Paragraph.ctrl_data_records`, 묶음 자식 `ShapeComponentAttr.ctrl_data`
+- 구역 정의 `SectionDef.raw_ctrl_extra`, `SectionDef.extra_child_records`(레코드 단위 — 원본 바탕쪽 목록에 모르는 것이 있으면
+  그 범위를 모두 버려 모델이 바탕쪽을 쓴다)
 - 머리말·꼬리말 `Header`/`Footer.raw_ctrl_extra`, 바탕쪽 `MasterPage.raw_list_header`
-- 표 `Table.raw_ctrl_data`·`raw_table_record_extra`, 셀 `Cell.raw_list_extra`
+- 표 머리 `Table.raw_ctrl_data`·수식 머리 `Equation.raw_ctrl_data`(비우면 `common` 으로 다시 쓴다 — 잃는 것이 없다),
+  `Table.raw_table_record_extra`, 셀 `Cell.raw_list_extra`
 - 그림 `Picture.raw_picture_extra`, 개체 공통 `CommonObjAttr.raw_extra`
-- 도형 `ShapeComponentAttr.raw_rendering`, 글상자 `TextBox.raw_list_header_extra`, 연결선 `ConnectorData.raw_trailing`,
-  다각형 `PolygonShape.raw_trailing`
-- 차트 `ChartShape.raw_chart_data`, OLE `OleShape.raw_tag_data`, 수식 `Equation.raw_ctrl_data`
+- 글상자 `TextBox.raw_list_header_extra`, 연결선 `ConnectorData.raw_trailing`, 다각형 `PolygonShape.raw_trailing`
+- 차트 `ChartShape.raw_chart_data`, OLE `OleShape.raw_tag_data`
 
-(나) HWP, DocInfo 항목
+(나) HWP, DocInfo 항목 — 정본이 본 내용일 때만
 
-- 글꼴, 글자 모양, 문단 모양, 번호, 글머리표, 탭, 스타일, 테두리·배경, BinData 항목, 문서 속성의 `raw_data`.
-- 항목마다 봉인이 지금 모델과 맞으면 저장기가 원본 레코드를 그대로 쓴다. 그래서 레코드 안의, 해석 범위 밖 꼬리가 남는다.
+- 글꼴, 글자 모양, 문단 모양, 번호, 글머리표, 탭, 스타일, 테두리·배경, BinData 항목의 `raw_data`(문서 속성은 위 사양 모양)
+- DocInfo 의 모르는 레코드 `extra_records`(레코드 단위, 개수까지)와 구역 끝 목록 `trailing_lists`(묶음 단위 — 메모·확장
+  바탕쪽 목록은 버리면 모델에서 다시 쓴다)는 6단계 S1 결정 (C)대로
 
-(다) HWPX, 원문 그대로 다시 넣는 XML 조각
+(다) HWPX, 원문 그대로 다시 넣는 XML 조각 — 정본이 본 내용일 때만
 
-- `DocInfo.memo_properties_xml`, `Field.raw_parameters_xml`, `Numbering.raw_para_heads`·`Bullet.raw_para_head`
+- `DocInfo.memo_properties_xml`(비우면 메모 모양 레코드로 다시 쓴다), `DocInfo.hwpx_head_tail`(비우면 기본 문서 설정),
+  `Numbering.raw_para_heads`, `Bullet.raw_para_head`(비울 때 그림 번호를 모델 필드로 옮긴다), `Field.raw_parameters_xml`
 
-(라) 성격상 불투명한 내용
+(라) 성격상 불투명한 내용 — 그대로
 
-- 참조되는 BinData 바이트(그림·OLE). 참조되지 않는 것은 버린다.
+- 참조되는 BinData 바이트(그림·OLE). 참조되지 않는 것은 버린다. 받는 쪽 프로그램이 그 내용을 다루는 방식의 문제다.
 
-**막힌 것(참고):**
+**op 인자로 들어오는 날 바이트**(다시 쓰기로는 막지 못한다 — op 는 모든 참여자가 그대로 적용한다): 정본 워커가 적용하기 전에
+`collabCheckOpArgs` 로 본다. 문단 나누기 다섯 함수(`splitParagraph`·`…InCell`·`…InCellByPath`·`…InFootnote`·
+`…InHeaderFooter`)의 `removedParaMeta.raw_header_extra` 는 길이 0·10·12 만 받고 아니면 `invalid`.
 
-- 파서가 모델에 남기지 않는 레코드
-- DocInfo 의 모르는 레코드, 구역 끝 목록에 끼운 내용(정본에 같은 내용이 없으면)
-- 부속 스트림, HWPX 부속 항목, 미리보기, 파일 머리(정본 것을 쓴다)
-- 참조되지 않는 BinData
+**한컴 조각 붙여넣기(`pasteHwpJson`, op):** 한컴 조각은 rhwp가 JSON에서 이스케이프해 만든 XML이라 원문·날 바이트 통로가
+아니다. 남는 위험은 변환기 이스케이프 결함이고, 시험으로 지킨다(`collab-core` `hancom_paste_fragments_are_escaped_xml_rhwp_builds_not_a_raw_channel`).
+JSON 모델에서 XML 을 거치지 않고 문서로 가는 것은 그림 바이트(`bins`, (라)와 같다)뿐이다.
 
-**다음 후보:** 위 (가)~(다)의 자리도 막는다. 해석하지 않은 바이트를 그대로 들고 있는 대신, 정본에 같은 자리의 같은 바이트가
-있을 때만 그 바이트를 쓰고 아니면 버리거나 모델에서 다시 만든다(구역 끝 목록에 쓴 방식과 같다). (라)는 그림·OLE 내용 자체라
-막을 수 없고, 받는 쪽 프로그램이 그 내용을 다루는 방식의 문제다.
+**한계**
+
+- 정본이 본 내용의 기록은 방 메타에 남기지 않는다. 재시작 복원은 "기준점 + 그 뒤 기록 재생"이라 재생 중에 `state` 를 읽을
+  때마다 모으면 그 세대 동안 정본이 가졌던 것이 다시 모인다. 세대 전환은 방이 비었을 때만 일어나고, 그 뒤 들어오는 사람은
+  welcome 으로 되돌리기 스택이 비워지므로 앞 세대의 내용으로 되돌릴 사람이 없다.
+- op 로 생겼다가 결과를 읽기 전에 지워진 날 바이트는 기록에 없을 수 있다. op 가 만드는 날 바이트(책갈피·누름틀 CTRL_DATA,
+  표 머리 등)는 비워도 모델에서 다시 만들어진다.
+- 정본이 본 적 없는 날 바이트는 비우므로, 모델이 다 표현하지 못하는 자리(그림 효과, OLE 속성, 차트, 그림 링크·누름틀 이름의
+  CTRL_DATA 등)에 그런 바이트가 오면 그 내용은 사라진다. 정상 편집은 이런 바이트를 새로 만들지 않는다(조사, 2026-11-27).
+  `importParagraphBlock`(state)이 다른 문서에서 가져온 번호·글머리표 원문 조각은 버려지고 모델에서 다시 쓴다(`checkable` 같은
+  모델 밖 속성을 잃는다). 그림 글머리표의 BinData 번호가 255 를 넘으면 원문 조각을 비울 때 그림을 잃는다.
+- 숫자 비트 자리(`raw_attr`, `raw_break_type` 등)는 내용을 싣지 못해 다루지 않는다.
+- (참고) 업스트림 HWPX 파서는 글머리표 `char` 속성을 이스케이프를 풀지 않고 읽는다 — `"`·`&`·`<` 글머리표 글자가 `&` 로
+  읽힌다(통로는 아니다, 충실도 결함).
 
 ## 9. 다른 플랫폼에서 클라이언트 만들기 (6단계 N1)
 

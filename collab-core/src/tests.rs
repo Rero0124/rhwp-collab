@@ -1515,3 +1515,207 @@ fn hardened_rewrite_remembers_raw_bytes_the_canonical_saw_before_an_op_removed_t
     via_state.load_state(&deleted.export_state().unwrap()).unwrap();
     assert!(has_param(&via_state.rewrite_state(&restored).unwrap()));
 }
+
+/// HWPX 결과 바이트의 모든 패키지 항목 글(압축 풀어 이어 붙임)
+fn hwpx_text(packed: &[u8]) -> String {
+    let raw = super::unpack_state(packed).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(raw.as_ref())).unwrap();
+    let mut all = String::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+        all.push_str(&String::from_utf8_lossy(&buf));
+    }
+    all
+}
+
+/// 하이퍼링크(누름틀)가 든 HWPX 출처 문서
+fn hwpx_doc() -> Vec<u8> {
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    c.insert_hyperlink_native(&crate::document_core::hyperlink::HyperlinkTarget::body(0, 0), 0, 2, "https://example.com/").unwrap();
+    let hwpx = c.export_hwpx_native().unwrap();
+    let doc = DocumentCore::from_bytes(&hwpx).unwrap();
+    assert!(matches!(doc.source_format, crate::parser::FileFormat::Hwpx));
+    hwpx
+}
+
+#[test]
+fn hardened_rewrite_drops_xml_injected_into_hwpx_verbatim_fragments() {
+    use crate::model::control::Control;
+    let raw = hwpx_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    {
+        let doc = &mut client.document;
+        doc.doc_info.memo_properties_xml = Some(r#"<hh:memoProperties itemCnt="1"><EVIL-MEMOPR/></hh:memoProperties>"#.to_string());
+        let tail = doc.doc_info.hwpx_head_tail.as_mut().expect("문서 설정 구간(전제)");
+        tail.insert_str(0, "<EVIL-HEADTAIL/>");
+        if let Some(n) = doc.doc_info.numberings.first_mut() {
+            n.raw_para_heads = Some("<EVIL-NUMHEAD/>".to_string());
+        }
+        let field = doc.sections[0].paragraphs.iter_mut().flat_map(|p| p.controls.iter_mut()).find_map(|c| match c {
+            Control::Field(f) => Some(f),
+            _ => None,
+        }).expect("하이퍼링크 누름틀(전제)");
+        let params = field.raw_parameters_xml.as_mut().expect("parameters 원문(전제)");
+        params.push_str("<EVIL-PARAMS/>");
+    }
+    let c = client.export_state().unwrap();
+    let text = hwpx_text(&c);
+    let mut planted = vec!["EVIL-MEMOPR", "EVIL-HEADTAIL", "EVIL-PARAMS"];
+    if client.document.doc_info.numberings.first().is_some() {
+        planted.push("EVIL-NUMHEAD");
+    }
+    for m in &planted {
+        assert!(text.contains(m), "{m} 이 결과에 실려야 한다(전제)");
+    }
+    let (s, changes) = canon.rewrite_state_report(&c).unwrap();
+    let out = hwpx_text(&s);
+    assert!(!out.contains("EVIL-"), "다시 쓴 결과에는 없다 (바꾼 자리 {changes:?})");
+    // 내용은 그대로: 글자, 하이퍼링크 대상
+    assert_eq!(texts(&reread(&s)), texts(&reread(&c)));
+    assert!(out.contains("example.com"), "하이퍼링크 대상은 command 로 다시 쓴다");
+}
+
+#[test]
+fn hardened_rewrite_keeps_hwpx_fragments_the_canonical_has() {
+    let raw = hwpx_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    client.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let c = client.export_state().unwrap();
+    let (s, changes) = canon.rewrite_state_report(&c).unwrap();
+    assert!(changes.is_empty(), "{changes:?}");
+    let (cin, sout) = (reread(&c), reread(&s));
+    assert_eq!(sout.document.doc_info.hwpx_head_tail, cin.document.doc_info.hwpx_head_tail);
+    assert_eq!(digest_of(&s), digest_of(&c));
+}
+
+#[test]
+fn hardened_rewrite_keeps_memo_shapes_an_earlier_op_made_on_hwpx() {
+    // 메모 모양 op 는 정본에서 memoProperties 원문을 비우고 레코드로 둔다. 결과 C 는 저장기가 쓴 원문을 싣고 오므로 원문은
+    // "모르는 것"이지만, 비워도 메모 모양 레코드로 다시 쓴다 — 메모 모양을 잃지 않는다.
+    let raw = hwpx_doc();
+    let mut canon = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    let mut client = CollabCore::new(DocumentCore::from_bytes(&raw).unwrap());
+    canon.set_memo_shape_json(Some(0), MEMO_SHAPE_JSON).unwrap();
+    client.set_memo_shape_json(Some(0), MEMO_SHAPE_JSON).unwrap();
+    client.insert_text_native(0, 0, 0, "더 ").unwrap();
+    let c = client.export_state().unwrap();
+    let s = canon.rewrite_state(&c).unwrap();
+    let shapes = |d: &DocumentCore| crate::model::memo_shape::memo_shapes(&d.document.doc_info);
+    assert!(!shapes(&reread(&c)).is_empty(), "전제");
+    assert_eq!(shapes(&reread(&s)), shapes(&reread(&c)));
+    assert!(hwpx_text(&s).contains("memoPr"), "memoProperties 를 다시 쓴다");
+}
+
+#[test]
+fn dropping_a_bullet_para_head_keeps_the_image_reference() {
+    let mut bullet = crate::model::style::Bullet { image_bullet: 3, raw_para_head: Some("<hh:paraHead/><hh:img/>".to_string()), ..Default::default() };
+    assert_eq!(bullet.image_reference(), Some(3));
+    let mut info = crate::model::document::DocInfo::default();
+    info.bullets.push(std::mem::take(&mut bullet));
+    let mut props = crate::model::document::DocProperties::default();
+    let mut changes = Default::default();
+    super::rewrite_raw::sanitize_doc_info(&mut info, &mut props, &Default::default(), &mut changes);
+    assert_eq!(info.bullets[0].raw_para_head, None);
+    assert_eq!(info.bullets[0].image_reference(), Some(3), "그림 번호를 모델 필드로 옮긴다");
+}
+
+#[test]
+fn op_args_gate_limits_para_header_tails_carried_by_split_undo_meta() {
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    let meta = |n: usize| serde_json::json!({ "para_shape_id": 0, "style_id": 0, "column_type": "None", "raw_break_type": 0, "numbering_restart": null, "raw_header_extra": vec![0u8; n], "tab_extended": [] }).to_string();
+    for n in [0, 10, 12] {
+        assert_eq!(c.check_op_args("splitParagraph", &serde_json::json!([0, 0, 1, meta(n)])), Ok(()), "{n}");
+        assert_eq!(c.check_op_args("splitParagraphInCellByPath", &serde_json::json!([0, 0, "[]", 1, meta(n)])), Ok(()), "{n}");
+    }
+    for n in [4, 11, 40] {
+        assert!(c.check_op_args("splitParagraph", &serde_json::json!([0, 0, 1, meta(n)])).is_err(), "{n}");
+        assert!(c.check_op_args("splitParagraphInHeaderFooter", &serde_json::json!([0, true, 0, 0, 1, meta(n)])).is_err(), "{n}");
+    }
+    // 메타가 없는 보통 Enter, 다른 함수는 그대로
+    assert_eq!(c.check_op_args("splitParagraph", &serde_json::json!([0, 0, 1])), Ok(()));
+    assert_eq!(c.check_op_args("splitParagraph", &serde_json::json!([0, 0, 1, null])), Ok(()));
+    assert_eq!(c.check_op_args("insertText", &serde_json::json!([0, 0, 0, "가"])), Ok(()));
+    assert!(c.check_op_args("splitParagraph", &serde_json::json!([0, 0, 1, "{깨진"])).is_err());
+    assert!(c.raw_seen_len().is_some(), "처음 부르면 본 바이트 기록을 켠다");
+}
+
+/// XML 조각에 나오는 요소 이름(시작·빈 요소)
+fn xml_element_names(fragment: &str) -> Vec<String> {
+    let mut reader = quick_xml::Reader::from_str(fragment);
+    let mut names = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                let name = e.name();
+                let text: &str = name.as_ref();
+                names.push(text.to_string());
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => panic!("조각이 올바른 XML 이 아니다: {e} — {fragment}"),
+        }
+    }
+    names
+}
+
+/// 악의적인 값을 담은 한컴 클립보드 모델(hwpjson) — 번호·글머리표 문단 머리, 메모 모양, 본문 글자
+fn hostile_hwpjson(text: &str, format: &str, bullet: &str) -> String {
+    serde_json::json!({
+        "ro": { "hp": "p0", "p0": { "id": 0, "ru": [{ "cp": "", "ch": [{ "t": text }] }] } },
+        "nu": { "n1": { "sn": 1, "ph": [{ "le": 1, "sf": format }] } },
+        "bu": { "b1": { "ch": bullet, "ph": { "le": 1, "sf": format } } },
+        "mp": { "m1": { "wi": 15591 } },
+    })
+    .to_string()
+}
+
+#[test]
+fn hancom_paste_fragments_are_escaped_xml_rhwp_builds_not_a_raw_channel() {
+    // 규약 §8.1: 한컴 조각(pasteHwpJson)은 rhwp 가 JSON 에서 이스케이프해 만든 XML 이라 원문·날 바이트 통로가 아니다 —
+    // 변환기의 이스케이프가 깨지면 이 시험이 잡는다(문서에 붙는 원문 조각 자리에 모르는 요소가 생기거나 값이 글자 그대로가 아님).
+    let text = "글\"><x/></hp:t></hp:run><evil/>&lt;&";
+    let format = "^1.\"><x/></hh:paraHead><evil/>&amp;&";
+    let bullet = "\"/><evil/>";
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    c.paste_hwp_json_native(0, 0, 0, &hostile_hwpjson(text, format, bullet)).expect("붙여넣기");
+    let info = &c.document.doc_info;
+    // 번호: 형식 문자열이 글자 그대로, 원문 조각은 rhwp 가 만든 paraHead 뿐
+    let numbering = info.numberings.iter().find(|n| n.level_formats.iter().any(|f| f == format)).expect("붙인 번호 정의의 형식이 글자 그대로");
+    let heads = numbering.raw_para_heads.as_deref().expect("번호 원문 조각(전제)");
+    assert!(xml_element_names(heads).iter().all(|n| n == "hh:paraHead"), "{heads}");
+    // 글머리표: 원문 조각에는 paraHead(·img)뿐. 글자는 첫 글자 — 업스트림 HWPX 파서가 `char` 속성을 풀지 않고 읽어
+    // (`attr_str` 를 쓰지 않음) `&quot;` 의 '&' 가 된다. 이스케이프는 지켜졌다(요소가 생기지 않음) — 글자 그대로가 아닌 것은
+    // 업스트림 결함이라 고쳐지면 '"' 가 된다.
+    let pasted_bullet = info.bullets.iter().find(|b| b.raw_para_head.is_some()).expect("붙인 글머리표(전제)");
+    assert!(matches!(pasted_bullet.bullet_char, '"' | '&'), "{:?}", pasted_bullet.bullet_char);
+    let head = pasted_bullet.raw_para_head.as_deref().unwrap();
+    assert!(xml_element_names(head).iter().all(|n| n == "hh:paraHead" || n == "hh:img"), "{head}");
+    // 메모 모양: rhwp 가 만든 memoProperties/memoPr 뿐
+    let memo = info.memo_properties_xml.as_deref().expect("메모 모양 원문 조각(전제 — 문서에 없어 조각 것을 옮긴다)");
+    assert!(xml_element_names(memo).iter().all(|n| n == "hh:memoProperties" || n == "hh:memoPr"), "{memo}");
+    // 누름틀 parameters: hwpjson 은 누름틀을 만들지 않는다 — 원문 조각이 생기지 않는다
+    let fields = c.document.sections[0].paragraphs.iter().flat_map(|p| p.controls.iter()).filter_map(|ctrl| match ctrl {
+        crate::model::control::Control::Field(f) => f.raw_parameters_xml.clone(),
+        _ => None,
+    }).count();
+    assert_eq!(fields, 0);
+    // 본문 글자도 글자 그대로
+    assert!(texts(&c).iter().any(|t| t.contains(text)), "{:?}", texts(&c));
+    // 제어 문자: 받아들이면 글자로만 남고(요소가 생기지 않음), 받아들이지 않으면 붙여넣기 전체가 실패한다 — 어느 쪽도 통로가 아니다
+    let mut d = CollabCore::new(DocumentCore::from_bytes(&text_doc()).unwrap());
+    let before = d.digest();
+    match d.paste_hwp_json_native(0, 0, 0, &hostile_hwpjson("제어\u{1}\u{8}글자", "^1.\u{1}<evil/>", "\u{1}")) {
+        Ok(_) => {
+            for n in &d.document.doc_info.numberings {
+                if let Some(h) = &n.raw_para_heads {
+                    assert!(xml_element_names(h).iter().all(|x| x == "hh:paraHead"), "{h}");
+                }
+            }
+        }
+        Err(_) => assert_eq!(d.digest(), before, "실패하면 문서는 그대로"),
+    }
+}

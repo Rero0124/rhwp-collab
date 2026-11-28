@@ -74,6 +74,17 @@ pub(crate) enum Kind {
     DocStyle,
     DocBinData,
     DocProperties,
+    // ── HWPX 원문 조각(규약 §8.1 (다)) — 저장기가 이스케이프 없이 그대로 넣는 XML 구간 ──
+    /// `<hh:memoProperties>`(`DocInfo.memo_properties_xml`) — 비우면 메모 모양 레코드로 다시 쓴다
+    MemoPropertiesXml,
+    /// `</hh:refList>`~`</hh:head>` 문서 설정 구간(`DocInfo.hwpx_head_tail`) — 비우면 기본 설정을 쓴다
+    HeadTailXml,
+    /// 번호 문단 머리들(`Numbering.raw_para_heads`) — 비우면 모델 수준 값으로 다시 쓴다
+    NumberingParaHeadsXml,
+    /// 글머리표 문단 머리(+그림)(`Bullet.raw_para_head`) — 비우면 그림 번호를 모델 필드로 옮긴다
+    BulletParaHeadXml,
+    /// 누름틀 `<hp:parameters>`(`Field.raw_parameters_xml`) — 비우면 해석한 매개변수·command 로 다시 쓴다
+    FieldParametersXml,
 }
 
 /// 날 바이트 자리 하나 — 걷기([`walk_section`]·[`walk_doc_info`])가 넘긴다.
@@ -82,6 +93,10 @@ pub(crate) enum Slot<'a> {
     Bytes(Kind, &'a mut Vec<u8>),
     /// (C)
     Opt(Kind, &'a mut Option<Vec<u8>>),
+    /// (C) HWPX 원문 조각
+    Str(Kind, &'a mut Option<String>),
+    /// (C) 글머리표 원문 조각 — 비울 때 그림 번호를 모델 필드로 옮긴다
+    BulletHead(&'a mut crate::model::style::Bullet),
     /// (C) 컨트롤마다
     CtrlData(&'a mut Vec<Option<Vec<u8>>>),
     /// (C) 레코드 단위 — 바탕쪽 원본 목록은 하나라도 모르면 모두 버려 모델이 쓰게 한다
@@ -151,6 +166,16 @@ impl Seen {
                     self.insert(kind, b)
                 }
             }
+            Slot::Str(kind, s) => {
+                if let Some(s) = s {
+                    self.insert(kind, s.as_bytes())
+                }
+            }
+            Slot::BulletHead(bullet) => {
+                if let Some(s) = &bullet.raw_para_head {
+                    self.insert(Kind::BulletParaHeadXml, s.as_bytes())
+                }
+            }
             Slot::CtrlData(v) => {
                 for b in v.iter().flatten() {
                     self.insert(Kind::CtrlData, b);
@@ -194,6 +219,27 @@ fn sanitize_slot(slot: Slot<'_>, seen: &Seen) -> Option<String> {
             Some(bytes) if !seen.has(kind, bytes) => {
                 *b = None;
                 Some(format!("{kind:?}"))
+            }
+            _ => None,
+        },
+        Slot::Str(kind, s) => match s {
+            Some(text) if !seen.has(kind, text.as_bytes()) => {
+                *s = None;
+                Some(format!("{kind:?}"))
+            }
+            _ => None,
+        },
+        Slot::BulletHead(bullet) => match &bullet.raw_para_head {
+            Some(text) if !seen.has(Kind::BulletParaHeadXml, text.as_bytes()) => {
+                // 원문 조각이 있으면 그림 번호를 `image_bullet`(BinData 순번)에서, 없으면 `image_data[3]` 에서 읽는다
+                // (`Bullet::image_reference`) — 비우기 전에 옮겨 그림 글머리표의 그림을 잃지 않게 한다. 255 를 넘으면
+                // 그 자리에 담을 수 없어 그림을 잃는다(BinData 가 255개 넘는 문서의 그림 글머리표).
+                let image = bullet.image_reference();
+                bullet.raw_para_head = None;
+                if let Some(id) = image.and_then(|id| u8::try_from(id).ok()) {
+                    bullet.image_data[3] = id;
+                }
+                Some("BulletParaHeadXml".to_string())
             }
             _ => None,
         },
@@ -294,9 +340,11 @@ pub(crate) fn walk_doc_info(doc_info: &mut DocInfo, props: &mut DocProperties, f
     }
     for x in &mut doc_info.numberings {
         f(Slot::Opt(Kind::DocNumbering, &mut x.raw_data));
+        f(Slot::Str(Kind::NumberingParaHeadsXml, &mut x.raw_para_heads));
     }
     for x in &mut doc_info.bullets {
         f(Slot::Opt(Kind::DocBullet, &mut x.raw_data));
+        f(Slot::BulletHead(x));
     }
     for x in &mut doc_info.para_shapes {
         f(Slot::Opt(Kind::DocParaShape, &mut x.raw_data));
@@ -308,6 +356,8 @@ pub(crate) fn walk_doc_info(doc_info: &mut DocInfo, props: &mut DocProperties, f
         f(Slot::Opt(Kind::DocBinData, &mut x.raw_data));
     }
     f(Slot::Opt(Kind::DocProperties, &mut props.raw_data));
+    f(Slot::Str(Kind::MemoPropertiesXml, &mut doc_info.memo_properties_xml));
+    f(Slot::Str(Kind::HeadTailXml, &mut doc_info.hwpx_head_tail));
 }
 
 pub(crate) fn walk_section(section: &mut Section, f: &mut Visit<'_>) {
@@ -362,7 +412,10 @@ fn walk_paragraphs(paragraphs: &mut [Paragraph], f: &mut Visit<'_>) {
                 Control::Footnote(n) => walk_paragraphs(&mut n.paragraphs, f),
                 Control::Endnote(n) => walk_paragraphs(&mut n.paragraphs, f),
                 Control::HiddenComment(c) => walk_paragraphs(&mut c.paragraphs, f),
-                Control::Field(field) => walk_paragraphs(&mut field.memo_paragraphs, f),
+                Control::Field(field) => {
+                    f(Slot::Str(Kind::FieldParametersXml, &mut field.raw_parameters_xml));
+                    walk_paragraphs(&mut field.memo_paragraphs, f);
+                }
                 Control::SectionDef(sd) => walk_section_def(sd, f),
                 _ => {}
             }
@@ -428,4 +481,36 @@ fn walk_shape(shape: &mut ShapeObject, f: &mut Visit<'_>) {
         ShapeObject::Arc(s) => walk_drawing(&mut s.drawing, f),
         ShapeObject::Curve(s) => walk_drawing(&mut s.drawing, f),
     }
+}
+
+// ── op 인자 문(결정 3) ─────────────────────────────────────────────────────
+
+/// 문단 나누기 계열의 `removedParaMeta`(병합 되돌리기용 문단 메타 JSON) 인자 자리
+fn split_meta_index(method: &str) -> Option<usize> {
+    match method {
+        "splitParagraph" => Some(3),
+        "splitParagraphInCell" => Some(6),
+        "splitParagraphInCellByPath" => Some(4),
+        "splitParagraphInFootnote" => Some(5),
+        "splitParagraphInHeaderFooter" => Some(5),
+        _ => None,
+    }
+}
+
+/// op 인자로 들어오는 날 바이트를 정본이 적용하기 전에 본다(결과 다시 쓰기로는 막을 수 없다 — op 는 모든 참여자가 그대로
+/// 적용한다). 통과하지 못하면 그 까닭.
+///
+/// - 문단 나누기 계열 `removedParaMeta.raw_header_extra`: 문단 머리 꼬리라 사양 길이 0·10·12 만 받는다(업스트림은 길이를
+///   보지 않고 그대로 저장한다).
+pub(crate) fn check_op_args(method: &str, args: &serde_json::Value, _seen: &Seen) -> Result<(), String> {
+    if let Some(at) = split_meta_index(method) {
+        if let Some(serde_json::Value::String(json)) = args.get(at) {
+            let meta: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("{method}: removedParaMeta 를 읽지 못함 ({e})"))?;
+            let n = meta.get("raw_header_extra").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+            if !matches!(n, 0 | 10 | 12) {
+                return Err(format!("{method}: removedParaMeta.raw_header_extra 길이 {n} — 문단 머리 꼬리는 0·10·12바이트만"));
+            }
+        }
+    }
+    Ok(())
 }

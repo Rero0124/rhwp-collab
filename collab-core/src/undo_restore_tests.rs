@@ -430,3 +430,66 @@ fn docinfo_item_bytes_are_stable_across_repeated_state_reloads() {
         assert_eq!(bytes_of(&c), first);
     }
 }
+
+/// 서버 정본 흐름(canonical-worker 와 같은 순서): 적용 전 스냅샷 → S = 다시 쓰기(적용 전 정본 기준) → C 읽기 → 범위 표시 확인
+/// → S 읽기. 확인 결과를 돌려준다.
+fn canonical_apply_hinted(canon: &mut CollabCore, c_bytes: &[u8], hint: &Value) -> Value {
+    let pre = canon.snapshot_save();
+    let s_bytes = canon.rewrite_state(c_bytes).unwrap();
+    canon.load_state(c_bytes).unwrap();
+    let v = canon.check_range_hint(pre, hint).unwrap();
+    canon.snapshot_discard(pre);
+    canon.load_state(&s_bytes).unwrap();
+    v
+}
+
+#[test]
+fn range_restore_of_a_deleted_file_table_keeps_its_raw_bytes_through_the_rewrite() {
+    // 6단계 결과 다시 쓰기 강화(정본이 본 날 바이트만 남김)를 지나도, 지운 표를 범위 복원으로 되살리면 표 머리·표 레코드 꼬리·
+    // 셀 목록 꼬리 같은 날 바이트가 남아야 한다 — 파일에서 온 표의 바이트는 정본이 열 때 본 것이다
+    use crate::model::control::Control;
+    let bytes = std::fs::read(format!("{}/samples/hwp_table_test-m.hwp", env!("CARGO_MANIFEST_DIR"))).expect("샘플");
+    let open = || CollabCore::new(DocumentCore::from_bytes(&bytes).unwrap());
+    let (mut canon, mut client) = (open(), open());
+    canon.track_raw_seen();
+    let table_at = |c: &CollabCore| {
+        c.document.sections[0].paragraphs.iter().enumerate().find_map(|(p, para)| {
+            para.controls.iter().position(|x| matches!(x, Control::Table(_))).map(|ci| (p, ci))
+        })
+    };
+    let (p, ci) = table_at(&client).expect("본문 표");
+    let original = client.document.sections[0].paragraphs[p].clone();
+    let Control::Table(t) = &original.controls[ci] else { unreachable!() };
+    assert!(!t.raw_ctrl_data.is_empty() || !t.raw_table_record_extra.is_empty() || t.cells.iter().any(|c| !c.raw_list_extra.is_empty()), "시험이 헛돌지 않게: 날 바이트가 있는 표");
+    // 표 지우기(op) — 클라이언트는 studio 스냅샷을 뜬 뒤 지우고, 정본도 같은 op 를 적용
+    let snap = client.save_snapshot_native();
+    let n0 = client.document.sections[0].paragraphs.len() as i64;
+    client.delete_table_control_native(0, p, ci).unwrap();
+    let pd = client.document.sections[0].paragraphs.len() as i64 - n0;
+    canon.delete_table_control_native(0, p, ci).unwrap();
+    assert_eq!(canon.digest(), client.digest());
+    let rec = json!({ "kind": "op", "m": "deleteTableControl", "a": [0, p, ci], "meta": { "pd": pd } });
+    let cat = json!({ "deleteTableControl": { "conc": "structural", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] } });
+    let r = range_of(&[rec], &cat);
+    let (lo, before, after) = (r["lo"].as_u64().unwrap() as usize, r["before"].as_u64().unwrap() as usize, r["after"].as_u64().unwrap() as usize);
+    recipe_discard(client.undo_restore_range(snap, &spec(0, (lo, before), (lo, after))).unwrap());
+    let hint = json!({ "section": 0, "lo": lo, "before": after, "after": before });
+    let v = canonical_apply_hinted(&mut canon, &client.export_state().unwrap(), &hint);
+    assert_eq!(v, json!({ "ok": true }));
+    // 정본(= 모두가 읽는 S)의 되살린 표가 지우기 전 표와 같다(날 바이트 포함, 줄 세로 위치만 빼고)
+    let (p2, ci2) = table_at(&canon).expect("표가 돌아옴");
+    assert_eq!((p2, ci2), (p, ci));
+    let restored = &canon.document.sections[0].paragraphs[p2];
+    let (Control::Table(a), Control::Table(b)) = (&original.controls[ci], &restored.controls[ci2]) else { unreachable!() };
+    assert_eq!(a.raw_ctrl_data, b.raw_ctrl_data, "표 머리");
+    assert_eq!(a.raw_table_record_extra, b.raw_table_record_extra, "표 레코드 꼬리");
+    assert_eq!(a.cells.iter().map(|c| c.raw_list_extra.clone()).collect::<Vec<_>>(), b.cells.iter().map(|c| c.raw_list_extra.clone()).collect::<Vec<_>>(), "셀 목록 꼬리");
+    assert_eq!(original.ctrl_data_records, restored.ctrl_data_records, "문단의 CTRL_DATA");
+    assert!(para_same(&original, restored, true), "문단 전체(줄 세로 위치 뺌)");
+    // 남의 편집이 없었으면 문서 전체가 지우기 전과 같다(정본이 S 를 읽은 뒤의 digest — 모든 참여자가 같은 S 를 읽는다)
+    let mut fresh = open();
+    fresh.load_state(&fresh.export_state().unwrap()).unwrap();
+    let mut back = open();
+    back.load_state(&canon.export_state().unwrap()).unwrap();
+    assert_eq!(back.digest(), fresh.digest(), "지우기 전 문서와 같다");
+}

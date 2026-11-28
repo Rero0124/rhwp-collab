@@ -7,8 +7,10 @@
 // 준비: COLLAB_DELAY_MS=300 PORT=8807 node server/server.mjs + (cd upstream/rhwp/rhwp-studio && npx vite --port 7720 --strictPort)
 // 실행: STUDIO_URL=http://127.0.0.1:7720 COLLAB_URL=ws://127.0.0.1:8807 node collab-client/e2e/u3-undo-range.mjs
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const studioDir = path.resolve(here, '../../upstream/rhwp/rhwp-studio');
@@ -26,6 +28,35 @@ const record = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}`);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ⑧ 의 비교용 — 같은 빌드의 WASM 으로 내보낸 문서를 한 번 다시 읽어 맞춘 digest(내보내기→다시 읽기는 항등이 아니다)
+const PKG = path.resolve(here, '../../upstream/rhwp/pkg');
+const wasm = await import(pathToFileURL(`${PKG}/rhwp.js`).href);
+wasm.initSync({ module: readFileSync(`${PKG}/rhwp_bg.wasm`) });
+const normalizedDigest = (b64) => {
+  const a = new wasm.HwpDocument(gunzipSync(Buffer.from(b64, 'base64')));
+  const b = new wasm.HwpDocument(gunzipSync(Buffer.from(a.collabExportState())));
+  const d = b.collabDigest();
+  a.free();
+  b.free();
+  return d;
+};
+const exportOf = (page) => page.evaluate(() => {
+  const bytes = window.__wasm.borrowDocumentHandle().collabExportState();
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+});
+/** 본문 표 하나의 (문단, 개체 번호) */
+const firstTable = (page) => page.evaluate(() => {
+  const w = window.__wasm;
+  for (let p = 0; p < w.getParagraphCount(0); p += 1) {
+    for (let ci = 0; ci < 4; ci += 1) {
+      try { w.getTableProperties(0, p, ci); return [p, ci]; } catch { /* 표 아님 */ }
+    }
+  }
+  return null;
+});
 
 async function openTab(host, room, name) {
   const page = await host.newPage();
@@ -261,6 +292,32 @@ try {
 
   const final = await Promise.all(pages.map(status));
   record('끝까지 어긋남·재동기화 없음', final.every((st) => !st.desynced && !st.left && st.resyncCount === 0), final.map((st) => `${st.name}: resync ${st.resyncCount}, replaced ${st.replacedAcks}`).join(', '));
+
+  // ⑧ 파일에서 온 표(표 머리·표 레코드 꼬리·셀 목록 꼬리 같은 날 바이트가 있는 표)를 지웠다가 되돌림 → 서버의 결과 다시
+  // 쓰기(정본이 본 날 바이트만 남김)를 지나도 잃는 것이 없다: 되돌린 문서 = 지우기 전 문서(맞춘 digest)
+  const sample = readFileSync(path.resolve(studioDir, '../samples/hwp_table_test-m.hwp'));
+  const made = await fetch(`${COLLAB.replace(/^ws/, 'http')}/rooms`, { method: 'POST', body: sample });
+  const fileRoom = (await made.json()).room;
+  const A2 = await openTab(browser, fileRoom, 'A2');
+  const B2 = await openTab(browser, fileRoom, 'B2');
+  const files = [A2, B2];
+  lastSeq = -1;
+  const pre = normalizedDigest(await exportOf(A2));
+  const at = await firstTable(A2);
+  await A2.evaluate(([p, ci]) => {
+    window.__inputHandler.executeOperation({
+      kind: 'snapshot',
+      operationType: 'deleteTable',
+      operation: (w) => { w.deleteTableControl(0, p, ci); return { sectionIndex: 0, paragraphIndex: p, charOffset: 0 }; },
+    });
+  }, at);
+  await same(files);
+  const gone = await firstTable(B2);
+  await undo(A2);
+  s = await same(files);
+  const post = normalizedDigest(await exportOf(B2));
+  record('⑧ 파일 표 지우기 되돌리기: 결과 다시 쓰기를 지나도 날 바이트를 잃지 않음(지우기 전 문서와 같음)', s.ok && at !== null && JSON.stringify(gone) !== JSON.stringify(at) && post === pre && JSON.stringify(await firstTable(A2)) === JSON.stringify(at),
+    `표 ${JSON.stringify(at)} 지운 뒤 ${JSON.stringify(gone)} digest ${pre.slice(0, 12)} → ${post.slice(0, 12)}`);
 } catch (error) {
   record('시나리오 실행', false, error.stack ?? String(error));
 } finally {

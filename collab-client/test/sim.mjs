@@ -2,13 +2,17 @@
 // R5 무작위 다중 클라이언트 시뮬레이션 (docs/collab-stage2.md §8). Node + 실제 WASM + 엔진 그대로.
 //
 //   node collab-client/test/sim.mjs [--seeds 500] [--ops 200] [--clients 3] [--from 1] [--verbose]
-//                                   [--mix all|tn] [--verify-fast] [--no-fast] [--realistic] [--rewrite-state]
+//                                   [--mix all|tn] [--verify-fast] [--no-fast] [--realistic] [--rewrite-state] [--range-undo]
 //
 // --mix tn       R11 관문: text·neutral 만(표가 든 base 에서 셀 삭제·셀 서식 포함). 구조·state 없음.
 // --rewrite-state 6단계 S1: 서버(정본)가 받은 state 를 바뀐 부분만 모델에서 다시 쓴 바이트로 바꿔 기록·방송하고(보낸
 //                사람에게는 `replaced` 확정), 섞기에 state 편집(덧말 넣기 — 분류표 state)을 넣는다. 붙여넣기 몫의 일부를 쓴다.
 // --verify-fast  빠른 경로를 쓸 때마다 되감기 결과와 digest 비교(불일치 수를 요약에 낸다 — 관문은 0).
 // --no-fast      빠른 경로를 끈다(언제나 되감기).
+// --range-undo   4단계 U3: 클라이언트마다 되돌리기(CollabUndo + 작은 히스토리)를 붙이고, 스냅샷 명령(표 만들기)과 그
+//                되돌리기·다시 하기를 섞는다. 범위로 되돌리면 범위 표시가 붙은 state 가 나가고, 미확정 중 원격이 끼면 다시
+//                만든다. 서버는 정본 + S1 다시 쓰기로 범위 표시를 확인한다. 관문: 수렴 + 정본의 범위 표시 거절 0 + 끝에서
+//                복원 재료 0.
 // --realistic    R9 현실 조건: 시간 축 위에서 사람 속도(클라이언트마다 초당 약 5타, 서식·구조 드물게),
 //                편도 50ms(왕복 100ms), 입력 묶음 전송. 분류별 충돌률을 낸다.
 //
@@ -20,6 +24,8 @@
 import { gunzipSync } from 'node:zlib';
 import { loadWasm, blankBytes, paragraphs, Client, Server } from './support/harness.mjs';
 import { classify } from '../src/engine/classify.ts';
+import { CollabUndo } from '../src/undo.ts';
+import { describeCollabUndo } from '../../upstream/rhwp/rhwp-studio/src/engine/collab-undo.ts';
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -39,6 +45,8 @@ const REALISTIC = flag('realistic');
 const NO_STRUCT = flag('no-struct');
 /** 6단계 S1: 서버가 다시 쓴 state(`replaced`) + 섞기에 state 편집 */
 const REWRITE_STATE = flag('rewrite-state');
+/** 4단계 U3: 스냅샷 명령의 범위 되돌리기를 섞는다 */
+const RANGE_UNDO = flag('range-undo');
 /**
  * --s3: 3단계 조건(docs/collab-stage3.md 관문 "R5 시뮬레이션 확장") — 서버 정본(S3-2), 무작위 연결 끊김·다시 붙기
  * (S3-4 catchup/welcome), 체크포인트(기준점 이동, S3-3), 서버 재시작(모든 연결 끊김 + 정본을 체크포인트 + 기록으로
@@ -456,12 +464,144 @@ async function runRealisticSeed(seed, base) {
   }
 }
 
+// ── 4단계 U3: 되돌리기(범위 복원) ─────────────────────────────────────────
+
+/** studio CommandHistory 의 훅 순서와 다리(`restoreSnapshot` 만 훅에 먼저 묻는다)를 흉내 낸 작은 히스토리 */
+class SimHistory {
+  constructor(doc) { this.doc = doc; this.undoStack = []; this.redoStack = []; this.hook = null; }
+  bridge(cmd, dir) {
+    const hook = this.hook;
+    return new Proxy(this.doc, {
+      get(target, key) {
+        if (key === 'restoreSnapshot') return (id) => { if (!hook.restoreSnapshot(cmd, dir, id)) target.restoreSnapshot(id); };
+        const v = Reflect.get(target, key, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+  }
+  execute(cmd) {
+    try {
+      cmd.execute(this.doc);
+    } catch {
+      cmd.discard(this.doc);
+      this.hook.settled();
+      return false;
+    }
+    for (const c of this.redoStack) c.discard(this.doc);
+    this.redoStack = [];
+    this.undoStack.push(cmd);
+    this.hook.recorded(cmd, null);
+    return true;
+  }
+  jump(dir) {
+    const [from, to] = dir === 'undo' ? [this.undoStack, this.redoStack] : [this.redoStack, this.undoStack];
+    const cmd = from.at(-1);
+    if (!cmd) return 'empty';
+    const why = this.hook.blocked(cmd, dir);
+    if (why !== null) { from.pop(); cmd.discard(this.doc); this.hook.rejected(cmd, dir, why); return 'blocked'; }
+    try {
+      if (dir === 'undo') cmd.undo(this.bridge(cmd, 'undo')); else cmd.execute(this.bridge(cmd, 'redo'));
+    } catch {
+      from.pop();
+      cmd.discard(this.doc);
+      this.hook.settled();
+      return 'failed';
+    }
+    from.pop();
+    to.push(cmd);
+    if (dir === 'undo') this.hook.undone(cmd); else this.hook.redone(cmd);
+    return 'ok';
+  }
+  controller() {
+    return {
+      stacks: () => ({ undo: [...this.undoStack], redo: [...this.redoStack] }),
+      remove: (set) => {
+        for (const c of set) c.discard(this.doc);
+        this.undoStack = this.undoStack.filter((c) => !set.has(c));
+        this.redoStack = this.redoStack.filter((c) => !set.has(c));
+      },
+      clear: () => { for (const c of [...this.undoStack, ...this.redoStack]) c.discard(this.doc); this.undoStack = []; this.redoStack = []; },
+      describe: (cmd) => describeCollabUndo(cmd),
+    };
+  }
+}
+
+/** studio SnapshotCommand 와 같은 순서의 표 만들기 명령 */
+const snapshotTable = (p, o) => ({
+  type: 'snapshot:createTable', beforeId: null, afterId: null, executed: false,
+  cursorBefore: { sectionIndex: 0, paragraphIndex: p, charOffset: o }, cursorAfter: { sectionIndex: 0, paragraphIndex: p, charOffset: o },
+  execute(doc) {
+    if (this.executed) {
+      doc.restoreSnapshot(this.afterId);
+      doc.discardSnapshot(this.afterId);
+      this.afterId = null;
+      return;
+    }
+    this.executed = true;
+    this.beforeId = doc.saveSnapshot();
+    doc.createTable(0, p, o, 2, 2);
+  },
+  undo(doc) {
+    if (this.afterId === null) this.afterId = doc.saveSnapshot();
+    doc.restoreSnapshot(this.beforeId);
+  },
+  discard(doc) {
+    for (const k of ['beforeId', 'afterId']) if (this[k] !== null) { doc.discardSnapshot(this[k]); this[k] = null; }
+  },
+});
+
+/** 클라이언트에 되돌리기를 붙인다(플러그인처럼: 원격 수신·서버가 다시 쓴 확정마다 스택을 옮기고, welcome 이면 비운다). */
+function withUndo(c, stats) {
+  c.engine.drainLocalLog(); // 붙이기 전의 기록은 어느 명령 것도 아니다
+  // DocInfo 전제가 어긋난 사유를 센다(요약에 낸다)
+  const check = c.engine.undoRangeCheck.bind(c.engine);
+  c.engine.undoRangeCheck = (id, spec) => {
+    const v = check(id, spec);
+    // 앞서 내 편집이 버려진 적이 있는가(버린 미확정이 덧붙인 항목 자리를 남의 항목이 차지한 맞는 막힘인지 가른다)
+    if (v.reason === 'docinfo') { const k = `${c.dropped > 0 ? '내 편집 버림 뒤' : '버림 없음'}: ${v.detail.replace(/ \(\d+번\)$/, '')}`; stats.docinfo[k] = (stats.docinfo[k] ?? 0) + 1; }
+    return v;
+  };
+  c.history = new SimHistory(c.doc);
+  c.undo = new CollabUndo(c.engine, (t) => { stats.notices[t] = (stats.notices[t] ?? 0) + 1; });
+  c.undo.attach(c.history.controller());
+  c.history.hook = c.undo.hook;
+  const receive = c.engine.receiveRemote.bind(c.engine);
+  c.engine.receiveRemote = (entries, caret) => { const res = receive(entries, caret); if (res.ok) c.undo.onRemote(res); return res; };
+  const replaced = c.engine.ackReplaced.bind(c.engine);
+  c.engine.ackReplaced = (entries, caret) => { const res = replaced(entries, caret); if (res.ok) c.undo.onRemote(res); return res; };
+  const welcome = c.applyWelcome.bind(c);
+  c.applyWelcome = (msg) => { welcome(msg); c.undo.clear(); };
+}
+
+/** 되돌리기 단계 하나: 표 만들기(스냅샷 명령) / 되돌리기 / 다시 하기 */
+function rangeStep(r, c, stats) {
+  if (!c.history) withUndo(c, stats); // --s3 의 늦은 참여자
+  const y = r.next();
+  if (y < 0.4) {
+    const s = survey(c.doc);
+    const p = r.int(s.paras);
+    const ok = c.history.execute(snapshotTable(p, offsetIn(r, s.lens[p])));
+    stats.executed += ok ? 1 : 0;
+    const top = c.history.undoStack.at(-1);
+    if (ok && c.undo.debug().undo.at(-1)?.range) stats.ranged += 1;
+    return ok && top ? 'snapshot:createTable' : null;
+  }
+  const dir = y < 0.85 ? 'undo' : 'redo';
+  const res = c.history.jump(dir);
+  if (res === 'empty') return null;
+  stats[`${dir}:${res}`] = (stats[`${dir}:${res}`] ?? 0) + 1;
+  return `${dir}`;
+}
+
 function finish(seed, server, clients, made, edits) {
   const digests = clients.map((c) => c.digest());
   const replay = server.replayDigest();
   const canon = server.canonicalDigest();
   const errors = clients.flatMap((c) => c.errors.map((e) => `${c.id}: ${e}`));
-  const ok = digests.every((d) => d === digests[0]) && replay === digests[0] && (canon === null || canon === digests[0]) && errors.length === 0;
+  // U3: 정상 클라이언트의 범위 표시는 언제나 맞다(거절 0), 모두 확정되면 복원 재료가 남지 않는다
+  const recipesLeft = RANGE_UNDO ? clients[0].engine.recipeCount() : 0;
+  const rangeOk = !RANGE_UNDO || (server.rangeRejects === 0 && recipesLeft === 0);
+  const ok = digests.every((d) => d === digests[0]) && replay === digests[0] && (canon === null || canon === digests[0]) && errors.length === 0 && rangeOk;
   const droppedByClass = {};
   for (const c of clients) for (const e of c.droppedEntries) {
     const cls = e.kind === 'state' ? 'state' : classify(e.m).conc;
@@ -482,6 +622,7 @@ function finish(seed, server, clients, made, edits) {
     reasons: clients.flatMap((c) => c.drops), fast,
     digests: digests.map((d) => d.slice(0, 10)), replay: replay.slice(0, 10), errors,
     ...(REWRITE_STATE ? { rewrite: { rewrites: server.rewrites, replacedAcks: clients.reduce((n, c) => n + (c.replacedAcks ?? 0), 0) } } : {}),
+    ...(RANGE_UNDO ? { range: { ...rangeStatsOf(server), recipesLeft } } : {}),
     ...(S3 ? { s3: { canon: canon?.slice(0, 10), generations: server.generations, newcomers: clients.length - CLIENTS, restarts: server.restarts, invalids: server.invalids,
       catchups: clients.reduce((n, c) => n + c.catchups, 0), welcomes: clients.reduce((n, c) => n + c.resyncs, 0) } } : {}),
   };
@@ -497,10 +638,19 @@ const normalized = (m, bytes) => {
   return out;
 };
 
+/** U3 통계: 서버 기록의 범위 표시 state 수·정본 확인·거절 수 + 되돌리기 결과(클라이언트 합) */
+let rangeStats = null;
+const rangeStatsOf = (server) => ({
+  hintedStates: server.log.reduce((n, m) => n + m.entries.filter((e) => e.kind === 'state' && e.range).length, 0),
+  rangeChecks: server.rangeChecks, rangeRejects: server.rangeRejects, ...rangeStats,
+});
+
 async function runSeed(seed, base) {
   const r = prng(seed);
-  const server = new Server(base, { canonical: S3, rewriteState: REWRITE_STATE });
+  const server = new Server(base, { canonical: S3 || RANGE_UNDO, rewriteState: REWRITE_STATE || RANGE_UNDO });
   const clients = Array.from({ length: CLIENTS }, (_, i) => new Client(String.fromCharCode(65 + i), base, server, { fast: FAST, verifyFast: VERIFY_FAST }));
+  rangeStats = { executed: 0, ranged: 0, notices: {}, docinfo: {} };
+  if (RANGE_UNDO) for (const c of clients) withUndo(c, rangeStats);
   const made = {};
   let edits = 0;
   const gen = MIX === 'tn' ? randomTextNeutralEdit : randomEdit;
@@ -508,9 +658,14 @@ async function runSeed(seed, base) {
     for (let step = 0; edits < OPS && step < OPS * 20; step += 1) {
       const c = r.pick(clients);
       const x = r.next();
-      if (x < 0.5) {
+      if (RANGE_UNDO && x < 0.06) {
+        const k = rangeStep(r, c, rangeStats);
+        if (k) { made[k] = (made[k] ?? 0) + 1; edits += 1; }
+      } else if (x < 0.5) {
         const k = gen(r, c.doc);
         if (k) { made[k] = (made[k] ?? 0) + 1; edits += 1; }
+        // 히스토리 밖 편집도 명령 경계다(studio 에서는 모든 편집이 명령) — 그 기록으로 스택 위치를 옮긴다
+        c.undo?.hook.settled();
       } else if (x < 0.7) {
         c.flush();
       } else if (S3 && x < 0.73) {
@@ -549,7 +704,7 @@ const m = await loadWasm();
 const base = (() => { const b = MIX === 'tn' ? tableBaseBytes(m) : blankBytes(); return S3 ? normalized(m, b) : b; })();
 const total = { seeds: 0, failed: [], edits: 0, made: {}, dropped: 0, droppedByClass: {}, reasons: {}, dropPairs: {},
   fast: { fast: 0, slow: 0, fallback: 0, blocks: {}, fastMs: 0, slowMs: 0 }, mismatches: [], mismatchSeeds: [],
-  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 }, rewrite: { rewrites: 0, replacedAcks: 0 } };
+  s3: { generations: 0, newcomers: 0, restarts: 0, invalids: 0, catchups: 0, welcomes: 0 }, rewrite: { rewrites: 0, replacedAcks: 0 }, range: {} };
 for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   const res = REALISTIC ? await runRealisticSeed(seed, base) : await runSeed(seed, base);
   for (const k of ['fast', 'slow', 'fallback', 'fastMs', 'slowMs']) total.fast[k] += res.fast[k];
@@ -562,6 +717,13 @@ for (let seed = FROM; seed < FROM + SEEDS; seed += 1) {
   total.seeds += 1;
   if (res.s3) for (const k of Object.keys(total.s3)) total.s3[k] += res.s3[k];
   if (res.rewrite) for (const k of Object.keys(total.rewrite)) total.rewrite[k] += res.rewrite[k];
+  if (res.range) {
+    for (const [k, v] of Object.entries(res.range)) {
+      if (k === 'notices') for (const [t, n] of Object.entries(v)) total.range[`알림 ${t}`] = (total.range[`알림 ${t}`] ?? 0) + n;
+      else if (k === 'docinfo') for (const [t, n] of Object.entries(v)) total.range[`DocInfo ${t}`] = (total.range[`DocInfo ${t}`] ?? 0) + n;
+      else total.range[k] = (total.range[k] ?? 0) + v;
+    }
+  }
   total.edits += res.edits;
   total.dropped += res.dropped;
   for (const [k, v] of Object.entries(res.made)) total.made[k] = (total.made[k] ?? 0) + v;
@@ -584,7 +746,7 @@ console.log(JSON.stringify({
   seeds: total.seeds, ops: OPS, clients: CLIENTS, failed: total.failed.length, failedSeeds: total.failed.slice(0, 20),
   edits: total.edits, made: total.made, madeByClass, dropped: total.dropped, droppedByClass: total.droppedByClass,
   conflictRateByClass: rate, dropReasons: total.reasons,
-  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), ...(REWRITE_STATE ? { rewrite: total.rewrite } : {}), cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
+  mix: MIX, realistic: REALISTIC, noStruct: NO_STRUCT, ...(S3 ? { s3: total.s3 } : {}), ...(REWRITE_STATE ? { rewrite: total.rewrite } : {}), ...(RANGE_UNDO ? { range: total.range } : {}), cellRatio: REALISTIC ? CELL_RATIO : undefined, fastEnabled: FAST, verifyFast: VERIFY_FAST,
   dropRate: total.edits ? `${((total.dropped / total.edits) * 100).toFixed(2)}%` : '-',
   dropPairs: Object.fromEntries(Object.entries(total.dropPairs).sort((a, b) => b[1] - a[1])),
   dropEvents: Object.values(total.reasons).reduce((n, v) => n + v, 0),

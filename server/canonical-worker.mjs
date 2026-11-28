@@ -13,6 +13,8 @@
 //                     {forbidden: true, reason: 'author'}
 //                     state 항목(6단계 S1)은 받은 바이트 C 를 그대로 두지 않고, 바뀐 부분만 모델에서 다시 쓴 바이트 S 로
 //                     바꿔 정본도 S 를 다시 읽는다 → {replaced: [{index, data}]}(묶음 안 위치와 S, base64(gzip))
+//                     범위 표시가 붙은 state(4단계 U3, `range: {section, lo, before, after}`)는 C 를 읽은 뒤 그 범위 밖이
+//                     적용 전과 같은지 확인한다(collabCheckRangeHint). 아니면 되돌리고 {reason: 'range', detail}
 //   roundtrip {}      6단계 S2: 모든 부분을 모델에서 다시 쓴 결과를 원본과 견준다(collabRoundtripCheck) →
 //                     {supported, result: {ok, lost: [{kind, count, detail}], irDiff}, ms}. 보조가 없으면 {supported: false}
 //   decrypt {data, password}  암호 문서(원본 바이트, base64)를 암호로 열어 결과 전송 형식(암호 없음, gzip)으로 → {data}.
@@ -43,12 +45,47 @@ function validate(entries) {
   for (const e of entries) {
     if (e?.kind === 'state') {
       if (typeof e.data !== 'string' || !e.data) return 'state 기록에 data 가 없다';
+      if (e.range !== undefined && !validRange(e.range)) return 'state 기록의 range 형식이 아니다';
       continue;
     }
     if (e?.kind !== 'op' || typeof e.m !== 'string' || !Array.isArray(e.a)) return '기록 형식이 아니다';
     if (!Object.hasOwn(CATALOG, e.m) || CATALOG[e.m].sync !== 'op') return `기록할 수 없는 기능: ${e.m}`;
   }
   return null;
+}
+
+/** 4단계 U3 범위 표시 `{section, lo, before, after}`(문단 수, before·after ≥ 1)의 모양. 다른 키는 받지 않는다. */
+function validRange(r) {
+  if (!r || typeof r !== 'object' || Array.isArray(r)) return false;
+  const keys = Object.keys(r);
+  if (keys.length !== 4 || !['section', 'lo', 'before', 'after'].every((k) => keys.includes(k))) return false;
+  const n = (v, min) => Number.isSafeInteger(v) && v >= min;
+  return n(r.section, 0) && n(r.lo, 0) && n(r.before, 1) && n(r.after, 1);
+}
+
+/** 4단계 U3: 범위 표시가 거짓이다(범위 밖이 바뀜) — 묶음을 거절한다(`invalid {reason: 'range'}`). */
+class RangeHintError extends Error {
+  constructor(detail) {
+    super(`범위 표시가 맞지 않음: ${detail}`);
+    this.detail = detail;
+  }
+}
+
+/**
+ * 4단계 U3: 범위 표시가 붙은 state 바이트 C 를 지금 정본에 읽고, 적용 전 스냅샷과 견주어 그 범위 밖이 그대로인지 확인한다.
+ * 범위 표시가 거짓이면 다른 참여자의 미확정을 잘못 보정하게 된다(받는 쪽은 그 state 를 그 범위의 구조 편집으로 보고 범위
+ * 밖 미확정을 번호만 옮겨 살린다). 확인 뒤 정본은 C 를 읽은 상태다 — 부른 쪽이 이어서 S 를 읽는다.
+ */
+function checkRangeHint(e) {
+  if (typeof doc.collabCheckRangeHint !== 'function') throw new RangeHintError('collabCheckRangeHint 가 없다');
+  const pre = doc.collabSnapshotSave();
+  try {
+    doc.collabLoadState(b64ToBytes(e.data));
+    const res = JSON.parse(doc.collabCheckRangeHint(pre, JSON.stringify(e.range)));
+    if (res.ok !== true) throw new RangeHintError(String(res.detail ?? res.reason ?? ''));
+  } finally {
+    doc.collabSnapshotDiscard(pre);
+  }
 }
 
 /**
@@ -160,13 +197,16 @@ parentPort.on('message', ({ id, op, ...p }) => {
         let ownerWhy = null;
         const replaced = [];
         try {
-          if (rewriteSupported() && p.entries.some((e) => e?.kind === 'state')) {
-            // S1: 하나씩 적용하며 state 는 다시 쓴 S 로 읽는다 — 뒤의 op 는 R(S) 위에 얹힌다(다른 참여자도 S 위에 얹는다)
+          const hinted = p.entries.some((e) => e?.kind === 'state' && e.range);
+          if ((rewriteSupported() || hinted) && p.entries.some((e) => e?.kind === 'state')) {
+            // S1: 하나씩 적용하며 state 는 다시 쓴 S 로 읽는다 — 뒤의 op 는 R(S) 위에 얹힌다(다른 참여자도 S 위에 얹는다).
+            // U3: 범위 표시가 있으면 S 를 만든 뒤(적용 전 정본 기준) C 를 읽어 범위 밖이 그대로인지 확인하고 S 를 읽는다.
             p.entries.forEach((e, index) => {
               if (e?.kind !== 'state') return engine.replay([e]);
               const S = rewriteState(e.data);
-              doc.collabLoadState(S);
-              replaced.push({ index, data: Buffer.from(S).toString('base64') });
+              if (e.range) checkRangeHint(e);
+              doc.collabLoadState(S ?? b64ToBytes(e.data));
+              if (S) replaced.push({ index, data: Buffer.from(S).toString('base64') });
             });
           } else if (owner !== null && p.entries.some((e) => OWNED_MEMO_OPS.has(e?.m))) {
             // 묶음 안에서 만든 메모를 바로 고치는 경우도 보려고 하나씩 적용하며 확인한다
@@ -182,6 +222,7 @@ parentPort.on('message', ({ id, op, ...p }) => {
           if (isTrap(e)) return reply({ ok: false, panic: true, reason: reasonOf(e) });
           doc.collabSnapshotRestore(snap);
           doc.collabSnapshotDiscard(snap);
+          if (e instanceof RangeHintError) return reply({ ok: false, reason: 'range', detail: e.detail });
           return reply({ ok: false, reason: reasonOf(e) });
         }
         if (ownerWhy) {

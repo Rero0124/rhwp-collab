@@ -232,6 +232,9 @@ export class Server {
     this.rewriteState = Boolean(options.rewriteState);
     this.rewrites = 0;
     this.invalids = 0;
+    /** 4단계 U3: 정본이 확인해 거절한 범위 표시 / 확인을 거친 범위 표시 state 수 */
+    this.rangeRejects = 0;
+    this.rangeChecks = 0;
     this.generations = 0;
     this.restarts = 0;
   }
@@ -257,21 +260,42 @@ export class Server {
       this.queues.get(client).push({ type: 'reject', seq: this.seq, ...(batchId ? { batchId } : {}) });
       return;
     }
+    // U3(server.mjs 와 같다): state 는 형식 필드만, 정본이 없으면 범위 표시를 뗀다(확인할 수 없다)
+    entries = entries.map((e) => (e.kind === 'state' ? { kind: 'state', data: e.data, ...(this.canonical && e.range ? { range: e.range } : {}) } : e));
     if (this.canonical) {
       const { doc, engine } = this.canonical;
       const snap = doc.collabSnapshotSave();
       try {
-        if (this.rewriteState && entries.some((e) => e.kind === 'state')) {
-          // 묶음의 앞 연산까지 적용한 정본과 비교해야 하므로 하나씩 적용하며 state 를 바꾼다
+        const hinted = entries.some((e) => e.kind === 'state' && e.range);
+        if ((this.rewriteState || hinted) && entries.some((e) => e.kind === 'state')) {
+          // 묶음의 앞 연산까지 적용한 정본과 비교해야 하므로 하나씩 적용하며 state 를 바꾼다(canonical-worker 와 같은 순서:
+          // 적용 전 정본으로 S 를 만들고 → 범위 표시면 C 를 읽어 범위 밖 확인 → S 를 읽음)
           entries = structuredClone(entries);
           for (const e of entries) {
             if (e.kind === 'state') {
-              e.data = bytesToBase64(doc.collabRewriteState(base64ToBytes(e.data)));
-              this.rewrites += 1;
+              const S = this.rewriteState ? doc.collabRewriteState(base64ToBytes(e.data)) : null;
+              if (e.range) {
+                this.rangeChecks += 1;
+                const pre = doc.collabSnapshotSave();
+                try {
+                  doc.collabLoadState(base64ToBytes(e.data));
+                  const v = JSON.parse(doc.collabCheckRangeHint(pre, JSON.stringify(e.range)));
+                  if (v.ok !== true) {
+                    this.rangeRejects += 1;
+                    throw new Error(`range: ${v.detail}`);
+                  }
+                } finally {
+                  doc.collabSnapshotDiscard(pre);
+                }
+              }
+              if (S) {
+                e.data = bytesToBase64(S);
+                this.rewrites += 1;
+              }
             }
             engine.replay([e]);
           }
-          replaced = true;
+          replaced = this.rewriteState;
         } else {
           engine.replay(entries);
         }

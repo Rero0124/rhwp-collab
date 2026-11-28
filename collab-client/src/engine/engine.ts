@@ -22,7 +22,26 @@ import type { CatalogEntry } from './types.ts';
 /** 기록 하나 (§3 기록 형태). */
 export type Entry =
   | { kind: 'op'; m: string; a: unknown[]; meta?: Record<string, unknown>; ctx?: { activeField?: unknown; clipboard?: unknown; memoTime?: string } }
-  | { kind: 'state'; data: string };
+  | { kind: 'state'; data: string; range?: StateRange; recipe?: number };
+
+/**
+ * 4단계 U3: 범위 표시(docs/collab-stage4.md §6) — 이 state 는 구역 `section` 의 [lo, lo+before) 를 after 개 문단으로 바꾼
+ * 것뿐이다(서버 정본이 확인한다). 받는 쪽은 문서 전체가 아니라 그 범위의 구조 편집으로 보고 보정한다. `recipe` 는 보낸 쪽
+ * 전용(복원 재료 번호 — 보낼 때 뺀다): 보정으로 범위가 옮겨지면 새 문서 위에서 다시 만든다.
+ */
+export interface StateRange {
+  section: number;
+  lo: number;
+  before: number;
+  after: number;
+}
+
+/** 4단계 U3: 범위 복원 지정 — studio 스냅샷의 `src` 문단을 지금 문서의 `dst` 와 바꾼다. */
+export interface RangeRestoreSpec {
+  section: number;
+  src: { lo: number; n: number };
+  dst: { lo: number; n: number };
+}
 
 /** 엔진이 쓰는 문서 핸들 — `HwpDocument` 의 collab 보조 export 와, 이름으로 부를 변경 export 들. */
 export interface EngineDoc {
@@ -42,6 +61,18 @@ export interface EngineDoc {
   collabMapPositions?(recsJson: string, catalogJson: string, itemsJson: string): string;
   /** 4단계: 명령이 만든 기록 열의 발자국. */
   collabFootprint?(entriesJson: string, catalogJson: string): string;
+  /** 4단계 U3: 명령이 만든 기록 열의 문단 범위(순수). */
+  collabUndoRange?(entriesJson: string, catalogJson: string): string;
+  /** 4단계 U3: 문단 범위들을 기록 열 뒤로 옮긴다(순수). */
+  collabMapRanges?(recsJson: string, catalogJson: string, rangesJson: string): string;
+  /** 4단계 U3: 범위 복원을 할 수 있는가(studio 스냅샷). */
+  collabUndoRangeCheck?(snapshotId: number, specJson: string): string;
+  /** 4단계 U3: 범위 복원(기록 훅 밖) — 복원 재료 번호. */
+  collabUndoRestoreRange?(snapshotId: number, specJson: string): number;
+  /** 4단계 U3: 복원 재료로 다시 복원(보정된 미확정 복원 state 를 새 문서 위에서 다시 만들 때). */
+  collabUndoReapplyRange?(recipeId: number, specJson: string): void;
+  collabUndoRecipeDiscard?(recipeId: number): void;
+  collabUndoRecipeCount?(): number;
   /** 5단계 D4 클라이언트 문: 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가. */
   collabFieldContains?(method: string, argsJson: string, activeFieldJson: string): boolean;
   /** D6: 메모 목록(작성자 확인) — 업스트림 `getMemoList` */
@@ -120,6 +151,14 @@ export interface UndoPosition extends TextCaret {
   scope?: 'section' | 'sectionAll';
   /** 출력: 남의 기록이 닿았으면 첫 사유 */
   hit?: 'touched' | 'gone' | 'structural' | 'whole' | 'section' | null;
+}
+
+/** 4단계 U3: 되돌리기 스택이 기억하는 문단 범위(지금 문서 좌표 [lo, hi)). 출력의 `hit` 은 남의 기록이 범위에 닿은 사유. */
+export interface UndoRange {
+  section: number;
+  lo: number;
+  hi: number;
+  hit?: 'touched' | 'structural' | 'whole' | null;
 }
 
 export interface EngineOptions {
@@ -322,6 +361,7 @@ export class CollabEngine {
 
   /** 미확정·확정 대기·스냅샷을 모두 버린다. */
   reset(): void {
+    this.discardRecipes(this.unconfirmed);
     if (this.doc && this.snapshot !== null) {
       try { this.doc.collabSnapshotDiscard(this.snapshot); } catch { /* 문서가 이미 해제됨 */ }
     }
@@ -452,9 +492,11 @@ export class CollabEngine {
   private push(entry: Entry): void {
     const lid = this.nextLid++;
     this.localLog.push({ lid, entry });
-    // 보내지 않은 state 가 끝에 있으면 새 state 가 그것을 포함한다 — 마지막 것만 남긴다.
+    // 보내지 않은 state 가 끝에 있으면 새 state 가 그것을 포함한다 — 마지막 것만 남긴다. U3: 범위 표시가 있는 state 는
+    // 합치지 않는다 — 합친 변경은 한 범위가 아니라 표시를 떼야 하고, 그러면 받는 쪽의 왕복 중 입력이 다시 취소된다(되돌리기를
+    // 연달아 누른 경우). 문서 두 벌을 보내는 비용을 택한다.
     const last = this.unconfirmed[this.unconfirmed.length - 1];
-    if (entry.kind === 'state' && last?.kind === 'state' && this.unconfirmed.length > this.sent) {
+    if (entry.kind === 'state' && last?.kind === 'state' && !entry.range && !last.range && this.unconfirmed.length > this.sent) {
       this.unconfirmed[this.unconfirmed.length - 1] = entry;
       this.lids[this.lids.length - 1].push(lid);
     } else {
@@ -462,6 +504,53 @@ export class CollabEngine {
       this.lids.push([lid]);
     }
     this.onLocal();
+  }
+
+  /**
+   * 4단계 U3: 범위 복원(collab 보조 — 기록 훅 밖)을 하고 그 결과를 **범위 표시가 붙은 state** 로 직접 기록한다. 순서는
+   * intercept 의 state 와 같다: 권한 문 → 확정 상태 스냅샷(바꾸기 전에) → 복원 → 내보내기·다시 읽기 → 기록. 복원이
+   * 실패하면 문서를 바꾸지 않고 던진다.
+   */
+  recordRangeRestore(snapshotId: number, spec: RangeRestoreSpec): void {
+    const doc = this.doc;
+    if (!doc?.collabUndoRestoreRange) throw new Error('범위 복원 보조가 없습니다');
+    if (this.scope) {
+      const denied = this.scope.form ? DENIED_TEXT.form : this.scope.comment ? DENIED_TEXT.comment : DENIED_TEXT.view;
+      this.onDenied(denied, 'collabUndoRestoreRange');
+      throw new PermissionDenied(denied, 'collabUndoRestoreRange');
+    }
+    if (!this.recording || this.replaying) throw new Error('기록 중이 아닐 때 범위 복원을 부를 수 없습니다');
+    const created = this.ensureSnapshot(doc);
+    let recipe: number;
+    try {
+      recipe = doc.collabUndoRestoreRange(snapshotId, JSON.stringify(spec));
+    } catch (error) {
+      if (created) this.dropSnapshotIfIdle(doc);
+      throw error;
+    }
+    const entry = this.stateEntry(doc) as Extract<Entry, { kind: 'state' }>;
+    entry.range = { section: spec.section, lo: spec.dst.lo, before: spec.dst.n, after: spec.src.n };
+    entry.recipe = recipe;
+    this.push(entry);
+  }
+
+  /** 4단계 U3: 미확정 복원 state 를 보정된 범위(옮긴 lo)에서 다시 만든다 — 재료로 다시 복원하고 내보내기·다시 읽기. */
+  private regenerate(doc: EngineDoc, entry: Extract<Entry, { kind: 'state' }>): void {
+    const range = entry.range as StateRange;
+    if (!doc.collabUndoReapplyRange || typeof entry.recipe !== 'number') throw new Error('복원 재료가 없습니다');
+    doc.collabUndoReapplyRange(entry.recipe, JSON.stringify({ section: range.section, lo: range.lo, n: range.before }));
+    const bytes = doc.collabExportState();
+    doc.collabLoadState(bytes);
+    entry.data = bytesToBase64(bytes);
+  }
+
+  /** 4단계 U3: 기록들의 복원 재료를 푼다(확정·버림·리셋). */
+  private discardRecipes(entries: readonly Entry[]): void {
+    for (const e of entries) {
+      if (e.kind !== 'state' || typeof e.recipe !== 'number') continue;
+      try { this.doc?.collabUndoRecipeDiscard?.(e.recipe); } catch { /* 문서가 이미 해제됨 */ }
+      delete e.recipe;
+    }
   }
 
   /** 4단계: 지난번 이후 생긴 로컬 기록(번호와 함께)을 가져간다. 명령 경계에서 부른다. */
@@ -488,7 +577,12 @@ export class CollabEngine {
 
   /** 보내지 않은 기록. 부르면 보낸 것으로 친다. */
   takePending(): Entry[] {
-    const out = this.unconfirmed.slice(this.sent);
+    // 복원 재료 번호는 보낸 쪽 전용 — 보내는 사본에서 뺀다
+    const out = this.unconfirmed.slice(this.sent).map((e) => {
+      if (e.kind !== 'state' || e.recipe === undefined) return e;
+      const { recipe: _recipe, ...rest } = e;
+      return rest;
+    });
     this.sent = this.unconfirmed.length;
     return out;
   }
@@ -496,6 +590,7 @@ export class CollabEngine {
   /** 서버가 내 기록 앞의 `n` 개를 확정했다. */
   ack(n: number): void {
     const done = this.unconfirmed.splice(0, Math.min(n, this.unconfirmed.length));
+    this.discardRecipes(done);
     this.lids.splice(0, done.length);
     this.sent = Math.max(0, this.sent - done.length);
     this.acked.push(...done);
@@ -522,6 +617,7 @@ export class CollabEngine {
     if (this.snapshot === null) return { ok: false, rebased: false, dropped: 0, caret, error: '미확정이 있는데 스냅샷이 없습니다' };
     this.replaying = true;
     try {
+      this.discardRecipes(this.unconfirmed.slice(0, n));
       const rest = this.unconfirmed.slice(n);
       const restLids = this.lids.slice(n);
       const sentRest = Math.max(0, this.sent - n);
@@ -550,6 +646,7 @@ export class CollabEngine {
           break;
         }
       }
+      this.discardRecipes(droppedEntries);
       this.unconfirmed = kept;
       this.lids = keptLids;
       this.sent = Math.min(sentRest, kept.length);
@@ -694,8 +791,11 @@ export class CollabEngine {
       let reapplyFailed = false;
       for (let i = 0; i < res.pending.length; i += 1) {
         try {
-          this.applyEntry(doc, res.pending[i]);
-          kept.push(res.pending[i]);
+          const e = res.pending[i];
+          // U3: 미확정 복원 state 는 옛 바이트에 원격이 없다 — 보정된 범위(옮긴 lo)에서 다시 만든다
+          if (e.kind === 'state' && e.range && typeof e.recipe === 'number') this.regenerate(doc, e);
+          else this.applyEntry(doc, e);
+          kept.push(e);
           keptLids.push(lidsOf(i));
         } catch (error) {
           // 재적용이 실패하면 그것과 그 뒤를 버린다(뒤는 그 위에서 만들어졌다). 앞은 이미 적용됐다.
@@ -709,6 +809,8 @@ export class CollabEngine {
         }
       }
       const dropped = droppedEntries.length;
+      // 버린 복원 state 의 재료를 푼다(보정이 버린 것은 원래 기록, 재적용 실패는 보정된 기록 — 둘 다 같은 재료 번호)
+      this.discardRecipes(droppedEntries);
       this.unconfirmed = kept;
       this.lids = keptLids;
       this.sent = 0;
@@ -796,6 +898,33 @@ export class CollabEngine {
     const doc = this.doc;
     if (!doc?.collabFootprint) return null;
     return JSON.parse(doc.collabFootprint(JSON.stringify(entries), this.catalogFor(entries)));
+  }
+
+  /** 4단계 U3: 명령이 만든 기록 열의 문단 범위(스냅샷 [lo, lo+before) → 지금 [lo, lo+after)). 없으면 `null`. */
+  undoRange(entries: readonly Entry[]): StateRange | null {
+    const doc = this.doc;
+    if (!doc?.collabUndoRange || entries.length === 0) return null;
+    return JSON.parse(doc.collabUndoRange(JSON.stringify(entries), this.catalogFor(entries))) as StateRange | null;
+  }
+
+  /** 4단계 U3: 문단 범위들(지금 문서 좌표 [lo, hi))을 기록 열 뒤로 옮긴다. WASM 이 모르면 `null`. */
+  mapRanges(recs: readonly Entry[], ranges: readonly UndoRange[]): UndoRange[] | null {
+    const doc = this.doc;
+    if (!doc?.collabMapRanges) return null;
+    if (recs.length === 0 || ranges.length === 0) return ranges.map((r) => ({ ...r, hit: null }));
+    return JSON.parse(doc.collabMapRanges(JSON.stringify(recs), this.catalogFor(recs), JSON.stringify(ranges))) as UndoRange[];
+  }
+
+  /** 4단계 U3: 범위 복원을 할 수 있는가(studio 스냅샷 `snapshotId`). */
+  undoRangeCheck(snapshotId: number, spec: RangeRestoreSpec & { counts?: boolean }): { ok: boolean; reason?: string; detail?: string } {
+    const doc = this.doc;
+    if (!doc?.collabUndoRangeCheck) return { ok: false, reason: 'unsupported' };
+    return JSON.parse(doc.collabUndoRangeCheck(snapshotId, JSON.stringify(spec)));
+  }
+
+  /** 시험용: 살아 있는 복원 재료 수(WASM 이 모르면 0). */
+  recipeCount(): number {
+    return this.doc?.collabUndoRecipeCount?.() ?? 0;
   }
 
   get lastLocal(): Entry | null {

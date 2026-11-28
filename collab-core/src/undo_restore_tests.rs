@@ -1,0 +1,432 @@
+//! 4단계 U3 시험: 범위 계산·옮기기(순수), 범위 표시 state 의 보정(ot), 실제 문서의 범위 복원·다시 만들기·DocInfo 전제,
+//! 서버 정본의 범위 표시 확인.
+
+use super::super::{map_positions, rebase};
+use super::*;
+use serde_json::json;
+
+fn cat() -> Value {
+    json!({
+        "insertText": { "conc": "text", "section": 0 },
+        "deleteText": { "conc": "text", "section": 0 },
+        "splitParagraph": { "conc": "text", "section": 0 },
+        "mergeParagraph": { "conc": "text", "section": 0 },
+        "deleteRange": { "conc": "text", "section": 0 },
+        "insertTextInCell": { "conc": "text", "section": 0 },
+        "applyParaFormat": { "conc": "neutral", "section": 0, "roles": [{ "kind": "para", "arg": 1 }] },
+        "createTable": { "conc": "structural", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] },
+        "insertTableRow": { "conc": "structural", "section": 0, "roles": [{ "kind": "anchor", "arg": 1, "control": 2 }] },
+        "pasteInternal": { "conc": "structural", "section": 0, "roles": [{ "kind": "anchor", "arg": 1 }] },
+        "createTableEx": { "conc": "structural", "section": null },
+        "createStyle": { "conc": "structural", "section": null },
+        "updateStyle": { "conc": "neutral", "section": null, "roles": [] },
+        "renameField": { "conc": "neutral", "section": null, "roles": [] },
+        "splitTableCell": { "conc": "structural", "section": 0 },
+    })
+}
+
+fn ins(sec: usize, p: usize, o: usize, t: &str) -> Value {
+    json!({ "kind": "op", "m": "insertText", "a": [sec, p, o, t], "meta": { "len": t.chars().count() } })
+}
+fn split(p: usize, o: usize) -> Value {
+    json!({ "kind": "op", "m": "splitParagraph", "a": [0, p, o], "meta": {} })
+}
+fn merge(p: usize, prev: usize) -> Value {
+    json!({ "kind": "op", "m": "mergeParagraph", "a": [0, p], "meta": { "prevLen": prev } })
+}
+fn table(p: usize, pd: i64) -> Value {
+    json!({ "kind": "op", "m": "createTable", "a": [0, p, 0, 2, 2], "meta": { "pd": pd } })
+}
+fn row(p: usize, ci: usize) -> Value {
+    json!({ "kind": "op", "m": "insertTableRow", "a": [0, p, ci, 0, false], "meta": { "pd": 0 } })
+}
+fn cell_ins(p: usize, t: &str) -> Value {
+    json!({ "kind": "op", "m": "insertTextInCell", "a": [0, p, 0, 0, 0, 0, t], "meta": { "len": t.chars().count() } })
+}
+fn hinted(lo: usize, before: usize, after: usize) -> Value {
+    json!({ "kind": "state", "data": "AAAA", "range": { "section": 0, "lo": lo, "before": before, "after": after } })
+}
+fn range_json(es: &[Value]) -> Value {
+    range_of(es, &cat())
+}
+fn mapped(recs: &[Value], lo: usize, hi: usize) -> Value {
+    map_ranges(recs, &cat(), &[json!({ "section": 0, "lo": lo, "hi": hi })])[0].clone()
+}
+
+// ── 범위 계산 ────────────────────────────────────────────────────────────
+
+#[test]
+fn range_of_structural_foot_and_text() {
+    // 표 만들기: 문단 2 를 나눠 표 문단을 끼움(pd +2) → 명령 전 [2,3), 명령 후 [2,5)
+    assert_eq!(range_json(&[table(2, 2)]), json!({ "section": 0, "lo": 2, "before": 1, "after": 3 }));
+    // 표 지우기처럼 문단이 줄어듦(pd -1): 명령 전 [3,5), 뒤 [3,4)
+    assert_eq!(range_json(&[table(3, -1)]), json!({ "section": 0, "lo": 3, "before": 2, "after": 1 }));
+    // 붙여넣기 뒤 그 안에 글자 입력 — 같은 범위
+    let paste = json!({ "kind": "op", "m": "pasteInternal", "a": [0, 1, 0], "meta": { "pd": 3 } });
+    assert_eq!(range_json(&[paste, ins(0, 3, 0, "x")]), json!({ "section": 0, "lo": 1, "before": 1, "after": 4 }));
+    // 나눔 + 합침
+    assert_eq!(range_json(&[split(4, 1)]), json!({ "section": 0, "lo": 4, "before": 1, "after": 2 }));
+    assert_eq!(range_json(&[merge(4, 2)]), json!({ "section": 0, "lo": 3, "before": 2, "after": 1 }));
+    // 떨어진 두 곳: 사이 문단도 범위(원래 문단이라 before 에도 셈)
+    assert_eq!(range_json(&[ins(0, 1, 0, "a"), ins(0, 5, 0, "b")]), json!({ "section": 0, "lo": 1, "before": 5, "after": 5 }));
+    // 셀 글자: 표를 품은 본문 문단
+    assert_eq!(range_json(&[cell_ins(6, "c")]), json!({ "section": 0, "lo": 6, "before": 1, "after": 1 }));
+}
+
+#[test]
+fn range_of_refuses_what_cannot_be_a_range() {
+    assert_eq!(range_json(&[json!({ "kind": "state", "data": "AAAA" })]), Value::Null, "결과 전송");
+    assert_eq!(range_json(&[json!({ "kind": "op", "m": "createTableEx", "a": [0, 1] })]), Value::Null, "구역 모르는 구조");
+    assert_eq!(range_json(&[json!({ "kind": "op", "m": "splitTableCell", "a": [0, 1, 0] })]), Value::Null, "발자국 없는 구조");
+    assert_eq!(range_json(&[ins(0, 1, 0, "a"), ins(1, 1, 0, "b")]), Value::Null, "두 구역");
+    assert_eq!(range_json(&[json!({ "kind": "op", "m": "createTable", "a": [0, 1, 0, 2, 2] })]), Value::Null, "pd 없는 구조");
+    assert_eq!(range_json(&[]), Value::Null);
+}
+
+// ── 범위 옮기기 ──────────────────────────────────────────────────────────
+
+#[test]
+fn map_ranges_moves_outside_edits_and_marks_inside() {
+    let hit = |v: &Value| v["hit"].clone();
+    let span = |v: &Value| (v["lo"].as_u64().unwrap(), v["hi"].as_u64().unwrap());
+    // 범위 앞 Enter → 번호만 옮김
+    let m = mapped(&[split(0, 1)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((3, 6), Value::Null));
+    // 범위 뒤 글자·Enter → 그대로
+    let m = mapped(&[ins(0, 6, 0, "x"), split(7, 0)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((2, 5), Value::Null));
+    // 범위 안 글자 → 닿음
+    assert_eq!(hit(&mapped(&[ins(0, 3, 0, "x")], 2, 5)), json!("touched"));
+    // 범위 첫 문단을 앞 문단에 합침 / 범위 뒤 문단을 마지막 문단에 합침 → 닿음
+    assert_eq!(hit(&mapped(&[merge(2, 1)], 2, 5)), json!("touched"));
+    assert_eq!(hit(&mapped(&[merge(5, 1)], 2, 5)), json!("touched"));
+    // 범위 앞 합침 → 하나 당김
+    let m = mapped(&[merge(1, 1)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((1, 4), Value::Null));
+    // 범위 안 표의 칸 편집·행 넣기 → 닿음(바꾸기가 그 표를 통째로 지운다), 범위 밖 표는 무관
+    assert_eq!(hit(&mapped(&[cell_ins(3, "c")], 2, 5)), json!("touched"));
+    assert_eq!(hit(&mapped(&[cell_ins(6, "c")], 2, 5)), Value::Null);
+    assert_eq!(hit(&mapped(&[row(4, 0)], 2, 5)), json!("structural"));
+    assert_eq!(hit(&mapped(&[row(6, 0)], 2, 5)), Value::Null);
+    // 같은 구역 다른 곳의 표 만들기 → 막지 않고 번호만(3.2-2 를 이 경우만 풂)
+    let m = mapped(&[table(0, 2)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((4, 7), Value::Null));
+    let m = mapped(&[table(8, 2)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((2, 5), Value::Null));
+    assert_eq!(hit(&mapped(&[table(4, 2)], 2, 5)), json!("structural"));
+    // 발자국 없는 구조·구역 모르는 구조·state → 막힘
+    assert_eq!(hit(&mapped(&[json!({ "kind": "op", "m": "splitTableCell", "a": [0, 9, 0] })], 2, 5)), json!("structural"));
+    assert_eq!(hit(&mapped(&[json!({ "kind": "op", "m": "createStyle", "a": ["{}"] })], 2, 5)), json!("structural"));
+    // DocInfo 정의만 고치는 서식은 범위에 닿지 않는다(DocInfo 전제가 걸러 따로 안내), 그 밖의 문서 단위 서식은 막힘
+    assert_eq!(hit(&mapped(&[json!({ "kind": "op", "m": "updateStyle", "a": [0, "{}"] })], 2, 5)), Value::Null);
+    assert_eq!(hit(&mapped(&[json!({ "kind": "op", "m": "renameField", "a": ["a", "b"] })], 2, 5)), json!("structural"));
+    assert_eq!(hit(&mapped(&[json!({ "kind": "state", "data": "AAAA" })], 2, 5)), json!("whole"));
+    // 다른 구역 → 무관
+    assert_eq!(hit(&mapped(&[ins(1, 3, 0, "x")], 2, 5)), Value::Null);
+    // 서식: 범위 안 문단이면 닿음
+    let fmt = |p: usize| json!({ "kind": "op", "m": "applyParaFormat", "a": [0, p, "{}"] });
+    assert_eq!(hit(&mapped(&[fmt(4)], 2, 5)), json!("touched"));
+    assert_eq!(hit(&mapped(&[fmt(5)], 2, 5)), Value::Null);
+    // 남의 범위 표시 state: 밖이면 옮김, 겹치면 막힘
+    let m = mapped(&[hinted(0, 1, 3)], 2, 5);
+    assert_eq!((span(&m), hit(&m)), ((4, 7), Value::Null));
+    assert_eq!(hit(&mapped(&[hinted(4, 2, 1)], 2, 5)), json!("structural"));
+}
+
+// ── 범위 표시 state 의 보정 (ot) ──────────────────────────────────────────
+
+#[test]
+fn hinted_state_is_a_structural_footprint_in_rebase() {
+    let r = |p: &[Value], q: &[Value]| rebase(p, q, &cat(), &Value::Null);
+    // 원격 범위 표시 state(문단 2 → 3개) 뒤로 내 미확정: 범위 밖이면 번호만 옮겨 살림
+    let out = r(&[ins(0, 7, 0, "B")], &[hinted(2, 1, 3)]);
+    assert_eq!(out["dropFrom"], Value::Null);
+    assert_eq!(out["pending"][0]["a"], json!([0, 9, 0, "B"]));
+    let out = r(&[ins(0, 1, 0, "B")], &[hinted(2, 1, 3)]);
+    assert_eq!(out["pending"][0]["a"], json!([0, 1, 0, "B"]), "범위 앞은 그대로");
+    // 범위 안이면 충돌
+    assert_eq!(r(&[ins(0, 2, 0, "B")], &[hinted(2, 1, 3)])["dropFrom"], json!(0));
+    // 다른 구역이면 그대로
+    assert_eq!(r(&[ins(1, 2, 0, "B")], &[hinted(2, 1, 3)])["pending"][0]["a"], json!([1, 2, 0, "B"]));
+    // 보통 state 는 예전처럼 모두와 충돌
+    assert_eq!(r(&[ins(0, 9, 0, "B")], &[json!({ "kind": "state", "data": "AAAA" })])["dropFrom"], json!(0));
+
+    // 내 미확정 범위 표시 state 를 원격 뒤로: 범위 밖이면 표시의 lo 를 고쳐 쓴다(엔진이 그 자리에서 다시 만든다)
+    let mine = json!({ "kind": "state", "data": "AAAA", "recipe": 7, "range": { "section": 0, "lo": 5, "before": 2, "after": 1 } });
+    let out = r(std::slice::from_ref(&mine), &[split(0, 1)]);
+    assert_eq!(out["dropFrom"], Value::Null);
+    assert_eq!(out["pending"][0]["range"], json!({ "section": 0, "lo": 6, "before": 2, "after": 1 }));
+    assert_eq!(out["pending"][0]["recipe"], json!(7), "보낸 쪽 전용 필드는 그대로");
+    // 원격 지도(remoteAfter)는 내 범위 표시 뒤로 옮겨진다(되돌리기 스택 지도)
+    let out = r(std::slice::from_ref(&mine), &[ins(0, 9, 0, "B")]);
+    assert_eq!(out["remoteAfter"][0]["a"], json!([0, 8, 0, "B"]));
+    // 범위를 고친 원격 → 충돌, 되돌림 지도는 span 을 실은 __undoFoot
+    let out = r(std::slice::from_ref(&mine), &[ins(0, 6, 0, "B")]);
+    assert_eq!(out["dropFrom"], json!(0));
+    assert_eq!(out["dropUndoComplete"], json!(true));
+    let undo = out["dropUndo"].as_array().unwrap().clone();
+    assert_eq!(undo[0]["meta"], json!({ "pd": 1, "span": 1 }));
+    let pos = map_positions(&undo, &cat(), &[json!({ "section": 0, "para": 8, "offset": 0 })]);
+    assert_eq!(pos[0]["para"], json!(9), "버린 범위 바꾸기의 되돌림: 뒤 문단 하나 밂");
+}
+
+#[test]
+fn hinted_state_moves_undo_positions_instead_of_whole() {
+    let out = map_positions(&[hinted(2, 1, 3)], &cat(), &[json!({ "section": 0, "para": 7, "offset": 1 }), json!({ "section": 1, "para": 7, "offset": 1 })]);
+    assert_eq!(out[0]["para"], json!(9));
+    assert_eq!(out[0]["hit"], json!("structural"), "같은 구역의 구조 편집(3.2-2)");
+    assert_eq!(out[1]["para"], json!(7));
+    assert_eq!(out[1]["hit"], Value::Null, "다른 구역은 막지 않는다 — 문서 전체(whole)가 아님");
+}
+
+// ── 실제 문서 ────────────────────────────────────────────────────────────
+
+fn blank() -> DocumentCore {
+    let mut core = DocumentCore::new_empty();
+    core.create_blank_document_native().expect("빈 문서 생성");
+    core
+}
+
+/// 문단 n 개(문단 i 의 글자는 `p{i}`)
+fn doc_with(n: usize) -> CollabCore {
+    let mut c = CollabCore::new(blank());
+    for i in 0..n {
+        if i > 0 {
+            let len = c.document.sections[0].paragraphs[i - 1].text.chars().count();
+            c.split_paragraph_native(0, i - 1, len, None).unwrap();
+        }
+        c.insert_text_native(0, i, 0, &format!("p{i}")).unwrap();
+    }
+    c
+}
+
+fn texts(c: &CollabCore) -> Vec<String> {
+    c.document.sections[0].paragraphs.iter().map(|p| p.text.clone()).collect()
+}
+/// 본문의 표 개수(빈 문서 첫 문단의 구역·단 정의 개체는 세지 않는다)
+fn controls(c: &CollabCore) -> usize {
+    use crate::model::control::Control;
+    c.document.sections[0].paragraphs.iter().flat_map(|p| &p.controls).filter(|x| matches!(x, Control::Table(_))).count()
+}
+
+/// 표 만들기(엔진처럼 구역 문단 수 변화 pd 를 실측해 기록에 붙인다)
+fn create_table(c: &mut CollabCore, p: usize) -> Value {
+    let off = c.document.sections[0].paragraphs[p].text.chars().count();
+    let before = c.document.sections[0].paragraphs.len() as i64;
+    c.create_table_native(0, p, off, 2, 2).unwrap();
+    let pd = c.document.sections[0].paragraphs.len() as i64 - before;
+    json!({ "kind": "op", "m": "createTable", "a": [0, p, off, 2, 2], "meta": { "pd": pd } })
+}
+
+fn spec(section: usize, src: (usize, usize), dst: (usize, usize)) -> Value {
+    json!({ "section": section, "src": { "lo": src.0, "n": src.1 }, "dst": { "lo": dst.0, "n": dst.1 } })
+}
+
+#[test]
+fn restore_range_removes_only_my_table_and_keeps_others_edits() {
+    let mut c = doc_with(5);
+    let snap = c.save_snapshot_native();
+    let rec = create_table(&mut c, 2);
+    let r = range_of(&[rec], &cat());
+    let (lo, before, after) = (r["lo"].as_u64().unwrap() as usize, r["before"].as_u64().unwrap() as usize, r["after"].as_u64().unwrap() as usize);
+    assert_eq!((lo, before), (2, 1));
+    assert!(after >= 2, "표 문단이 생긴다: {r}");
+    let mut check = spec(0, (lo, before), (lo, after));
+    check["counts"] = json!(true);
+    assert_eq!(c.undo_range_check(snap, &check).unwrap()["ok"], json!(true));
+    assert_eq!(controls(&c), 1);
+
+    // 남의 편집: 범위 앞 글자와 Enter, 범위 뒤 글자
+    let remote = vec![ins(0, 0, 0, "B"), split(0, 1), ins(0, lo + after + 1, 0, "C")];
+    c.insert_text_native(0, 0, 0, "B").unwrap();
+    c.split_paragraph_native(0, 0, 1, None).unwrap();
+    c.insert_text_native(0, lo + after + 1, 0, "C").unwrap();
+    let m = map_ranges(&remote, &cat(), &[json!({ "section": 0, "lo": lo, "hi": lo + after })])[0].clone();
+    assert_eq!(m["hit"], Value::Null);
+    let dlo = m["lo"].as_u64().unwrap() as usize;
+    assert_eq!(dlo, lo + 1);
+
+    let n0 = recipe_count();
+    let recipe = c.undo_restore_range(snap, &spec(0, (lo, before), (dlo, after))).unwrap();
+    assert_eq!(recipe_count(), n0 + 1);
+    assert_eq!(texts(&c), vec!["B", "p0", "p1", "p2", "Cp3", "p4"], "내 표만 빠지고 남의 편집은 그대로");
+    assert_eq!(controls(&c), 0);
+    // 내보내기 → 다시 읽기가 된다(그 결과가 state 로 나간다)
+    let bytes = c.export_state().unwrap();
+    let mut back = CollabCore::new(blank());
+    back.load_state(&bytes).unwrap();
+    assert_eq!(texts(&back), texts(&c));
+    recipe_discard(recipe);
+    assert_eq!(recipe_count(), n0, "재료를 풀면 저장소에서 빠진다");
+    assert!(c.undo_reapply_range(recipe, &json!({ "section": 0, "lo": 0, "n": 1 })).is_err(), "푼 재료는 쓸 수 없다");
+}
+
+#[test]
+fn reapply_range_rebuilds_on_a_new_document() {
+    // 보낸 쪽 보정 흉내: 복원 → (되감기) → 원격 Enter 를 먼저 적용 → 옮긴 자리에서 재료로 다시 복원
+    let mut c = doc_with(4);
+    let snap = c.save_snapshot_native();
+    let rec = create_table(&mut c, 1);
+    let r = range_of(&[rec], &cat());
+    let (lo, before, after) = (r["lo"].as_u64().unwrap() as usize, r["before"].as_u64().unwrap() as usize, r["after"].as_u64().unwrap() as usize);
+    let confirmed = c.snapshot_save();
+    let n0 = recipe_count();
+    let recipe = c.undo_restore_range(snap, &spec(0, (lo, before), (lo, after))).unwrap();
+    c.snapshot_restore(confirmed).unwrap();
+    c.split_paragraph_native(0, 0, 1, None).unwrap(); // 원격: 범위 앞 Enter
+    c.undo_reapply_range(recipe, &json!({ "section": 0, "lo": lo + 1, "n": after })).unwrap();
+    assert_eq!(texts(&c), vec!["p", "0", "p1", "p2", "p3"]);
+    assert_eq!(controls(&c), 0);
+    recipe_discard(recipe);
+    assert_eq!(recipe_count(), n0);
+}
+
+#[test]
+fn docinfo_precondition_allows_appends_and_blocks_changes() {
+    let mut c = doc_with(3);
+    let snap = c.save_snapshot_native();
+    let rec = create_table(&mut c, 1);
+    let r = range_of(&[rec], &cat());
+    let (lo, before, after) = (r["lo"].as_u64().unwrap() as usize, r["before"].as_u64().unwrap() as usize, r["after"].as_u64().unwrap() as usize);
+    let s = spec(0, (lo, before), (lo, after));
+    // 덧붙이기: 통과
+    let extra = c.document.doc_info.char_shapes[0].clone();
+    c.document.doc_info.char_shapes.push(extra);
+    assert_eq!(c.undo_range_check(snap, &s).unwrap()["ok"], json!(true));
+    // 원본 바이트만 다름: 통과(다시 읽은 문서에는 새 항목에도 원본 바이트가 생긴다)
+    c.document.doc_info.char_shapes[0].raw_data = Some(vec![1, 2, 3]);
+    assert_eq!(c.undo_range_check(snap, &s).unwrap()["ok"], json!(true));
+    // 기존 항목의 내용이 바뀜: 막힘(docinfo), 문서는 그대로
+    c.document.doc_info.char_shapes[0].base_size += 100;
+    let v = c.undo_range_check(snap, &s).unwrap();
+    assert_eq!(v["reason"], json!("docinfo"), "{v}");
+    let before_texts = texts(&c);
+    assert!(c.undo_restore_range(snap, &s).is_err());
+    assert_eq!(texts(&c), before_texts);
+    // 스냅샷이 없으면 snapshot
+    assert_eq!(c.undo_range_check(snap + 1000, &s).unwrap()["reason"], json!("snapshot"));
+    // 범위가 문단 수를 넘으면 bounds, 명령 직후 문단 수가 범위와 안 맞으면 counts
+    assert_eq!(c.undo_range_check(snap, &spec(0, (lo, before), (lo, 99))).unwrap()["reason"], json!("bounds"));
+    let mut bad_counts = spec(0, (lo, before), (lo, 1));
+    bad_counts["counts"] = json!(true);
+    c.document.doc_info.char_shapes[0].base_size -= 100;
+    assert_eq!(c.undo_range_check(snap, &bad_counts).unwrap()["reason"], json!("counts"));
+}
+
+/// 서버 흉내: 같은 바이트로 연 정본과 클라이언트. 클라이언트가 표 만들기(정본도 같은 op) → 범위 복원 → 범위 표시 state.
+fn server_case() -> (CollabCore, Vec<u8>, Value) {
+    let base = doc_with(5).export_state().unwrap();
+    let open = || {
+        let mut c = CollabCore::new(blank());
+        c.load_state(&base).unwrap();
+        c
+    };
+    let (mut canon, mut client) = (open(), open());
+    let snap = client.save_snapshot_native();
+    let rec = create_table(&mut client, 2);
+    let a = rec["a"].as_array().unwrap();
+    canon.create_table_native(0, 2, a[2].as_u64().unwrap() as usize, 2, 2).unwrap();
+    assert_eq!(canon.digest(), client.digest(), "같은 op 를 적용한 정본과 클라이언트");
+    let r = range_of(&[rec], &cat());
+    let (lo, before, after) = (r["lo"].as_u64().unwrap() as usize, r["before"].as_u64().unwrap() as usize, r["after"].as_u64().unwrap() as usize);
+    let recipe = client.undo_restore_range(snap, &spec(0, (lo, before), (lo, after))).unwrap();
+    recipe_discard(recipe);
+    let hint = json!({ "section": 0, "lo": lo, "before": after, "after": before });
+    (canon, client.export_state().unwrap(), hint)
+}
+
+#[test]
+fn server_accepts_a_true_range_hint() {
+    let (mut canon, c_bytes, hint) = server_case();
+    let snap = canon.snapshot_save();
+    canon.load_state(&c_bytes).unwrap();
+    let v = canon.check_range_hint(snap, &hint).unwrap();
+    assert_eq!(v, json!({ "ok": true }));
+}
+
+#[test]
+fn server_rejects_a_false_range_hint() {
+    let (mut canon, c_bytes, hint) = server_case();
+    let snap = canon.snapshot_save();
+    canon.load_state(&c_bytes).unwrap();
+    // (범위를 바뀌지 않은 이웃 문단까지 넓힌 표시는 맞는 표시다 — 범위 밖이 그대로이므로. 거짓은 바뀐 문단을 범위 밖에
+    // 두는 표시다.)
+    let lo = hint["lo"].as_u64().unwrap();
+    for bad in [
+        json!({ "section": 0, "lo": lo + 2, "before": hint["before"], "after": hint["after"] }),
+        json!({ "section": 0, "lo": lo + hint["before"].as_u64().unwrap(), "before": hint["before"], "after": hint["after"] }),
+        json!({ "section": 0, "lo": hint["lo"], "before": hint["before"], "after": hint["after"].as_u64().unwrap() + 1 }),
+        json!({ "section": 0, "lo": 0, "before": 1, "after": 1 }),
+        json!({ "section": 0, "lo": hint["lo"], "before": 0, "after": 1 }),
+    ] {
+        let v = canon.check_range_hint(snap, &bad).unwrap();
+        assert_eq!(v["reason"], json!("range"), "{bad} → {v}");
+    }
+}
+
+#[test]
+fn server_rejects_a_hint_that_hides_an_edit_outside_the_range() {
+    // 범위 표시는 맞지만 범위 밖 문단(문단 0)도 몰래 고친 state
+    let base = doc_with(5).export_state().unwrap();
+    let mut canon = CollabCore::new(blank());
+    canon.load_state(&base).unwrap();
+    let mut client = CollabCore::new(blank());
+    client.load_state(&base).unwrap();
+    let snap = client.save_snapshot_native();
+    let rec = create_table(&mut client, 2);
+    let a = rec["a"].as_array().unwrap();
+    canon.create_table_native(0, 2, a[2].as_u64().unwrap() as usize, 2, 2).unwrap();
+    let r = range_of(&[rec], &cat());
+    let (lo, before, after) = (r["lo"].as_u64().unwrap() as usize, r["before"].as_u64().unwrap() as usize, r["after"].as_u64().unwrap() as usize);
+    recipe_discard(client.undo_restore_range(snap, &spec(0, (lo, before), (lo, after))).unwrap());
+    client.insert_text_native(0, 0, 0, "몰래").unwrap();
+    let hint = json!({ "section": 0, "lo": lo, "before": after, "after": before });
+    let cs = canon.snapshot_save();
+    canon.load_state(&client.export_state().unwrap()).unwrap();
+    let v = canon.check_range_hint(cs, &hint).unwrap();
+    assert_eq!(v["reason"], json!("range"), "{v}");
+}
+
+#[test]
+fn docinfo_precondition_survives_state_reload_of_items_made_in_session() {
+    // 세션 안에서 만든 글자·문단 모양은 모델의 속성 비트(attr)가 저장 때 필드에서 다시 계산된다 — 다시 읽은 문서와도 같다고
+    // 봐야 state 한 번 뒤의 범위 되돌리기가 거짓으로 막히지 않는다(R5 범위 되돌리기 섞기에서 발견)
+    let mut c = doc_with(3);
+    c.apply_char_format_native(0, 1, 0, 2, r#"{"bold":true}"#).unwrap();
+    c.apply_para_format_native(0, 0, r#"{"alignment":"center"}"#).unwrap();
+    let snap = c.save_snapshot_native();
+    let bytes = c.export_state().unwrap();
+    c.load_state(&bytes).unwrap();
+    let v = c.undo_range_check(snap, &spec(0, (0, 1), (0, 1))).unwrap();
+    assert_eq!(v, json!({ "ok": true }), "다시 읽은 뒤에도 같은 서식 목록");
+    // 기존 항목을 정말 바꾸면 여전히 막는다
+    c.document.doc_info.char_shapes[0].base_size += 100;
+    assert_eq!(c.undo_range_check(snap, &spec(0, (0, 1), (0, 1))).unwrap()["reason"], json!("docinfo"));
+}
+
+#[test]
+fn docinfo_item_bytes_are_stable_across_repeated_state_reloads() {
+    // DocInfo 전제는 항목을 저장 레코드 바이트로 견준다 — 세션 안에서 만든 문단 모양(정렬 바꿈)·표의 항목이 결과를 여러 번
+    // 다시 읽어도 같은 바이트여야 한다(직렬화 → 다시 읽기 → 직렬화가 멱등)
+    use crate::serializer::doc_info::{serialize_border_fill, serialize_char_shape, serialize_para_shape};
+    let mut c = doc_with(4);
+    for (p, a) in [(0, "center"), (1, "right"), (2, "justify"), (3, "left"), (0, "left"), (1, "justify")] {
+        c.apply_para_format_native(0, p, &format!(r#"{{"alignment":"{a}"}}"#)).unwrap();
+    }
+    c.apply_char_format_native(0, 1, 0, 1, r#"{"italic":true,"underline":true}"#).unwrap();
+    c.create_table_native(0, 2, 0, 2, 2).unwrap();
+    let bytes_of = |c: &CollabCore| {
+        let d = &c.document.doc_info;
+        (
+            d.para_shapes.iter().map(serialize_para_shape).collect::<Vec<_>>(),
+            d.char_shapes.iter().map(serialize_char_shape).collect::<Vec<_>>(),
+            d.border_fills.iter().map(serialize_border_fill).collect::<Vec<_>>(),
+        )
+    };
+    let first = bytes_of(&c);
+    for _ in 0..3 {
+        let bytes = c.export_state().unwrap();
+        c.load_state(&bytes).unwrap();
+        assert_eq!(bytes_of(&c), first);
+    }
+}

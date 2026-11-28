@@ -22,7 +22,7 @@ const { startServer } = await import(path.join(root, 'server/server.mjs'));
 const { LocalDocStore } = await import(path.join(root, 'server/doc-store.mjs'));
 
 const STUDIO = process.env.STUDIO_URL ?? 'http://127.0.0.1:7700';
-const PORT = 8792;
+const PORT = Number(process.env.COLLAB_PORT ?? 8792);
 const COLLAB = `ws://127.0.0.1:${PORT}`;
 const CHROME = process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const DATA = mkdtempSync(path.join(tmpdir(), 'cc-rhwp-s34-'));

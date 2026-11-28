@@ -5,7 +5,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadWasm, blankBytes, Client, Server, paragraphs } from './support/harness.mjs';
-import { CollabUndo, UNDO_BLOCKED_NOTICE, REDO_BLOCKED_NOTICE } from '../src/undo.ts';
+import { bytesToBase64 } from '../src/engine/codec.ts';
+import { CollabUndo, UNDO_BLOCKED_NOTICE, REDO_BLOCKED_NOTICE, UNDO_DOCINFO_NOTICE, UNDO_DROPPED_NOTICE } from '../src/undo.ts';
 import { describeCollabUndo } from '../../upstream/rhwp/rhwp-studio/src/engine/collab-undo.ts';
 
 await loadWasm();
@@ -26,9 +27,24 @@ const splitParagraph = (para, off) => ({
 /** 표에 없는 종류(스냅샷 명령처럼 3.2-3) — 문서를 바꾸는 것은 글자 입력으로 흉내 */
 const opaque = (para, off, text) => ({ ...insertText(para, off, text), type: 'snapshot:fake' });
 
-/** 작은 히스토리: CommandHistory 의 훅 호출과 같은 순서(실행 → 기록 → recorded, 막힘 → 버림 → rejected) */
+/**
+ * 작은 히스토리: CommandHistory 의 훅 호출과 같은 순서(실행 → 기록 → recorded, 막힘 → 버림 → rejected). undo/redo 때 명령에
+ * 넘기는 문서는 studio 의 다리와 같다(U3: `restoreSnapshot` 만 훅에 먼저 묻는다).
+ */
 class MiniHistory {
   constructor(doc) { this.doc = doc; this.undoStack = []; this.redoStack = []; this.hook = null; }
+  bridge(cmd, dir) {
+    const hook = this.hook;
+    if (!hook?.restoreSnapshot) return this.doc;
+    const doc = this.doc;
+    return new Proxy(doc, {
+      get(target, key) {
+        if (key === 'restoreSnapshot') return (id) => { if (!hook.restoreSnapshot(cmd, dir, id)) target.restoreSnapshot(id); };
+        const v = Reflect.get(target, key, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+  }
   execute(cmd) {
     cmd.execute(this.doc);
     this.undoStack.push(cmd);
@@ -40,7 +56,7 @@ class MiniHistory {
     if (!cmd) return 'empty';
     const why = this.hook?.blocked(cmd, 'undo') ?? null;
     if (why !== null) { this.undoStack.pop(); this.hook.rejected(cmd, 'undo', why); return why; }
-    cmd.undo(this.doc);
+    cmd.undo(this.bridge(cmd, 'undo'));
     this.undoStack.pop();
     this.redoStack.push(cmd);
     this.hook?.undone(cmd);
@@ -51,7 +67,7 @@ class MiniHistory {
     if (!cmd) return 'empty';
     const why = this.hook?.blocked(cmd, 'redo') ?? null;
     if (why !== null) { this.redoStack.pop(); this.hook.rejected(cmd, 'redo', why); return why; }
-    cmd.execute(this.doc);
+    cmd.execute(this.bridge(cmd, 'redo'));
     this.redoStack.pop();
     this.undoStack.push(cmd);
     this.hook?.redone(cmd);
@@ -60,7 +76,11 @@ class MiniHistory {
   controller() {
     return {
       stacks: () => ({ undo: [...this.undoStack], redo: [...this.redoStack] }),
-      remove: (set) => { this.undoStack = this.undoStack.filter((c) => !set.has(c)); this.redoStack = this.redoStack.filter((c) => !set.has(c)); },
+      remove: (set) => {
+        for (const c of set) c.discard?.(this.doc);
+        this.undoStack = this.undoStack.filter((c) => !set.has(c));
+        this.redoStack = this.redoStack.filter((c) => !set.has(c));
+      },
       clear: () => { this.undoStack = []; this.redoStack = []; },
       describe: (cmd) => describeCollabUndo(cmd),
     };
@@ -85,9 +105,9 @@ function joinWithUndo(id, server, base) {
 }
 
 /** 빈 문서에 문단 n 개(문단 i 의 글자는 `p{i}`) — A 가 만들고 모두 받은 뒤 시작한다(스택은 비움). */
-function room(n = 4) {
+function room(n = 4, serverOptions = {}) {
   const base = blankBytes();
-  const server = new Server(base);
+  const server = new Server(base, serverOptions);
   const a = joinWithUndo('A', server, base);
   const b = joinWithUndo('B', server, base);
   for (let i = 0; i < n; i += 1) {
@@ -469,4 +489,287 @@ test('U2 구역 설정: 같은 구역에 남의 기록이 하나라도 오면 �
   assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
   converged(r);
   assert.equal(JSON.parse(r.a.doc.getSectionDef(0)).columnSpacing, 3000);
+});
+
+
+// ── 4단계 U3: snapshot 경로의 문단 범위 복원 (stage4 §6) ─────────────────────────
+
+/**
+ * studio SnapshotCommand 와 같은 모양·순서: 최초 실행은 before 스냅샷 → 작업, 되돌리기는 after 스냅샷(되돌리기 직전) →
+ * before 로 복원, 다시 하기는 after 로 복원 → after 해제. 복원은 히스토리 다리의 `restoreSnapshot` 을 거친다.
+ */
+const snapshotCmd = (op, operation) => ({
+  type: `snapshot:${op}`, beforeId: null, afterId: null, executed: false, cursorBefore: pos(0, 0), cursorAfter: pos(0, 0),
+  execute(doc) {
+    if (this.executed) {
+      doc.restoreSnapshot(this.afterId);
+      doc.discardSnapshot(this.afterId);
+      this.afterId = null;
+      return;
+    }
+    this.executed = true;
+    this.beforeId = doc.saveSnapshot();
+    operation(doc);
+  },
+  undo(doc) {
+    if (this.afterId === null) this.afterId = doc.saveSnapshot();
+    doc.restoreSnapshot(this.beforeId);
+  },
+  discard(doc) {
+    for (const k of ['beforeId', 'afterId']) if (this[k] !== null) { doc.discardSnapshot(this[k]); this[k] = null; }
+  },
+});
+/** 문단 끝에 2×2 표(studio 표 만들기와 같은 export) */
+const makeTable = (para) => snapshotCmd('createTable', (doc) => doc.createTable(0, para, doc.getParagraphLength(0, para), 2, 2));
+/** 표를 품은 본문 문단들 */
+const tableParas = (doc) => {
+  const out = [];
+  for (let p = 0; p < doc.getParagraphCount(0); p += 1) {
+    try { doc.getTableProperties(0, p, 0); out.push(p); } catch { /* 표 없음 */ }
+  }
+  return out;
+};
+/** 범위 표시를 확인하는 정본(S1 다시 쓰기 포함)이 있는 방 */
+const rangeRoom = (n = 5) => room(n, { canonical: true, rewriteState: true });
+const lastEntry = (r) => r.server.log.at(-1).entries.at(-1);
+/** 텍스트 문단만(표 문단의 빈 글자는 뺀다) */
+const words = (doc) => paragraphs(doc).filter((t) => t !== '');
+
+test('U3 ① 표 만들기 뒤 B 가 같은 구역 다른 문단에 입력 → A 되돌리기 허용, A 의 표만 사라지고 B 의 글자는 남는다', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  assert.equal(tableParas(r.b.doc).length, 1);
+  const n = r.a.doc.getParagraphCount(0);
+  r.b.history.execute(insertText(n - 1, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p0', 'p1', 'p2', 'p3', 'Bp4']);
+  assert.deepEqual(tableParas(r.a.doc), []);
+  const st = lastEntry(r);
+  assert.equal(st.kind, 'state');
+  assert.deepEqual(st.range, { section: 0, lo: 1, before: n - 4, after: 1 }, '복원 state 에 범위 표시(서버를 거쳐도 남음)');
+  assert.equal(r.server.rangeChecks, 1);
+  assert.equal(r.server.rangeRejects, 0);
+  assert.equal(r.a.engine.recipeCount(), 0, '확정되면 복원 재료를 푼다');
+  assert.deepEqual([r.a.dropped, r.b.dropped], [0, 0]);
+});
+
+test('U3 ② B 가 A 의 범위(표를 넣은 문단)를 고쳤으면 막힘·알림·문서 그대로', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  r.b.history.execute(insertText(1, 0, 'B'));
+  r.server.drain(r.all);
+  const before = paragraphs(r.a.doc);
+  assert.equal(r.a.history.undo(), UNDO_BLOCKED_NOTICE);
+  assert.deepEqual(paragraphs(r.a.doc), before);
+  assert.equal(r.a.history.undoStack.length, 0);
+  converged(r);
+});
+
+test('U3 ③ 범위 앞에서 B 가 Enter → 지도로 옮겨 허용', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(2));
+  r.server.drain(r.all);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'p4']);
+});
+
+test('U3 ④ 같은 구역 다른 곳에 B 가 표 만들기(구조) → 막지 않고(3.2-2 를 이 경우만 풂) A 의 표만 사라짐', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  const n = r.a.doc.getParagraphCount(0);
+  r.b.doc.createTable(0, n - 1, 2, 1, 1);
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(words(r.a.doc), ['p0', 'p1', 'p2', 'p3', 'p4']);
+  const t = tableParas(r.a.doc);
+  assert.equal(t.length, 1, 'B 의 표는 남는다');
+  assert.ok(t[0] >= 4, 'B 의 표는 p4 자리');
+});
+
+test('U3 ⑤ redo: 되돌린 뒤 다시 하기로 표가 돌아오고(남의 편집 유지), 남이 되살린 범위를 고치면 다시 하기 막힘', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  const withTable = r.a.doc.getParagraphCount(0);
+  r.b.history.execute(insertText(withTable - 1, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  r.server.drain(r.all);
+  r.b.history.execute(splitParagraph(0, 1)); // 범위 앞 Enter
+  r.server.drain(r.all);
+  assert.equal(r.a.history.redo(), 'ok');
+  converged(r);
+  assert.equal(tableParas(r.a.doc).length, 1, '표가 돌아옴');
+  assert.deepEqual(words(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'Bp4']);
+  // 다시 되돌리기(남의 기록 없음 — 언제나 범위 복원) → 표가 빠짐
+  assert.equal(r.a.history.undo(), 'ok');
+  r.server.drain(r.all);
+  assert.equal(tableParas(r.a.doc).length, 0);
+  // 되살린 범위(p1)를 남이 고치면 다시 하기 막힘
+  r.b.history.execute(insertText(2, 0, 'Z'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.redo(), REDO_BLOCKED_NOTICE);
+  converged(r);
+  assert.equal(r.a.engine.recipeCount(), 0);
+});
+
+test('U3 ⑥ 범위 문단이 참조할 수 있는 DocInfo 의 기존 항목을 남이 바꾸면 따로 안내하고 막힘', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  r.b.doc.updateStyle(0, JSON.stringify({ name: '바뀐 바탕글' }));
+  r.server.drain(r.all);
+  const before = paragraphs(r.a.doc);
+  assert.equal(r.a.history.undo(), UNDO_DOCINFO_NOTICE);
+  assert.deepEqual(paragraphs(r.a.doc), before);
+  converged(r);
+});
+
+test('U3 ⑦ 표 지우기(개체 삭제)를 되돌리면 표가 돌아오고 B 의 편집은 남는다', () => {
+  const r = rangeRoom();
+  r.a.doc.createTable(0, 2, 2, 1, 1);
+  r.server.drain(r.all);
+  r.a.history.hook.settled();
+  r.a.history.controller().clear();
+  const [tp] = tableParas(r.a.doc);
+  const words0 = words(r.a.doc);
+  r.a.history.execute(snapshotCmd('deleteTable', (doc) => doc.deleteTableControl(0, tp, 0)));
+  r.server.drain(r.all);
+  assert.deepEqual(tableParas(r.b.doc), []);
+  r.b.history.execute(insertText(0, 0, 'B'));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  converged(r);
+  assert.deepEqual(tableParas(r.a.doc), [tp], '표가 제자리로');
+  assert.deepEqual(words(r.a.doc), ['Bp0', ...words0.slice(1)]);
+});
+
+test('U3 ⑧ B 가 계속 치는 중: B 의 묶음이 먼저 서버에 가도 A 의 복원 state 를 새 문서 위에서 다시 만들어 둘 다 산다', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  const n = r.a.doc.getParagraphCount(0);
+  r.b.history.execute(insertText(n - 1, 0, 'B1'));
+  r.server.drain(r.all);
+  // A 되돌리기(미확정, 아직 안 보냄) — 그사이 B 가 범위 앞에 Enter 를 치고 먼저 확정
+  assert.equal(r.a.history.undo(), 'ok');
+  assert.equal(r.a.engine.recipeCount(), 1);
+  r.b.history.execute(splitParagraph(0, 1));
+  r.b.flush();
+  r.server.deliverOne(r.b);
+  while (r.server.deliverOne(r.a)) { /* A: 미확정 복원 state 가 있는 채로 B 의 Enter 를 받음 → 다시 만듦 */ }
+  assert.equal(r.a.dropped, 0, 'A 의 되돌리기가 취소되지 않음');
+  r.server.drain(r.all);
+  converged(r);
+  assert.deepEqual(paragraphs(r.a.doc), ['p', '0', 'p1', 'p2', 'p3', 'B1p4']);
+  assert.equal(r.server.rangeRejects, 0, '다시 만든 state 의 범위 표시도 맞다');
+  assert.equal(r.a.engine.recipeCount(), 0);
+});
+
+test('U3 ⑨ B 가 계속 치는 중: A 의 복원 state 가 먼저 서버에 가면 B 의 왕복 중 입력이 취소되지 않는다(범위 표시가 없으면 취소된다)', () => {
+  for (const hinted of [true, false]) {
+    // 정본이 없는 서버는 범위 표시를 확인할 수 없어 뗀다 → 보통 state(예전 동작) — 대조군
+    const r = hinted ? rangeRoom() : room(5);
+    r.a.history.execute(makeTable(1));
+    r.server.drain(r.all);
+    const n = r.a.doc.getParagraphCount(0);
+    assert.equal(r.a.history.undo(), 'ok');
+    r.a.flush();
+    r.b.history.execute(insertText(n - 1, 0, 'B'));
+    r.b.flush(); // 보냈지만 A 의 state 뒤라 reject 된다
+    while (r.server.deliverOne(r.b)) { /* B: 미확정이 있는 채로 A 의 복원 state 를 받음 */ }
+    r.server.drain(r.all);
+    converged(r);
+    if (hinted) {
+      assert.equal(r.b.dropped, 0, 'B 의 입력이 살아남음');
+      assert.deepEqual(paragraphs(r.a.doc), ['p0', 'p1', 'p2', 'p3', 'Bp4']);
+    } else {
+      assert.ok(r.b.dropped > 0, '범위 표시가 없으면 state 와 충돌해 B 의 입력이 취소된다');
+    }
+  }
+});
+
+test('U3 ⑩ 복원 재료는 확정·버림·리셋 때 풀린다', () => {
+  // 버림: A 의 복원 state 가 미확정인 동안 B 가 A 의 범위를 고치고 먼저 확정 → 충돌로 버려짐 → 재료 해제, 명령도 스택에서
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  r.b.history.execute(insertText(r.b.doc.getParagraphCount(0) - 1, 0, 'x')); // 범위 밖(마지막 문단) — 남의 기록이 있어도 범위 복원
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  assert.equal(r.a.engine.recipeCount(), 1);
+  r.b.history.execute(insertText(1, 0, 'B')); // A 가 되살린 범위(p1)
+  r.b.flush();
+  r.server.deliverOne(r.b);
+  while (r.server.deliverOne(r.a)) { /* 받기 */ }
+  assert.ok(r.a.dropped > 0);
+  assert.equal(r.a.engine.recipeCount(), 0, '버리면 재료를 푼다');
+  assert.ok(r.a.notices.includes(UNDO_DROPPED_NOTICE));
+  assert.equal(r.a.history.redoStack.length, 0, '되돌리기가 취소된 명령은 스택에서 빠짐');
+  converged(r);
+  // 리셋(제자리 재동기화·문서 교체): 미확정 복원 state 의 재료를 푼다
+  r.a.history.execute(makeTable(0));
+  r.server.drain(r.all);
+  assert.equal(r.a.history.undo(), 'ok');
+  assert.equal(r.a.engine.recipeCount(), 1);
+  r.a.engine.reset();
+  assert.equal(r.a.engine.recipeCount(), 0, '리셋하면 재료를 푼다');
+});
+
+test('U3 ⑪ 거짓 범위 표시를 단 원시 클라이언트의 state 는 정본이 거절한다(seq 그대로)', () => {
+  const r = rangeRoom();
+  const x = { id: 'X', deliver(msg) { this.got.push(msg); }, got: [] };
+  r.server.join(x);
+  // 문단 0 을 고친 문서를 "문단 3 만 바꿨다"고 주장
+  const d = r.b.doc;
+  r.b.engine.setRecording(false);
+  const snap = d.collabSnapshotSave();
+  d.insertText(0, 0, 0, '몰래');
+  const data = bytesToBase64(d.collabExportState());
+  d.collabSnapshotRestore(snap);
+  d.collabSnapshotDiscard(snap);
+  r.b.engine.setRecording(true);
+  const seq = r.server.seq;
+  r.server.submit(x, seq, [{ kind: 'state', data, range: { section: 0, lo: 3, before: 1, after: 1 } }], 'X:1');
+  while (r.server.deliverOne(x)) { /* 받기 */ }
+  assert.equal(r.server.seq, seq, 'seq 그대로');
+  assert.equal(r.server.rangeRejects, 1);
+  assert.equal(x.got.at(-1).type, 'invalid');
+  converged(r);
+});
+
+test('U3 ⑫ 되돌리기·다시 하기를 연달아(한 묶음이 왕복 중): 복원 state 들을 합치지 않아 범위 표시가 남고 B 의 입력이 산다', () => {
+  const r = rangeRoom();
+  r.a.history.execute(makeTable(1));
+  r.server.drain(r.all);
+  // A 가 먼저 글자 하나를 보내 왕복 중으로 만든 뒤 되돌리기·다시 하기·되돌리기 — 셋 다 보내지 않은 채 쌓인다
+  const n = r.a.doc.getParagraphCount(0);
+  r.a.history.execute(insertText(0, 0, 'a'));
+  r.a.flush();
+  assert.equal(r.a.history.undo(), 'ok'); // 'a' 입력 되돌리기(글자)
+  assert.equal(r.a.history.undo(), 'ok'); // 표 되돌리기(범위)
+  assert.equal(r.a.history.redo(), 'ok'); // 표 다시 하기(범위)
+  assert.equal(r.a.history.undo(), 'ok'); // 다시 되돌리기(범위)
+  const states = r.a.engine.unconfirmed.filter((e) => e.kind === 'state');
+  assert.equal(states.length, 3, '복원 state 셋이 따로 남는다');
+  assert.ok(states.every((e) => e.range && typeof e.recipe === 'number'), '모두 범위 표시와 재료');
+  r.b.history.execute(insertText(n - 1, 0, 'B'));
+  r.b.flush();
+  r.server.drain(r.all);
+  converged(r);
+  assert.equal(r.b.dropped, 0);
+  assert.equal(r.a.dropped, 0);
+  assert.deepEqual(paragraphs(r.a.doc), ['p0', 'p1', 'p2', 'p3', 'Bp4']);
+  assert.equal(r.a.engine.recipeCount(), 0);
+  const sent = r.server.log.flatMap((m) => m.entries).filter((e) => e.kind === 'state');
+  assert.ok(sent.length >= 3 && sent.every((e) => e.range && !('recipe' in e)), '서버에 간 복원 state 에는 범위 표시만(재료 번호 없음)');
 });

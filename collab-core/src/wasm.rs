@@ -157,6 +157,14 @@ impl HwpDocument {
         self.roundtrip_check().map(|v| v.to_string()).map_err(js_err)
     }
 
+    /// 7단계 B(서버 점검 워커, 방을 열 때 한 번 — 왕복 점검 다음): 모델에서만 다시 쓴 결과의 조판(쪽 수·문단·개체 위치)이
+    /// 지금 저장본과 같은지 본다. 반환 JSON 문자열 — 통과면 `null`, 경고면 왕복 점검 `lost` 에 더할 항목
+    /// `{kind:"layout", count, detail, pages, maxDisp, worstPage}`. 이 문서는 바꾸지 않는다.
+    #[wasm_bindgen(js_name = collabLayoutCheck)]
+    pub fn collab_layout_check(&self) -> Result<String, JsValue> {
+        self.layout_check().map(|v| v.map_or_else(|| "null".to_string(), |v| v.to_string())).map_err(js_err)
+    }
+
     /// 5단계 D4(클라이언트 문): 글자 연산 호출(호출 전)이 활성 누름틀 안에 완전히 드는가.
     #[wasm_bindgen(js_name = collabFieldContains)]
     pub fn collab_field_contains(&self, method: &str, args_json: &str, active_field_json: &str) -> Result<bool, JsValue> {

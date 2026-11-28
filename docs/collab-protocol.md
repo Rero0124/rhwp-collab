@@ -360,6 +360,12 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
   - `block`: 상한까지 기다린다. 통과면 응답에 결과를 싣고, 아니면 방을 만들지 않는다 — 경고는 `422 {error: "roundtrip",
     reason: "roundtrip", roundtrip}`, 점검 못 함은 `reason: "roundtrip-timeout"`·`"roundtrip-error"`(모르는 위험은 막는다).
   - `off`: 점검하지 않는다. 점검 보조가 없는 서버도 점검하지 않고 `roundtrip` 을 싣지 않는다.
+  - **배치 점검(7단계 B, `COLLAB_ROUNDTRIP_LAYOUT=on|off`, 기본 `off`):** 왕복 점검 다음에 같은 워커·같은 시간 상한(남은 시간)
+    안에서, 모델에서만 다시 쓴 결과의 **조판**(쪽 수, 문단·개체 위치)이 원본과 같은지 본다(`collabLayoutCheck` — 업스트림
+    render-diff 의 핵심. 판정도 같다: 쪽 수 다름, TextRun ±1 이 아닌 구조 어긋남, 1px 를 넘는 변위). 경고는 `lost` 에
+    `{kind: "layout", count: 문제 쪽 수, detail, pages: [원본, 다시 쓴 것], maxDisp(px), worstPage(1부터)}` 로 더한다.
+    배치 점검만 시간 상한을 넘거나 실패하면 왕복 점검 결과는 그대로 두고 `layoutUnknown: "timeout" | "error"` 를 단다.
+    조판 환경은 정본과 같다(엔진 기본 = 글꼴 정책 `bundled-only`).
 - 같은 출처가 아닌 브라우저 요청은 Origin 허용 목록을 따른다. CORS 는 열지 않는다(바깥 시스템은 서버끼리 부른다).
 
 ### `GET /rooms/{room}/document` — 최신 문서 파일

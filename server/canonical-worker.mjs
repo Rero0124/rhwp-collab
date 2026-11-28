@@ -289,9 +289,18 @@ parentPort.on('message', ({ id, op, ...p }) => {
         const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
         return reply({ ok: true, supported: true, result, ms: Math.round(performance.now() - t0) });
       }
+      case 'roundtripLayout': {
+        // 7단계 B: 배치 점검(왕복 점검 다음, 같은 두 바이트) — 모델에서만 다시 쓴 결과의 조판이 같은가. 통과면 entry 는 null
+        if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
+        if (typeof doc.collabLayoutCheck !== 'function') return reply({ ok: true, supported: false });
+        const t0 = performance.now();
+        const raw = doc.collabLayoutCheck();
+        const entry = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return reply({ ok: true, supported: true, entry, ms: Math.round(performance.now() - t0) });
+      }
       case 'capabilities':
         // 서버가 시작 로그·경고에 쓴다: 다시 쓰기 보조가 있는지(6단계 S1)
-        return reply({ ok: true, rewriteState: typeof wasm.HwpDocument.prototype[REWRITE_STATE] === 'function', roundtripCheck: typeof wasm.HwpDocument.prototype.collabRoundtripCheck === 'function' });
+        return reply({ ok: true, rewriteState: typeof wasm.HwpDocument.prototype[REWRITE_STATE] === 'function', roundtripCheck: typeof wasm.HwpDocument.prototype.collabRoundtripCheck === 'function', layoutCheck: typeof wasm.HwpDocument.prototype.collabLayoutCheck === 'function' });
       default:
         return reply({ ok: false, reason: `모르는 op: ${op}` });
     }

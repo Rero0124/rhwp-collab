@@ -95,9 +95,16 @@ export const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
  * 6단계 S2: 왕복 점검 결과를 방 메타·응답·welcome 에 실을 모양으로 — {ok, lost: [{kind, count, detail}], irDiff}.
  * 보조의 결과를 믿되 모양만 다듬는다(detail 은 짧게, 목록은 32개까지).
  */
+/** 7단계 B: 배치 점검 항목의 숫자 필드(쪽 수 [원본, 다시 쓴 것], 최대 변위 px, 가장 많이 움직인 쪽 — 1부터) */
+function layoutFields(l) {
+  const n = (v) => (Number.isFinite(v) ? v : undefined);
+  const pages = Array.isArray(l?.pages) && l.pages.length === 2 && l.pages.every(Number.isFinite) ? { pages: [l.pages[0], l.pages[1]] } : {};
+  return { ...pages, ...(n(l?.maxDisp) !== undefined ? { maxDisp: l.maxDisp } : {}), ...(n(l?.worstPage) !== undefined ? { worstPage: l.worstPage } : {}) };
+}
 function summarizeRoundtrip(r) {
   const lost = Array.isArray(r?.lost) ? r.lost.slice(0, 32).map((l) => ({
     kind: String(l?.kind ?? '?'), count: Number.isFinite(l?.count) ? l.count : 1, ...(l?.detail ? { detail: String(l.detail).slice(0, 200) } : {}),
+    ...(l?.kind === 'layout' ? layoutFields(l) : {}),
   })) : [];
   const irDiff = Number.isFinite(r?.irDiff) ? r.irDiff : 0;
   return { ok: r?.ok === true && lost.length === 0, lost, irDiff };
@@ -182,6 +189,8 @@ export function startServer({
   roundtripMode = process.env.COLLAB_ROUNDTRIP || 'warn',
   /** 6단계 S2: 왕복 점검 시간 상한(ms). 넘으면 점검 워커를 버리고 {ok: null, reason: 'timeout'} */
   roundtripTimeoutMs = Number(process.env.COLLAB_ROUNDTRIP_TIMEOUT_MS ?? 15_000),
+  /** 7단계 B: 왕복 점검 다음에 배치 점검(모델에서 다시 쓴 뒤 쪽 수·문단·개체 위치가 같은가)도 할지 — on | off(기본). 같은 시간 상한 안에서 */
+  roundtripLayout = process.env.COLLAB_ROUNDTRIP_LAYOUT || 'off',
   // 6단계 S3 부품 전용 모드: 바깥 시스템의 iframe 안에서만 쓰인다(허용 출처 목록이 필요하다)
   embedOnly = process.env.COLLAB_EMBED_ONLY === '1',
   embedOrigins = process.env.COLLAB_EMBED_ORIGINS ? process.env.COLLAB_EMBED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean) : [],
@@ -200,6 +209,7 @@ export function startServer({
   }
   if (!['warn', 'block', 'off'].includes(roundtripMode)) throw new Error(`COLLAB_ROUNDTRIP 은 warn | block | off 중 하나다 (지금 ${roundtripMode})`);
   if (!(Number.isFinite(roundtripTimeoutMs) && roundtripTimeoutMs > 0)) throw new Error(`COLLAB_ROUNDTRIP_TIMEOUT_MS 는 양수(ms)다 (지금 ${roundtripTimeoutMs})`);
+  if (!['on', 'off'].includes(roundtripLayout)) throw new Error(`COLLAB_ROUNDTRIP_LAYOUT 은 on | off 중 하나다 (지금 ${roundtripLayout})`);
   if (allowEncrypted) log('경고: COLLAB_ALLOW_ENCRYPTED=1 — 암호 문서로 방을 열면 암호가 풀린 상태로 서버 디스크·모든 참여자·내려받은 파일에 남는다');
   /** @type {Map<string, ReturnType<typeof createRoom>>} */
   const rooms = new Map();
@@ -818,8 +828,20 @@ export function startServer({
         return roundtripUnknown('error');
       }
       if (!rt.supported) return null;
-      const result = summarizeRoundtrip(rt.result);
-      log(`[${name}] 왕복 점검 ${result.ok ? '통과' : `경고 ${result.lost.map((l) => `${l.kind}×${l.count}`).join(', ') || `IR 차이 ${result.irDiff}`}`} (점검 ${rt.ms}ms, 열기 포함 ${Date.now() - t0}ms)`);
+      let result = summarizeRoundtrip(rt.result);
+      // 7단계 B: 배치 점검 — 같은 워커·같은 시간 상한(남은 시간). 넘거나 실패하면 왕복 점검 결과는 그대로 두고 배치만 모른다
+      let layoutNote = '';
+      if (roundtripLayout === 'on') {
+        const lay = await Promise.race([checker.roundtripLayout(), deadline]);
+        if (lay.timeout || !lay.ok) {
+          result = { ...result, layoutUnknown: lay.timeout ? 'timeout' : 'error' };
+          layoutNote = lay.timeout ? ', 배치 점검 시간 초과' : `, 배치 점검 실패: ${lay.reason}`;
+        } else if (lay.supported) {
+          if (lay.entry) result = summarizeRoundtrip({ ok: false, lost: [...result.lost, lay.entry], irDiff: result.irDiff });
+          layoutNote = `, 배치 ${lay.ms}ms`;
+        }
+      }
+      log(`[${name}] 왕복 점검 ${result.ok ? '통과' : `경고 ${result.lost.map((l) => `${l.kind}×${l.count}`).join(', ') || `IR 차이 ${result.irDiff}`}`} (점검 ${rt.ms}ms${layoutNote}, 열기 포함 ${Date.now() - t0}ms)`);
       return result;
     } finally {
       clearTimeout(timer);

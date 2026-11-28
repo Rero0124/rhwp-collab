@@ -74,6 +74,8 @@ export class Canonical {
   decrypt(raw, password) { return this.call('decrypt', { data: Buffer.from(raw).toString('base64'), password }); }
   digest() { return this.call('digest'); }
   export() { return this.call('export'); }
+  /** 7단계 C: 원본 형식 계열로 암호를 걸어 내보낸다 — {data: 파일 바이트 base64, format} */
+  exportEncrypted(password) { return this.call('exportEncrypted', { password }); }
 
   /** 워커를 버리고 기준점 + 기록으로 새로 만든다(기록은 한 번에 — 쪽 배치는 끝에 한 번). 반환: 마지막 digest 또는 실패 사유. */
   async rebuild(base, log) {

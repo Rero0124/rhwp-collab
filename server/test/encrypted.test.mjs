@@ -107,11 +107,15 @@ test('허용(COLLAB_ALLOW_ENCRYPTED): 시작 경고, 암호 없으면·틀리면
       assert.equal(msg.encryptedSource, true, `${name}: welcome 에 encryptedSource`);
       assert.ok(opensPlain(msg.base), `${name}: base 는 암호 없이 열린다`);
       ws.close();
-      const dl = await fetch(`http://127.0.0.1:${server.port}/rooms/${room}/document`, { headers: { authorization: `Bearer ${invite.view}` } });
+      // 7단계 C: 원래 암호 문서였던 방은 암호를 걸어서만 내려받는다(COLLAB_ENCRYPTED_DOWNLOAD=require 기본 — 시험은
+      // encrypted-download.test.mjs). 걸면 그 암호로 열린다.
+      const url = `http://127.0.0.1:${server.port}/rooms/${room}/document`;
+      const refused = await fetch(url, { headers: { authorization: `Bearer ${invite.view}` } });
+      assert.equal(refused.status, 403, `${name}: 암호 없이 내려받기는 거절`);
+      const dl = await fetch(url, { headers: { authorization: `Bearer ${invite.view}`, 'x-collab-document-password': 'd5-download' } });
       assert.equal(dl.status, 200);
       const file = Buffer.from(await dl.arrayBuffer());
-      const reopened = new wasm.HwpDocument(file); // 내려받은 파일도 암호 없음(다음 후보: 다시 암호 걸기)
-      reopened.free();
+      wasm.HwpDocument.openWithPassword(file, 'd5-download').free(); // 내려받을 때 건 암호로 열린다
       assert.equal((await store.load(room)).meta.encryptedSource, true, `${name}: 방 메타`);
     }
     // 암호 없는 방에는 encryptedSource 가 없다

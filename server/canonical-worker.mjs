@@ -34,6 +34,8 @@ const { CATALOG } = await import(new URL('../collab-client/src/engine/catalog.ts
 
 let doc = null;
 let engine = null;
+/** 정본의 원본 형식 계열(열 때 본 바이트로) — 7단계 C 암호를 걸어 내보낼 때 같은 계열로 쓴다. HWP3 는 HWP5 로 나간다. */
+let docFormat = 'hwp';
 
 const reasonOf = (e) => (typeof e === 'string' ? e : e?.message ?? String(e));
 const TRAP = /memory access out of bounds|unreachable|recursive use of an object|null pointer passed to rust/i;
@@ -156,6 +158,7 @@ function opArgsViolation(entries) {
 function open(base) {
   const raw = gunzipSync(Buffer.from(base, 'base64'));
   const next = new wasm.HwpDocument(raw);
+  docFormat = raw[0] === 0x50 && raw[1] === 0x4b ? 'hwpx' : 'hwp';
   // 결과 다시 쓰기 강화(결정 2): 정본은 열자마자(기록 재생 전) 본 날 바이트를 모은다 — 되돌리기가 되살린 옛 바이트를 받으려고
   next.collabTrackRawSeen?.();
   engine?.detach();
@@ -279,6 +282,13 @@ parentPort.on('message', ({ id, op, ...p }) => {
       }
       case 'export':
         return reply({ ok: true, data: Buffer.from(doc.collabExportState()).toString('base64') });
+      case 'exportEncrypted': {
+        // 7단계 C: 정본을 원본 형식 계열로 암호를 걸어 내보낸다(파일 바이트 그대로, gzip 아님). 암호는 기록하지 않는다.
+        if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
+        const password = String(p.password ?? '');
+        const bytes = docFormat === 'hwpx' ? doc.exportHwpxWithPassword(password) : doc.exportHwpWithPassword(password);
+        return reply({ ok: true, data: Buffer.from(bytes).toString('base64'), format: docFormat });
+      }
       case 'digest':
         return reply({ ok: true, digest: doc.collabDigest() });
       case 'roundtrip': {

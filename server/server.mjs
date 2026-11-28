@@ -219,8 +219,11 @@ export function startServer({
   encryptedDownload = process.env.COLLAB_ENCRYPTED_DOWNLOAD || 'require',
   /** 6단계 S2: 왕복 점검 시간 상한(ms). 넘으면 점검 워커를 버리고 {ok: null, reason: 'timeout'} */
   roundtripTimeoutMs = Number(process.env.COLLAB_ROUNDTRIP_TIMEOUT_MS ?? 15_000),
-  /** 7단계 B: 왕복 점검 다음에 배치 점검(모델에서 다시 쓴 뒤 쪽 수·문단·개체 위치가 같은가)도 할지 — on | off(기본). 같은 시간 상한 안에서 */
-  roundtripLayout = process.env.COLLAB_ROUNDTRIP_LAYOUT || 'off',
+  /**
+   * 7단계 B: 왕복 점검 다음에 배치 점검(모델에서 다시 쓴 뒤 쪽 수·문단·개체 위치가 같은가)도 할지 — on(기본) | off. 같은 시간
+   * 상한 안에서. 기본 on 의 근거(업스트림 샘플 441개): 더하는 시간 p90 0.65초, 새 시간 초과 0, 경고 2.3% 모두 실제 차이
+   */
+  roundtripLayout = process.env.COLLAB_ROUNDTRIP_LAYOUT || 'on',
   // 6단계 S3 부품 전용 모드: 바깥 시스템의 iframe 안에서만 쓰인다(허용 출처 목록이 필요하다)
   embedOnly = process.env.COLLAB_EMBED_ONLY === '1',
   embedOrigins = process.env.COLLAB_EMBED_ORIGINS ? process.env.COLLAB_EMBED_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean) : [],
@@ -944,11 +947,12 @@ export function startServer({
     // S2 왕복 점검: rhwp 가 모든 부분을 모델에서 다시 쓴 결과를 원본과 견준다. 손대지 않은 부분은 원본 바이트를 그대로 쓰므로
     // "저장 후 비교"로는 드러나지 않는 것(그 부분을 편집하면 사라질 것)을 방을 만들 때 알린다. 보조가 없으면 건너뛴다.
     // 점검은 따로 둔 워커에서(정본 워커를 붙잡지 않는다), 상한 COLLAB_ROUNDTRIP_TIMEOUT_MS. warn 은 방을 먼저 만들고 뒤에서,
-    // block 은 상한까지 기다리고 통과가 아니면(경고·시간 초과·오류) 만들지 않는다.
+    // block 은 상한까지 기다리고 내용 손실 경고·시간 초과·오류면 만들지 않는다. 7단계 B: 배치 경고(layout)만 있거나 배치 점검만
+    // 못 했으면(layoutUnknown) 막지 않는다 — 내용은 그대로이고 모양만 달라진다. 경고는 응답·welcome 에 그대로 실린다.
     const roundtripLater = roundtripMode === 'warn' && await roundtripAvailable(room);
     if (roundtripMode === 'block' && await roundtripAvailable(room)) {
       room.roundtrip = await checkRoundtrip(name, packed);
-      if (room.roundtrip && room.roundtrip.ok !== true) {
+      if (room.roundtrip && (room.roundtrip.ok === null || room.roundtrip.lost.some((l) => l.kind !== 'layout'))) {
         await room.canonical.terminate();
         const reason = room.roundtrip.ok === null ? `roundtrip-${room.roundtrip.reason}` : 'roundtrip';
         const why = room.roundtrip.ok === null ? `왕복 점검을 끝내지 못해(${room.roundtrip.reason})` : 'rhwp 가 이 문서의 일부를 다루지 못해';

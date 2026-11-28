@@ -368,13 +368,19 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
     번 보낸다.
   - `block`: 상한까지 기다린다. 통과면 응답에 결과를 싣고, 아니면 방을 만들지 않는다 — 경고는 `422 {error: "roundtrip",
     reason: "roundtrip", roundtrip}`, 점검 못 함은 `reason: "roundtrip-timeout"`·`"roundtrip-error"`(모르는 위험은 막는다).
+    **block 은 내용 손실(`ir`·`record`·`bindata`·`ole-clsid`·`cfb`·`package`)과 왕복 점검의 시간 초과·오류만 막는다** — 배치 경고
+    (`layout`)만 있거나 배치 점검만 끝내지 못했으면(`layoutUnknown`) 방을 만들고 경고를 응답·`welcome` 에 싣는다(내용은 그대로이고
+    모양만 달라진다).
   - `off`: 점검하지 않는다. 점검 보조가 없는 서버도 점검하지 않고 `roundtrip` 을 싣지 않는다.
-  - **배치 점검(7단계 B, `COLLAB_ROUNDTRIP_LAYOUT=on|off`, 기본 `off`):** 왕복 점검 다음에 같은 워커·같은 시간 상한(남은 시간)
+  - **배치 점검(7단계 B, `COLLAB_ROUNDTRIP_LAYOUT=on|off`, 기본 `on` — 업스트림 샘플 441개에서 더하는 시간 p90 0.65초, 새 시간
+    초과 0, 경고 2.3% 모두 실제 차이):** 왕복 점검 다음에 같은 워커·같은 시간 상한(남은 시간)
     안에서, 모델에서만 다시 쓴 결과의 **조판**(쪽 수, 문단·개체 위치)이 원본과 같은지 본다(`collabLayoutCheck` — 업스트림
     render-diff 의 핵심. 판정도 같다: 쪽 수 다름, TextRun ±1 이 아닌 구조 어긋남, 1px 를 넘는 변위). 경고는 `lost` 에
     `{kind: "layout", count: 문제 쪽 수, detail, pages: [원본, 다시 쓴 것], maxDisp(px), worstPage(1부터)}` 로 더한다.
     배치 점검만 시간 상한을 넘거나 실패하면 왕복 점검 결과는 그대로 두고 `layoutUnknown: "timeout" | "error"` 를 단다.
-    조판 환경은 정본과 같다(엔진 기본 = 글꼴 정책 `bundled-only`).
+    조판 환경은 정본과 같다(엔진 기본 = 글꼴 정책 `bundled-only`). 안내 문구는 내용 손실과 나눈다: 배치 경고는 "rhwp 가 이
+    문서를 다시 쓰면 일부 쪽의 배치(줄 높이·위치)가 달라질 수 있습니다(5쪽 등)"(쪽 수가 달라지면 "(쪽 수 12 → 13)"), 둘 다
+    있으면 두 문장을 보인다(`collab-client/src/session/roundtrip.ts`, 업로드 페이지가 같은 규칙).
 - 같은 출처가 아닌 브라우저 요청은 Origin 허용 목록을 따른다. CORS 는 열지 않는다(바깥 시스템은 서버끼리 부른다).
 
 ### `GET /rooms/{room}/document` — 최신 문서 파일

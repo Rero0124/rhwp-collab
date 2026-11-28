@@ -20,6 +20,8 @@ export const isRoundtripPending = (rt: unknown): rt is RoundtripPending => (rt a
 
 export const ROUNDTRIP_OK_TEXT = 'rhwp 가 이 문서를 그대로 다룰 수 있습니다';
 export const ROUNDTRIP_EDIT_WARNING = '이 부분이 있는 쪽을 편집하면 사라질 수 있습니다';
+/** 7단계 B 배치 점검 경고 — 내용을 잃는 것이 아니라 모양(줄 높이·위치)이 달라진다 */
+export const ROUNDTRIP_LAYOUT_WARNING = 'rhwp 가 이 문서를 다시 쓰면 일부 쪽의 배치(줄 높이·위치)가 달라질 수 있습니다';
 export const ROUNDTRIP_PENDING_TEXT = 'rhwp 가 이 문서를 다룰 수 있는지 점검하고 있습니다. 결과는 방에 들어가면 보입니다';
 const UNKNOWN_REASON: Record<string, string> = { timeout: '시간 초과', error: '오류' };
 const unknownReason = (rt: RoundtripResult) => UNKNOWN_REASON[rt.reason ?? ''] ?? rt.reason ?? '알 수 없음';
@@ -51,12 +53,26 @@ export function roundtripLostText(rt: RoundtripResult): string {
 /** 배치 점검만 끝내지 못했을 때 덧붙이는 말 */
 const layoutUnknownNote = (rt: RoundtripResult) => (rt.layoutUnknown ? ` (조판 점검 못 함: ${UNKNOWN_REASON[rt.layoutUnknown] ?? rt.layoutUnknown})` : '');
 
-/** 방을 만든 사람에게 보이는 결과 문구 */
+/** 배치 경고 한 문장: "…달라질 수 있습니다(5쪽 등)", 쪽 수가 달라지면 "(쪽 수 12 → 13)" */
+export function roundtripLayoutText(l: RoundtripLost): string {
+  const where = l.pages && l.pages[0] !== l.pages[1] ? `쪽 수 ${l.pages[0]} → ${l.pages[1]}`
+    : l.worstPage ? `${l.worstPage}쪽${l.count > 1 ? ' 등' : ''}` : `${l.count}쪽`;
+  return `${ROUNDTRIP_LAYOUT_WARNING}(${where})`;
+}
+
+/**
+ * 방을 만든 사람에게 보이는 결과 문구. 내용 손실(ir·record·bindata·ole-clsid·cfb·package)과 배치(layout)는 문장을 나눈다 —
+ * 둘 다 있으면 두 문장을 모두 보인다.
+ */
 export function roundtripText(rt: RoundtripResult): string {
   if (rt.ok) return `${ROUNDTRIP_OK_TEXT}${layoutUnknownNote(rt)}`;
   if (rt.ok === null) return `왕복 점검 못 함(${unknownReason(rt)}) — rhwp 가 이 문서의 모든 부분을 다룰 수 있는지 확인하지 못했습니다. ${ROUNDTRIP_EDIT_WARNING}`;
-  const lost = roundtripLostText(rt);
-  return `이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다${lost ? `: ${lost}` : ''}. ${ROUNDTRIP_EDIT_WARNING}${layoutUnknownNote(rt)}`;
+  const layout = (rt.lost ?? []).find((l) => l.kind === 'layout');
+  const lost = roundtripLostText({ ...rt, lost: (rt.lost ?? []).filter((l) => l.kind !== 'layout') });
+  const sentences: string[] = [];
+  if (lost || !layout) sentences.push(`이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다${lost ? `: ${lost}` : ''}. ${ROUNDTRIP_EDIT_WARNING}`);
+  if (layout) sentences.push(roundtripLayoutText(layout));
+  return `${sentences.join('. ')}${layoutUnknownNote(rt)}`;
 }
 
 /** COLLAB_ROUNDTRIP=block 서버가 방을 만들지 않았을 때 */

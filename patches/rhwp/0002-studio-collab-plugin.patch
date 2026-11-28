@@ -1,3 +1,23 @@
+diff --git a/rhwp-studio/src/command/commands/file.ts b/rhwp-studio/src/command/commands/file.ts
+index 367e3451..9f5446e5 100644
+--- a/rhwp-studio/src/command/commands/file.ts
++++ b/rhwp-studio/src/command/commands/file.ts
+@@ -424,8 +424,14 @@ export async function saveCurrentDocument(services: CommandServices): Promise<Sa
+     }
+     if (services.wasm.requiresPasswordForSave) {
+       const passwordFormat = requirePasswordSaveFormat(target.format);
+-      password = await showHwpSavePasswordDialog(fileNameForFormat(services.wasm.fileName, passwordFormat));
++      // cc-rhwp(8단계 E4): 빈 암호를 받는 문서(원래 암호 문서였던 공동편집 방)는 비워 두면 경고를 거쳐 암호 없이 저장한다
++      const emptyPassword = services.wasm.emptySavePassword;
++      password = await showHwpSavePasswordDialog(fileNameForFormat(services.wasm.fileName, passwordFormat), emptyPassword);
+       if (password === null) return 'cancelled';
++      if (password === '' && emptyPassword) {
++        if (!await showConfirm(emptyPassword.title, emptyPassword.warning)) return 'cancelled';
++        password = null;
++      }
+     }
+     recoveryCipher = password !== null ? await RecoveryCipher.create(password) : null;
+     if (services.wasm.documentGeneration !== generation) throw new Error('DOCUMENT_CHANGED_DURING_SAVE');
 diff --git a/rhwp-studio/src/core/document-dirty-state.ts b/rhwp-studio/src/core/document-dirty-state.ts
 index c28ff9b9..5cbcf759 100644
 --- a/rhwp-studio/src/core/document-dirty-state.ts
@@ -78,7 +98,7 @@ index 00000000..386c0d0e
 +  }
 +}
 diff --git a/rhwp-studio/src/core/wasm-bridge.ts b/rhwp-studio/src/core/wasm-bridge.ts
-index 9c713c46..f66e8cd6 100644
+index 9c713c46..edf3ca82 100644
 --- a/rhwp-studio/src/core/wasm-bridge.ts
 +++ b/rhwp-studio/src/core/wasm-bridge.ts
 @@ -24,6 +24,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
@@ -89,7 +109,17 @@ index 9c713c46..f66e8cd6 100644
  import { readLayerTreeTransport, type LayerTreeExportOptions } from './layer-tree-transport';
  import {
    normalizeHmlSaveState,
-@@ -325,6 +326,15 @@ export class WasmBridge {
+@@ -66,6 +67,9 @@ interface FontDecisionTraceWasmDocument {
+  * 병합 결과에 실려 오고 undo 분할에 그대로 되돌려주는 불투명 값이다 — 스튜디오는
+  * 내용을 해석하지 않는다.
+  */
++/** cc-rhwp(8단계 E4): 빈 저장 암호를 받을 때의 문구(플러그인 `PluginEmptySavePassword` 와 같은 모양) */
++export interface EmptySavePasswordPolicy { hint: string; title: string; warning: string }
++
+ export type RemovedParaMeta = Record<string, unknown>;
+ 
+ function serializeParaMeta(meta: RemovedParaMeta | undefined): string | undefined {
+@@ -325,6 +329,15 @@ export class WasmBridge {
      const metafileFontGeneration = this.canvasFontGeneration;
      if (!await this.metafileFonts.prepare(doc as unknown as MetafileFontDocument | null,
        metafileFontGeneration, () => current() && this.canvasFontGeneration === metafileFontGeneration)) return false;
@@ -105,7 +135,59 @@ index 9c713c46..f66e8cd6 100644
      if (backend === 'canvas2d' && hasHostFontProvider()) {
        const generation = getHostFontState().generation;
        await prepareHostFontCatalog();
-@@ -1042,6 +1052,8 @@ export class WasmBridge {
+@@ -423,6 +436,8 @@ export class WasmBridge {
+   onRecoveryProtectionChanged?: () => void;
+   private _pdfImport: Record<string, unknown> | null = null;
+   private _requiresPasswordForSave = false;
++  /** cc-rhwp(8단계 E4): 지금 문서의 저장 암호 대화상자가 빈 암호를 받는가(그때의 문구). 문서를 바꾸면 풀린다. */
++  private _emptySavePassword: EmptySavePasswordPolicy | null = null;
+   private _documentDigest: string | null = null;
+   /** 같은 바이트를 다시 열어도 구분되는 문서 인스턴스 세대. */
+   private _documentGeneration = 0;
+@@ -513,6 +528,7 @@ export class WasmBridge {
+     this.setRecoveryCipher(null);
+     this._pdfImport = null;
+     this._requiresPasswordForSave = false;
++    this._emptySavePassword = null;
+     this._documentDigest = null;
+   }
+ 
+@@ -551,6 +567,7 @@ export class WasmBridge {
+     this._recoveryCipher = null;
+     this._pdfImport = null;
+     this._requiresPasswordForSave = requiresPasswordForSave;
++    this._emptySavePassword = null;
+     this._documentDigest = nextDocumentDigest;
+     this._documentGeneration += 1;
+     const notify = (work: () => void) => {
+@@ -692,6 +709,7 @@ export class WasmBridge {
+     this.setRecoveryCipher(null);
+     this._pdfImport = null;
+     this._requiresPasswordForSave = false;
++    this._emptySavePassword = null;
+     this.doc.setFileName(this._fileName);
+     try {
+       this._documentDigest = `blake3:${bytesToHex(blake3(this.doc.exportHwp()))}`;
+@@ -758,6 +776,18 @@ export class WasmBridge {
+     if (changed) this.onRecoveryProtectionChanged?.();
+   }
+ 
++  /**
++   * cc-rhwp(8단계 E4): 지금 문서를 "저장할 때 암호가 필요한 문서"로 둔다(플러그인 `loadDocument` 의
++   * `requirePasswordForSave`). `emptyPassword` 가 있으면 저장 암호 대화상자가 빈 암호를 받는다(경고 뒤 암호 없이).
++   */
++  markRequiresPasswordForSave(options: { emptyPassword?: EmptySavePasswordPolicy } = {}): void {
++    this._emptySavePassword = options.emptyPassword ?? null;
++    this.requiresPasswordForSave = true;
++  }
++
++  /** cc-rhwp(8단계 E4): 저장 암호 대화상자가 빈 암호를 받는가 — 받으면 그때의 문구 */
++  get emptySavePassword(): EmptySavePasswordPolicy | null { return this._emptySavePassword; }
++
+   get recoveryCipher(): RecoveryCipher | null { return this._recoveryCipher; }
+   setRecoveryCipher(cipher: RecoveryCipher | null): void {
+     if (this._recoveryCipher === cipher) return;
+@@ -1042,6 +1072,8 @@ export class WasmBridge {
      const doc = this.doc;
      // 새 조판 참여는 Canvas2D 연결에 한정하고 이전 자동 환경의 해제도 처리한다.
      if (!doc) return false;
@@ -114,7 +196,7 @@ index 9c713c46..f66e8cd6 100644
      const useHost = backend === 'canvas2d' && hostFontLayoutEnabled();
      const restoreHost = this.hasHostFontLayoutEnvironment && !useHost;
      if (!restoreHost && (backend !== 'canvas2d' || (hasHostFontProvider() && !useHost))) return false;
-@@ -1109,6 +1121,26 @@ export class WasmBridge {
+@@ -1109,6 +1141,26 @@ export class WasmBridge {
      }
    }
  
@@ -1083,17 +1165,20 @@ index 7d251116..fb99ce2b 100644
    /** Undo 실행 (커맨드 시스템용) */
    performUndo(): void { this.handleUndo(); }
 diff --git a/rhwp-studio/src/main.ts b/rhwp-studio/src/main.ts
-index 50b4215d..49283930 100644
+index 50b4215d..afccf245 100644
 --- a/rhwp-studio/src/main.ts
 +++ b/rhwp-studio/src/main.ts
-@@ -6,6 +6,7 @@ import { isPdfInput, type PdfInputSource } from './core/pdf-open';
+@@ -6,8 +6,9 @@ import { isPdfInput, type PdfInputSource } from './core/pdf-open';
  import { showPdfImportDialog, cancelPdfImport } from './ui/pdf-import-dialog';
  import { installCommandErrorGlobalRouting, StudioCommandError, inspectCommandError, type CommandErrorV1 } from '@/core/command-error';
  import { hostFontLayoutEnabled, setHostFontProvider, onHostFontsChanged, hasHostFontProvider, prepareHostFontCatalog, getHostFontState, localFontFaceKey, type LocalFontRecord } from '@/core/local-fonts';
 +import { acquireBundledFontPolicy, bundledFontsOnly, onFontPolicyChanged } from '@/core/font-policy';
  import { collectHostFontRequests, collectDocumentCanvasKitFontUsage, resolveDocumentCanvasKitFontUsage, type DocumentCanvasKitFontUsage } from '@/core/host-font-requests';
- import { WasmBridge } from '@/core/wasm-bridge';
+-import { WasmBridge } from '@/core/wasm-bridge';
++import { WasmBridge, type EmptySavePasswordPolicy } from '@/core/wasm-bridge';
  import { installDocumentTitle } from '@/ui/document-title';
+ import type { CanvasKitDocumentPreflight, DocumentInfo, PageInfo } from '@/core/types';
+ import { EventBus } from '@/core/event-bus';
 @@ -32,6 +33,10 @@ import { AutomationHost } from '@/automation/host';
  import { getChromeVisibility, setChromeVisibility } from '@/automation/chrome';
  import type { ChromeVisibility } from '@/automation/types';
@@ -1142,7 +1227,7 @@ index 50b4215d..49283930 100644
    throw new Error(`허용되지 않은 플러그인: ${id}`);
  }
  
-@@ -368,7 +390,10 @@ const plugins = new PluginHostRegistry({
+@@ -368,7 +390,12 @@ const plugins = new PluginHostRegistry({
    automation,
    eventBus,
    getInputHandler: () => inputHandler,
@@ -1150,11 +1235,13 @@ index 50b4215d..49283930 100644
 +  // cc-rhwp: suppressDialogs 를 열기 경로로 넘긴다(생략하면 종전과 같다).
 +  loadDocument: (bytes, fileName, options) => loadBytes(bytes, fileName ?? 'document.hwp', null, undefined, {
 +    suppressDialogs: options?.suppressDialogs,
++    // cc-rhwp(8단계 E4): 원래 암호 문서였던 공동편집 방의 문서 — 저장할 때 암호를 묻는다
++    requirePasswordForSave: options?.requirePasswordForSave,
 +  }),
    createBlankDocument: async (options) => {
      if (options?.confirmUnsaved && !await canReplaceCurrentDocument()) return false;
      await createNewDocument();
-@@ -376,6 +401,36 @@ const plugins = new PluginHostRegistry({
+@@ -376,6 +403,36 @@ const plugins = new PluginHostRegistry({
    },
    resolve: resolvePlugin,
    sidePanels,
@@ -1191,7 +1278,7 @@ index 50b4215d..49283930 100644
    selectTextRange: (range) => {
      if (!inputHandler) return false;
      navigateToSearchHit(inputHandler, {
-@@ -478,6 +533,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
+@@ -478,6 +535,9 @@ function autosaveScheduleFromUserSettings(): AutosaveScheduleSettings {
  }
  
  function handleAutosaveStatus(status: AutosaveStatus): void {
@@ -1201,7 +1288,7 @@ index 50b4215d..49283930 100644
    const message = document.getElementById('sb-message');
    if (!message) return;
    if (autosaveStatusRestoreTimer) {
-@@ -564,6 +622,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
+@@ -564,6 +624,8 @@ function prepareCanvasKitLocalFonts(fontNames: readonly string[] | undefined, re
      ? rendererSession?.getCanvasKitRenderer() ?? null
      : null;
    if (!renderer || (!fontNames?.length && !refresh)) return;
@@ -1210,7 +1297,7 @@ index 50b4215d..49283930 100644
    const requestedFonts = [...(fontNames ?? [])];
    void (async () => {
      await loadStoredLocalFonts();
-@@ -693,9 +753,12 @@ async function initialize(): Promise<void> {
+@@ -693,9 +755,12 @@ async function initialize(): Promise<void> {
            try {
              // 저장된 Local Font Access 권한이 있으면 첫 replay부터 원 face의 SFNT bytes를
              // CanvasKit에 전달한다. CSS local()에서 EBDT face가 두부로 바뀌는 경로를 타지 않는다.
@@ -1226,7 +1313,7 @@ index 50b4215d..49283930 100644
            } catch (error) {
              // 로컬 권한이 만료됐거나 face 읽기에 실패해도 portable bundled face로 계속 연다.
              console.warn(
-@@ -1313,8 +1376,29 @@ function setupEventListeners(): void {
+@@ -1313,8 +1378,29 @@ function setupEventListeners(): void {
      }
    });
  
@@ -1256,7 +1343,7 @@ index 50b4215d..49283930 100644
      wasm.invalidateCanvasMetricFonts();
      const documentGeneration = wasm.documentGeneration;
      const hostGeneration = getHostFontState().generation;
-@@ -1343,6 +1427,7 @@ function setupEventListeners(): void {
+@@ -1343,6 +1429,7 @@ function setupEventListeners(): void {
        clearDeclaredLocalPrograms();
      }
      if (!canvasView || wasm.pageCount === 0) return;
@@ -1264,7 +1351,7 @@ index 50b4215d..49283930 100644
      const state = getLocalFontState();
      const generation = `${state.detectedAt ?? 'none'}:${state.source ?? 'none'}:${state.count}`;
      if (generation === lastAppliedLocalFontGeneration) return;
-@@ -1535,11 +1620,13 @@ async function initializeDocument(
+@@ -1535,11 +1622,13 @@ async function initializeDocument(
    try {
      signal.throwIfAborted();
      // 이미 승인된 snapshot을 권한 prompt 없이 준비한 뒤 프로그램을 선택한다.
@@ -1280,7 +1367,24 @@ index 50b4215d..49283930 100644
        await promptLocalFontsIfNeeded(displayName);
        signal.throwIfAborted();
      }
-@@ -1995,9 +2082,20 @@ async function renderRecentSubmenu(): Promise<void> {
+@@ -1821,7 +1910,7 @@ async function loadBytes(
+   fileName: string,
+   fileHandle: typeof wasm.currentFileHandle,
+   startTime = performance.now(),
+-  options: { signal?: AbortSignal; dataReadProgressShown?: boolean; skipRecent?: boolean; suppressDialogs?: boolean; pdfSource?: PdfInputSource; recoveryCipher?: RecoveryCipher; validateBeforeOpen?: () => Promise<void> } = {},
++  options: { signal?: AbortSignal; dataReadProgressShown?: boolean; skipRecent?: boolean; suppressDialogs?: boolean; pdfSource?: PdfInputSource; recoveryCipher?: RecoveryCipher; validateBeforeOpen?: () => Promise<void>; requirePasswordForSave?: { emptyPassword?: EmptySavePasswordPolicy } } = {},
+ ): Promise<void> {
+   // 바이트로 여는 모든 경로(파일 열기 · ?url= · 자동저장 복구 · 호스트 API)의 공통 깔때기다.
+   const signal = options.signal ?? beginDocumentOpen();
+@@ -1858,6 +1947,7 @@ async function loadBytes(
+         wasm.requiresPasswordForSave = true;
+         wasm.setRecoveryCipher(options.recoveryCipher);
+       }
++      if (options.requirePasswordForSave) wasm.markRequiresPasswordForSave(options.requirePasswordForSave);
+       prepareCanvasRendererDocument(signal);
+       // 문서가 갈렸다 — 빌린 핸들을 쥔 플러그인에 새 lease 를 준다. 알리지 않으면 그쪽만 옛
+       // 문서를 계속 만진다(세대 검사가 잡아 DOCUMENT_RELEASED 로 끊긴다).
+@@ -1995,9 +2085,20 @@ async function renderRecentSubmenu(): Promise<void> {
    panel.closest('.md-sub')?.classList.toggle('disabled', recents.length === 0);
  }
  
@@ -1302,7 +1406,7 @@ index 50b4215d..49283930 100644
  }
  
  async function offerAutosaveRecoveryIfIdle(): Promise<void> {
-@@ -2306,6 +2404,14 @@ void initPromise.then(() => {
+@@ -2306,6 +2407,14 @@ void initPromise.then(() => {
    if (__RHWP_AI__ && sidePanels && window.parent === window) {
      plugins.load('ai-assistant').catch((error) => console.error('[main] AI 도우미 로드 실패', error));
    }
@@ -1673,7 +1777,7 @@ index 07a99843..fd2e0d42 100644
      ledger.eventUnsubs.length = 0;
      ledger.menuItems.clear();
 diff --git a/rhwp-studio/src/plugin/types.ts b/rhwp-studio/src/plugin/types.ts
-index 571e2b4d..72ea3a6a 100644
+index 571e2b4d..9729114e 100644
 --- a/rhwp-studio/src/plugin/types.ts
 +++ b/rhwp-studio/src/plugin/types.ts
 @@ -9,6 +9,7 @@
@@ -1684,7 +1788,7 @@ index 571e2b4d..72ea3a6a 100644
  
  /** 현재 플러그인 API 세대. `activate` 는 이 값을 선언한 플러그인만 받는다. */
  export const PLUGIN_API_VERSION = 1 as const;
-@@ -98,6 +99,17 @@ export interface Tx {
+@@ -98,6 +99,31 @@ export interface Tx {
    deferPagination(): void;
  }
  
@@ -1697,12 +1801,26 @@ index 571e2b4d..72ea3a6a 100644
 + */
 +export interface PluginLoadOptions {
 +  suppressDialogs?: boolean;
++  /**
++   * cc-rhwp(8단계 E4): 연 문서를 "저장할 때 암호가 필요한 문서"로 둔다 — 암호를 풀고 연 문서와 같은 저장 경로
++   * (저장하면 암호를 묻고, 다른 이름으로 저장은 암호 설정을 이어받는다). 다음 문서를 열면 풀린다.
++   * `emptyPassword` 를 주면 저장 암호 대화상자가 빈 암호를 받는다 — `hint` 를 입력 칸 아래에 보이고, 비워 두고 확인하면
++   * `title`·`warning` 확인 창을 띄운 뒤 동의하면 암호 없이 저장한다. 문구는 부른 쪽이 정한다.
++   */
++  requirePasswordForSave?: { emptyPassword?: PluginEmptySavePassword };
++}
++
++/** cc-rhwp(8단계 E4): 빈 저장 암호를 받을 때의 문구 */
++export interface PluginEmptySavePassword {
++  hint: string;
++  title: string;
++  warning: string;
 +}
 +
  /**
   * 플러그인이 studio 에 요청할 수 있는 전부.
   *
-@@ -134,7 +146,7 @@ export interface PluginHost {
+@@ -134,7 +160,7 @@ export interface PluginHost {
     * 문서 교체 위임. 원자 교체·세대 증가·이전 문서 해제는 studio 가 한다.
     * 비동기인 이유는 studio 의 열기 경로가 저장 안 된 변경 확인·복구 흐름을 포함하기 때문이다.
     */
@@ -1711,7 +1829,7 @@ index 571e2b4d..72ea3a6a 100644
    /**
     * 빈 문서로 교체한다. 끝날 때까지 기다릴 수 있다. `confirmUnsaved` 면 메뉴의 「새 문서」처럼
     * 저장 안 된 변경을 먼저 묻는다 — 사용자가 취소하면 `false` 이고 문서는 그대로다.
-@@ -173,6 +185,99 @@ export interface PluginHost {
+@@ -173,6 +199,99 @@ export interface PluginHost {
  
    /** 문서가 교체되면 새 lease 를 받는다. 반환값은 해지 함수다. */
    onDocumentSwap(cb: (lease: DocumentLease) => void): () => void;
@@ -1811,7 +1929,7 @@ index 571e2b4d..72ea3a6a 100644
  }
  
  /**
-@@ -212,6 +317,14 @@ export interface PluginLedger {
+@@ -212,6 +331,14 @@ export interface PluginLedger {
    swapUnsubs: Array<() => void>;
    /** `ui.registerSidePanel` 이 돌려준 해지 함수 */
    uiUnsubs: Array<() => void>;
@@ -1825,6 +1943,65 @@ index 571e2b4d..72ea3a6a 100644
 +  fontPolicyReleases: Array<() => void>;
    /** 진행 중인 트랜잭션 수. 0 이 될 때까지 unload 는 기다린다. */
    activeTx: number;
+ }
+diff --git a/rhwp-studio/src/ui/hwp-password-dialog.ts b/rhwp-studio/src/ui/hwp-password-dialog.ts
+index f0ae3abb..189f662f 100644
+--- a/rhwp-studio/src/ui/hwp-password-dialog.ts
++++ b/rhwp-studio/src/ui/hwp-password-dialog.ts
+@@ -1,6 +1,7 @@
+ import { ModalDialog } from './dialog';
+ 
+ import { t } from '../i18n/index.ts';
++import type { EmptySavePasswordPolicy } from '../core/wasm-bridge';
+ class HwpPasswordDialog extends ModalDialog {
+   private input!: HTMLInputElement;
+   private resolve!: (value: string | null) => void;
+@@ -105,7 +106,7 @@ class HwpSavePasswordDialog extends ModalDialog {
+   private resolve!: (value: string | null) => void;
+   private inputEnterHandler: ((event: KeyboardEvent) => void) | null = null;
+ 
+-  constructor(private readonly fileName: string) {
++  constructor(private readonly fileName: string, private readonly emptyPassword: EmptySavePasswordPolicy | null = null) {
+     super(t('dialog.hwpPassword.showAsync.title'), 420);
+   }
+ 
+@@ -130,6 +131,13 @@ class HwpSavePasswordDialog extends ModalDialog {
+     const help = document.createElement('p');
+     help.textContent = t('dialog.hwpPassword.help.text.xd118e7');
+     body.appendChild(help);
++    // cc-rhwp(8단계 E4): 빈 암호를 받는 문서면 그 뜻을 알린다(문구는 플러그인이 정한다)
++    if (this.emptyPassword) {
++      const emptyHint = document.createElement('p');
++      emptyHint.dataset.ccRhwp = 'save-password-empty-hint';
++      emptyHint.textContent = this.emptyPassword.hint;
++      body.appendChild(emptyHint);
++    }
+     return body;
+   }
+ 
+@@ -150,6 +158,11 @@ class HwpSavePasswordDialog extends ModalDialog {
+ 
+   protected onConfirm(): boolean {
+     const password = this.passwordInput.value;
++    // cc-rhwp(8단계 E4): 두 칸을 모두 비워 확인하면 '' — 부른 쪽이 경고를 거쳐 암호 없이 저장한다
++    if (this.emptyPassword && password === '' && this.confirmationInput.value === '') {
++      this.resolve('');
++      return true;
++    }
+     if (password.length < 5) {
+       this.showError(t('dialog.hwpPassword.showError.label'));
+       this.passwordInput.focus();
+@@ -207,7 +220,8 @@ class HwpSavePasswordDialog extends ModalDialog {
+   }
+ }
+ 
+-/** 새 암호와 확인 입력을 받아 HWP/HWPX 저장에 한 번만 사용한다. */
+-export function showHwpSavePasswordDialog(fileName: string): Promise<string | null> {
+-  return new HwpSavePasswordDialog(fileName).showAsync();
++/** 새 암호와 확인 입력을 받아 HWP/HWPX 저장에 한 번만 사용한다.
++ * cc-rhwp(8단계 E4): `emptyPassword` 를 주면 두 칸을 비워 확인할 때 ''(빈 암호)를 돌려준다. */
++export function showHwpSavePasswordDialog(fileName: string, emptyPassword: EmptySavePasswordPolicy | null = null): Promise<string | null> {
++  return new HwpSavePasswordDialog(fileName, emptyPassword).showAsync();
  }
 diff --git a/rhwp-studio/src/vite-env.d.ts b/rhwp-studio/src/vite-env.d.ts
 index cc5860ac..870d1a52 100644
@@ -2819,6 +2996,97 @@ index 00000000..792a6f3f
 +  // 개발 서버 프록시는 COLLAB_DEV_SERVER 가 있을 때만(빌드에는 영향 없음 — server 설정)
 +  assert.match(config, /\.\.\.\(collabDevServer \? \{ '\/rooms': \{ target: collabDevServer \}, '\/healthz': \{ target: collabDevServer \} \} : \{\}\)/);
 +  assert.match(config, /'@cc-rhwp\/collab-launcher': resolve\(/);
++});
+diff --git a/rhwp-studio/tests/plugin-save-password.test.ts b/rhwp-studio/tests/plugin-save-password.test.ts
+new file mode 100644
+index 00000000..a3ce5f24
+--- /dev/null
++++ b/rhwp-studio/tests/plugin-save-password.test.ts
+@@ -0,0 +1,85 @@
++// cc-rhwp(8단계 E4): 원래 암호 문서였던 공동편집 방의 저장 암호 (docs/collab-stage8.md E4).
++//
++// 플러그인이 `loadDocument(…, { requirePasswordForSave })` 로 연 문서는 암호를 풀고 연 문서와 같은 저장 경로를 탄다
++// (저장하면 암호를 묻는다). `emptyPassword` 를 주면 저장 암호 대화상자가 빈 암호를 받고, 경고를 확인한 뒤 암호 없이 저장한다.
++//
++// 호스트 facade 는 실행으로, WasmBridge·대화상자·저장 명령(DOM·WASM 이 필요)은 소스 가드로 본다.
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++import { PluginHostRegistry, type PluginHostDeps } from '../src/plugin/host.ts';
++import { PLUGIN_API_VERSION, type PluginHost, type PluginLoadOptions, type StudioPlugin } from '../src/plugin/types.ts';
++import { codeOnly, functionBodyFrom } from './support/source-guard.ts';
++
++const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
++const source = (rel: string): string => codeOnly(readFileSync(join(rootDir, rel), 'utf8'));
++
++const EMPTY = { hint: '비워 두면 암호 없이', title: '암호 없이 저장', warning: '계속할까요?' };
++
++test('loadDocument: requirePasswordForSave 를 studio 의 열기로 그대로 넘긴다', async () => {
++  const calls: Array<[number, string | undefined, PluginLoadOptions | undefined]> = [];
++  let captured!: PluginHost;
++  const plugin: StudioPlugin = { id: 'probe', apiVersion: PLUGIN_API_VERSION, activate(host) { captured = host; return {}; } };
++  const deps = {
++    wasm: { borrowDocumentHandle: () => null, documentGeneration: 1 },
++    automation: { removeMenuItem: () => {}, unregisterCommand: () => {} },
++    eventBus: { on: () => () => {} },
++    getInputHandler: () => null,
++    loadDocument: async (bytes: Uint8Array, fileName?: string, options?: PluginLoadOptions) => { calls.push([bytes.length, fileName, options]); },
++    createBlankDocument: async () => true,
++    resolve: async () => plugin,
++  } as unknown as PluginHostDeps;
++  const registry = new PluginHostRegistry(deps);
++  await registry.load('probe');
++  await captured.loadDocument(new Uint8Array(3), 'room.hwpx', { suppressDialogs: true, requirePasswordForSave: { emptyPassword: EMPTY } });
++  await captured.loadDocument(new Uint8Array(2), 'room.hwp', { suppressDialogs: true });
++  assert.deepEqual(calls, [
++    [3, 'room.hwpx', { suppressDialogs: true, requirePasswordForSave: { emptyPassword: EMPTY } }],
++    [2, 'room.hwp', { suppressDialogs: true }],
++  ]);
++  await registry.unload('probe');
++});
++
++test('main.ts: 플러그인 열기의 requirePasswordForSave 를 loadBytes 로 넘기고, 문서를 연 뒤 저장 암호 표시를 건다', () => {
++  const main = source('src/main.ts');
++  assert.match(main, /loadDocument: \(bytes, fileName, options\) => loadBytes\([^]*?requirePasswordForSave: options\?\.requirePasswordForSave,[^]*?\}\),/);
++  const loadBytes = functionBodyFrom(main, 'async function loadBytes(');
++  const opened = loadBytes.indexOf('await loadDocumentForOpen(data, fileName, signal)');
++  const marked = loadBytes.indexOf('if (options.requirePasswordForSave) wasm.markRequiresPasswordForSave(options.requirePasswordForSave);');
++  assert.ok(opened >= 0 && marked > opened, '문서를 연 뒤(새 문서에) 표시를 건다 — 열기가 표시를 지우므로');
++});
++
++test('WasmBridge: 표시는 저장 암호 필요 + 빈 암호 문구, 문서를 바꾸는 세 곳에서 문구를 함께 푼다', () => {
++  const bridge = source('src/core/wasm-bridge.ts');
++  const mark = functionBodyFrom(bridge, 'markRequiresPasswordForSave(');
++  assert.match(mark, /this\._emptySavePassword = options\.emptyPassword \?\? null;/);
++  assert.match(mark, /this\.requiresPasswordForSave = true;/, '세터로 — 복구 보호 변경 알림이 함께 간다');
++  // 문서를 닫기·원자 교체·새 문서: 저장 암호 표시를 지우는 곳마다 빈 암호 문구도 지운다
++  const resets = bridge.match(/this\._requiresPasswordForSave = (?:false|requiresPasswordForSave);\n\s*this\._emptySavePassword = null;/g) ?? [];
++  assert.equal(resets.length, 3);
++  assert.equal((bridge.match(/this\._requiresPasswordForSave = (?:false|requiresPasswordForSave);/g) ?? []).length, 3);
++});
++
++test('저장 암호 대화상자: 빈 암호 문구가 있을 때만 두 칸을 비운 확인이 빈 암호, 아니면 지금처럼 5자 제한', () => {
++  const dialog = source('src/ui/hwp-password-dialog.ts');
++  const confirm = functionBodyFrom(dialog.slice(dialog.indexOf('class HwpSavePasswordDialog')), 'protected onConfirm(');
++  const empty = confirm.indexOf("if (this.emptyPassword && password === '' && this.confirmationInput.value === '')");
++  const minLength = confirm.indexOf('if (password.length < 5)');
++  assert.ok(empty >= 0 && minLength > empty, '빈 암호 판정이 길이 제한보다 먼저');
++  assert.match(confirm.slice(empty, minLength), /this\.resolve\(''\);\s*return true;/);
++  assert.match(dialog, /emptyHint\.textContent = this\.emptyPassword\.hint;/, '받는 문서면 입력 칸 아래에 문구');
++  assert.match(dialog, /export function showHwpSavePasswordDialog\(fileName: string, emptyPassword: EmptySavePasswordPolicy \| null = null\)/);
++});
++
++test('저장: 빈 암호면 경고를 확인해야 암호 없이 저장하고, 취소하면 저장하지 않는다 — 다른 이름으로 저장은 그대로', () => {
++  const file = source('src/command/commands/file.ts');
++  const save = functionBodyFrom(file, 'export async function saveCurrentDocument(');
++  assert.match(save, /const emptyPassword = services\.wasm\.emptySavePassword;/);
++  assert.match(save, /password = await showHwpSavePasswordDialog\(fileNameForFormat\(services\.wasm\.fileName, passwordFormat\), emptyPassword\);/);
++  assert.match(save, /if \(password === '' && emptyPassword\) \{\s*if \(!await showConfirm\(emptyPassword\.title, emptyPassword\.warning\)\) return 'cancelled';\s*password = null;\s*\}/);
++  const saveAs = functionBodyFrom(file, 'async function promptSaveAsOptions(');
++  assert.match(saveAs, /showHwpSavePasswordDialog\(selection\.fileName\)/, '다른 이름으로 저장은 「암호 없이 저장」 단추가 따로 있다');
 +});
 diff --git a/rhwp-studio/tsconfig.json b/rhwp-studio/tsconfig.json
 index 564f230e..cadde804 100644

@@ -53,6 +53,12 @@ export interface UndoHooks {
   clear(): void;
 }
 
+/** `CollabHost.openDoc` 에 함께 넘기는 방 정보 */
+export interface OpenDocInfo {
+  /** 원래 암호 문서였던 방(welcome 의 encryptedSource, 또는 내가 암호 문서로 방을 열었음) */
+  encryptedSource: boolean;
+}
+
 /** 편집기 쪽 */
 export interface CollabHost {
   /** 지금 문서(공유 핸들). 없으면 null */
@@ -63,8 +69,11 @@ export interface CollabHost {
   isEncrypted(): boolean;
   /** base 로 올릴 바이트(gzip 감싼 collabExportState) */
   exportState(): Uint8Array;
-  /** 받은 바이트로 문서를 연다(gzip 이면 풀어서, 확인 창 없이). 끝나면 doc() 가 새 핸들 */
-  openDoc(bytes: Uint8Array): Promise<void>;
+  /**
+   * 받은 바이트로 문서를 연다(gzip 이면 풀어서, 확인 창 없이). 끝나면 doc() 가 새 핸들.
+   * `info.encryptedSource`(8단계 E4): 원래 암호 문서였던 방 — 편집기는 저장할 때 암호를 묻는다.
+   */
+  openDoc(bytes: Uint8Array, info?: OpenDocInfo): Promise<void>;
   /** 같은 조판 규칙(글꼴 정책)이 걸렸나 — 아니면 세션이 방을 나간다 */
   layoutPolicyHolds(doc: EngineDoc): boolean;
   /** 원격 반영 구역: fn 안의 문서 변경은 사용자 편집이 아니다(기록·되돌리기·자동 저장 밖). 끝나면 화면 갱신 */
@@ -173,6 +182,8 @@ export interface SessionStatus {
   fast: Omit<FastStats, 'mismatches'> & { enabled: boolean; mismatches: number };
   /** 7단계 A: 내 state 기록에 범위 표시를 단 수·못 단 수(사유별) */
   stateHints: { hinted: number; plain: number; reasons: Record<string, number> };
+  /** 8단계 E4: 원래 암호 문서였던 방인가 */
+  encryptedSource: boolean;
 }
 
 export interface CollabSessionOptions {
@@ -294,6 +305,8 @@ export class CollabSession {
   private lastDeniedAt = 0;
   private viewOnlyNoticed = false;
   private encryptedNoticed = false;
+  /** 8단계 E4: 지금 방이 원래 암호 문서였나(welcome 마다 다시 정한다) */
+  private _encryptedSource = false;
   private roundtripNoticed = false;
   private transport: Transport | null = null;
   /** 메시지는 줄을 세워 하나씩(welcome 의 비동기 문서 교체가 끝난 뒤 다음) */
@@ -435,6 +448,7 @@ export class CollabSession {
       reconnects: this.reconnects, disconnectedAt: this.disconnectedAt, inflightBatch: this.inflightBatch, user: this.auth.user,
       fast: { enabled: this.fast, ...fastStats, mismatches: mismatches.length },
       stateHints: { ...this.engine.stateHints, reasons: { ...this.engine.stateHints.reasons } },
+      encryptedSource: this._encryptedSource,
     };
   }
 
@@ -576,6 +590,7 @@ export class CollabSession {
   // ── 메시지 처리 ──
   private async onWelcome(msg: WelcomeMessage): Promise<void> {
     this.onAdmitted(msg.user);
+    this._encryptedSource = msg.encryptedSource === true;
     if (msg.encryptedSource) this.noticeEncrypted();
     if (msg.roundtrip && msg.roundtrip.ok !== true) this.noticeRoundtrip(msg.roundtrip);
     if (typeof msg.maxMessageBytes === 'number') this.maxMessageBytes = msg.maxMessageBytes;
@@ -606,15 +621,15 @@ export class CollabSession {
         const data = bytesToBase64(packed);
         if (data.length + 64 > this.maxMessageBytes) { this.leave({ code: 'base-too-large' }); return; }
         this.send({ type: 'base', data, ...(encrypted ? { encryptedSource: true } : {}) });
-        if (encrypted) this.noticeEncrypted();
+        if (encrypted) { this._encryptedSource = true; this.noticeEncrypted(); }
         this.log('info', `base 전송 ${packed.length}B`);
-        await this.host.openDoc(packed);
+        await this.host.openDoc(packed, { encryptedSource: this._encryptedSource });
         const doc = this.host.doc();
         if (!doc) throw new Error('문서를 열지 못했습니다');
         if (!this.host.layoutPolicyHolds(doc)) { this.leave({ code: 'font-policy' }); return; }
         this.engine.attach(doc);
       } else {
-        await this.host.openDoc(base64ToBytes(msg.base));
+        await this.host.openDoc(base64ToBytes(msg.base), { encryptedSource: this._encryptedSource });
         const doc = this.host.doc();
         if (!doc) throw new Error('문서를 열지 못했습니다');
         if (!this.host.layoutPolicyHolds(doc)) { this.leave({ code: 'font-policy' }); return; }

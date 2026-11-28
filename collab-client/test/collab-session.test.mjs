@@ -67,7 +67,7 @@ class FakeNet {
 
 function fakeHost() {
   const h = {
-    doc: null, events: [], external: [], composing: false, caret: null, encrypted: false,
+    doc: null, events: [], external: [], composing: false, caret: null, encrypted: false, opened: [],
     notices: () => h.events.filter((e) => e.type === 'notice').map((e) => e.notice.code),
     of: (type) => h.events.filter((e) => e.type === type),
   };
@@ -76,7 +76,7 @@ function fakeHost() {
     ensureDoc: async () => { if (!h.doc) h.doc = new wasm.HwpDocument(blankBytes()); },
     isEncrypted: () => h.encrypted,
     exportState: () => h.doc.collabExportState(),
-    openDoc: async (bytes) => { h.doc = new wasm.HwpDocument(bytes[0] === 0x1f ? gunzipSync(bytes) : bytes); },
+    openDoc: async (bytes, info) => { h.opened.push(info); h.doc = new wasm.HwpDocument(bytes[0] === 0x1f ? gunzipSync(bytes) : bytes); },
     layoutPolicyHolds: () => true,
     applyExternal: (kind, fn) => { h.external.push(kind); return fn(); },
     captureCaret: () => (h.caret ? { text: h.caret } : null),
@@ -419,6 +419,42 @@ test('첫 참여자: 빈 방(base null)이면 지금 문서를 base 로 올리�
   assert.equal(h2.of('left')[0].reason.code, 'encrypted');
   assert.equal(net2.sentOf('base').length, 0);
   s2.dispose();
+});
+
+test('8단계 E4: 원래 암호 문서였던 방이면 문서를 열 때 encryptedSource 를 넘긴다 — welcome 의 표시, 또는 내가 암호 문서로 연 방', async () => {
+  const enter = async (welcome, encrypted = false) => {
+    const net = new FakeNet();
+    const h = fakeHost();
+    h.encrypted = encrypted;
+    if (welcome.base === null) h.doc = new wasm.HwpDocument(blankBytes());
+    const s = new CollabSession({ room: 'r', name: 'A', clientId: 'A', transport: net.factory, host: h.host, clock: new FakeClock() });
+    s.start();
+    await net.open();
+    await net.deliver({ type: 'welcome', seq: 0, log: [], generation: 1, user: USER, ...welcome });
+    return { s, net, h };
+  };
+  // welcome 에 표시가 있는 방: 열 때 넘기고, 상태에도 남고, 안내는 그대로 한 번
+  const a = await enter({ base: stateWith('가'), encryptedSource: true });
+  assert.deepEqual(a.h.opened, [{ encryptedSource: true }]);
+  assert.equal(a.s.status().encryptedSource, true);
+  assert.equal(a.h.notices().filter((c) => c === 'encrypted-source').length, 1);
+  a.s.dispose();
+  // 표시 없는 방
+  const b = await enter({ base: stateWith('가') });
+  assert.deepEqual(b.h.opened, [{ encryptedSource: false }]);
+  assert.equal(b.s.status().encryptedSource, false);
+  b.s.dispose();
+  // 첫 참여자가 암호 문서로 연 방(서버가 허용): base 에 표시를 싣고, 같은 바이트로 다시 열 때도 넘긴다
+  const c = await enter({ base: null, allowEncrypted: true }, true);
+  assert.equal(c.net.sentOf('base')[0].encryptedSource, true);
+  assert.deepEqual(c.h.opened, [{ encryptedSource: true }]);
+  assert.equal(c.s.status().encryptedSource, true);
+  c.s.dispose();
+  // 첫 참여자가 평문 문서로 연 방
+  const d = await enter({ base: null });
+  assert.equal(d.net.sentOf('base')[0].encryptedSource, undefined);
+  assert.deepEqual(d.h.opened, [{ encryptedSource: false }]);
+  d.s.dispose();
 });
 
 test('편집기가 문서를 바꾸면(세션이 일으킨 것이 아니면) swapped 로 나감, 호스트가 나가게 할 수도 있음', async () => {

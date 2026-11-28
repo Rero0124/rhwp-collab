@@ -25,6 +25,20 @@ import {
 
 /** 공유 문서 열기는 확인 창 없이 (1단계 §6.2) */
 const OPEN_OPTIONS = { suppressDialogs: true } as const;
+/**
+ * 8단계 E4: 원래 암호 문서였던 방의 문서는 studio 가 저장할 때 암호를 묻게 연다(0002 `requirePasswordForSave` —
+ * 암호를 풀고 연 문서와 같은 저장 경로). 암호 칸을 비워 두고 확인하면 경고 뒤 암호 없이 저장한다(사용자가 고를 수 있게).
+ */
+const ENCRYPTED_ROOM_OPEN_OPTIONS = {
+  ...OPEN_OPTIONS,
+  requirePasswordForSave: {
+    emptyPassword: {
+      hint: '원래 암호가 걸린 문서입니다. 두 칸을 비워 두고 확인하면 암호 없이 저장합니다.',
+      title: '암호 없이 저장',
+      warning: '원래 암호가 걸린 문서를 암호 없이 저장합니다. 저장한 파일은 누구나 열 수 있습니다. 계속할까요?',
+    },
+  },
+} as const;
 const NOTICE_MS = 8000;
 const CURSOR_COLORS = ['#e53935', '#1e88e5', '#43a047', '#fb8c00', '#8e24aa', '#00897b', '#6d4c41', '#3949ab'];
 
@@ -342,10 +356,10 @@ export const collabPlugin = {
       ensureDoc: async () => { if (!host.borrowDocument()) await host.createBlankDocument(); },
       isEncrypted: () => documentIsEncrypted(host),
       exportState: () => host.read((d) => (d as unknown as EngineDoc).collabExportState()),
-      openDoc: async (bytes) => {
+      openDoc: async (bytes, info) => {
         // R12: 결과·base 는 gzip 으로 감싸 온다(`collabExportState`). studio 열기에는 원본 바이트가 필요하다.
         const raw = await gunzip(bytes);
-        await host.loadDocument(raw, fileNameFor(room, raw), OPEN_OPTIONS);
+        await host.loadDocument(raw, fileNameFor(room, raw), info?.encryptedSource ? ENCRYPTED_ROOM_OPEN_OPTIONS : OPEN_OPTIONS);
       },
       layoutPolicyHolds: fontPolicyHolds,
       applyExternal: (kind, fn) => host.applyExternal(`collab:${kind}`, fn),

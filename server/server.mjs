@@ -613,6 +613,9 @@ export function startServer({
     const authorWhy = memoAuthorViolation(msg.entries, ws.meta.name);
     if (authorWhy) return forbidden(ws, room, 'ops', 'author', msg, authorWhy);
     if (perm.level === 'confined' && !room.canonical) return forbidden(ws, room, 'ops', 'unsupported', msg, '정본이 꺼져 있음');
+    // 4단계 U3: state 항목은 형식 필드(kind·data·range)만 남긴다. 정본이 없으면 범위 표시를 확인할 수 없으므로 뗀다 — 받는
+    // 쪽은 보통 state 로 다룬다(안전 쪽).
+    msg = { ...msg, entries: msg.entries.map((e) => (e?.kind === 'state' ? stateFields(e, Boolean(room.canonical)) : e)) };
     if (!room.canonical) return commitOps(ws, room, msg, null);
     enqueue(room, async () => {
       if (!room.clients.has(ws)) return;
@@ -634,7 +637,8 @@ export function startServer({
       // 6단계 S1: 정본이 state 를 다시 쓴 바이트 S 로 바꿨으면, 기록·방송·보낸 쪽 ack 모두 C 대신 S 를 쓴다.
       if (res.replaced?.length) {
         const byIndex = new Map(res.replaced.map((r) => [r.index, r.data]));
-        msg = { ...msg, entries: msg.entries.map((e, i) => (byIndex.has(i) ? { kind: 'state', data: byIndex.get(i) } : e)), replaced: true };
+        // U3: 범위 표시는 그대로 넘긴다 — 정본이 확인했고, 다시 쓴 S 도 같은 모델이라 표시가 유효하다
+        msg = { ...msg, entries: msg.entries.map((e, i) => (byIndex.has(i) ? { kind: 'state', data: byIndex.get(i), ...(e.range ? { range: e.range } : {}) } : e)), replaced: true };
       } else if (msg.entries.some((e) => e?.kind === 'state') && !rewriteWarned) {
         rewriteWarned = true;
         log('경고: 정본에 state 다시 쓰기 보조(collabRewriteState)가 없다 — 받은 state 바이트를 그대로 기록·방송한다(6단계 S1 전)');
@@ -654,6 +658,13 @@ export function startServer({
       commitOps(ws, room, msg, res.digest);
     });
   };
+
+  /** 4단계 U3: state 항목의 형식 필드. 범위 표시는 정본이 확인할 때만(`keepRange`) 남긴다. */
+  const stateFields = (e, keepRange) => ({
+    kind: 'state',
+    data: e.data,
+    ...(keepRange && e.range !== undefined ? { range: e.range } : {}),
+  });
 
   /** 기록 항목의 덧붙임: 묶음 이름(클라이언트 값)과 sub(서버가 찍는 값 — 클라이언트가 보낸 sub 는 쓰지 않는다). */
   const stampOf = (ws, msg) => ({

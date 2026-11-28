@@ -17,7 +17,7 @@ const { startServer } = await import(path.join(root, 'server/server.mjs'));
 const { ENGINE_FINGERPRINT } = await import(path.join(root, 'collab-client/src/engine/catalog.ts'));
 
 const STUDIO = process.env.STUDIO_URL ?? 'http://127.0.0.1:7700';
-const PORT = 8790;
+const PORT = Number(process.env.COLLAB_PORT ?? 8790);
 const COLLAB = `ws://127.0.0.1:${PORT}`;
 const CHROME = process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 

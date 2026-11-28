@@ -664,6 +664,8 @@ struct Rec {
 /// 구조 연산의 발자국 (§4.6-2). 기준 문단 `anchor`(표 구조 연산은 + 개체 `control`)와 그 구역의 문단 수 변화
 /// `pd`(기록 때 실측). 적용 전 좌표에서 기준 ~ 기준+max(-pd,0) 문단이 바뀌거나 사라지고, 그 뒤 문단은 `pd` 만큼
 /// 밀린다. `para_arg` 는 기록 인자 안의 기준 문단 자리(옮길 때 고쳐 쓴다, 되돌림 기록은 없음).
+/// `span`(4단계 U3)이 있으면 바뀌는 문단은 기준 ~ 기준+span-1 이다 — 범위 표시가 붙은 state(`range_foot`)처럼 바뀌는
+/// 문단 수가 `pd` 로 정해지지 않는 발자국.
 #[derive(Clone, Debug, PartialEq)]
 struct Foot {
     sec: usize,
@@ -671,11 +673,19 @@ struct Foot {
     control: Option<usize>,
     pd: i64,
     para_arg: Option<usize>,
+    span: Option<usize>,
 }
 
 impl Foot {
     fn end(&self) -> usize {
-        self.anchor + (-self.pd).max(0) as usize
+        match self.span {
+            Some(n) => self.anchor + n.saturating_sub(1),
+            None => self.anchor + (-self.pd).max(0) as usize,
+        }
+    }
+    /// 적용 뒤 좌표에서 바뀐 마지막 문단(`span` 이 없으면 기준+max(pd,0)).
+    fn post_end(&self) -> usize {
+        (self.end() as i64 + self.pd).max(self.anchor as i64) as usize
     }
     /// 문단 단위 발자국인가(개체 단위는 개체만 — 그 문단의 글자 편집은 겹치지 않는다).
     fn paragraph_level(&self) -> bool {
@@ -695,8 +705,20 @@ impl Foot {
     }
     /// 되돌림(이 연산을 버렸을 때 뒤 연산을 옮기는 지도): 만든 문단은 발자국, 그 뒤는 반대로 민다.
     fn inverse(&self) -> Foot {
-        Foot { pd: -self.pd, para_arg: None, ..self.clone() }
+        Foot { pd: -self.pd, para_arg: None, span: self.span.map(|n| (n as i64 + self.pd).max(1) as usize), ..self.clone() }
     }
+}
+
+/// 4단계 U3: 범위 표시가 붙은 state(`range: {section, lo, before, after}`, 문단 수)의 발자국 — 구역 `section` 의
+/// [lo, lo+before) 를 after 개 문단으로 바꾼 구조 편집. 모양이 틀리면 `None`(보통 state 로 본다).
+fn range_foot(rec: &Value) -> Option<Foot> {
+    let r = rec.get("range")?;
+    let g = |k: &str| r.get(k).and_then(Value::as_u64).map(|v| v as usize);
+    let (sec, lo, before, after) = (g("section")?, g("lo")?, g("before")?, g("after")?);
+    if before == 0 || after == 0 {
+        return None;
+    }
+    Some(Foot { sec, anchor: lo, control: None, pd: after as i64 - before as i64, para_arg: None, span: Some(before) })
 }
 
 /// 구조 연산의 발자국을 분류표의 `anchor` 역할과 `meta.pd` 로 만든다.
@@ -706,17 +728,26 @@ fn foot_of(rec: &Value, info: &Value, a: &[Value], section: Option<usize>) -> Op
     let role = info.get("roles")?.as_array()?.iter().find(|r| r.get("kind").and_then(Value::as_str) == Some("anchor"))?;
     let pi = role.get("arg")?.as_u64()? as usize;
     let control = role.get("control").and_then(Value::as_u64).and_then(|ci| num(a, ci as usize));
-    Some(Foot { sec, anchor: num(a, pi)?, control, pd, para_arg: Some(pi) })
+    Some(Foot { sec, anchor: num(a, pi)?, control, pd, para_arg: Some(pi), span: None })
 }
 
 fn classify(rec: &Value, catalog: &Value) -> Rec {
     let state = rec.get("kind").and_then(Value::as_str) != Some("op");
     let m = rec.get("m").and_then(Value::as_str).unwrap_or("");
+    // 4단계 U3: 범위 표시가 붙은 state — 바이트는 문서 전체지만 보정·지도는 그 범위의 구조 편집으로 본다(서버 정본이
+    // 범위 밖이 그대로인지 확인한다). 적용은 여전히 바이트를 읽는다(엔진 `applyEntry`).
+    if state {
+        if let Some(foot) = range_foot(rec) {
+            return Rec { json: rec.clone(), conc: Conc::Structural, state: false, section: Some(foot.sec), text: None, roles: vec![], foot: Some(foot) };
+        }
+    }
     // 4단계: 지도 전용 기록 — 구조 연산 발자국의 되돌림(`undo_map_json`). 분류표를 보지 않는다.
     if m == UNDO_FOOT {
         let a = rec.get("a").and_then(Value::as_array).cloned().unwrap_or_default();
-        let pd = rec.get("meta").and_then(|x| x.get("pd")).and_then(Value::as_i64).unwrap_or(0);
-        let foot = num(&a, 0).zip(num(&a, 1)).map(|(sec, anchor)| Foot { sec, anchor, control: num(&a, 2), pd, para_arg: None });
+        let meta = rec.get("meta");
+        let pd = meta.and_then(|x| x.get("pd")).and_then(Value::as_i64).unwrap_or(0);
+        let span = meta.and_then(|x| x.get("span")).and_then(Value::as_u64).map(|v| v as usize).filter(|&n| n > 0);
+        let foot = num(&a, 0).zip(num(&a, 1)).map(|(sec, anchor)| Foot { sec, anchor, control: num(&a, 2), pd, para_arg: None, span });
         return Rec { json: rec.clone(), conc: Conc::Structural, state: false, section: foot.as_ref().map(|f| f.sec), text: None, roles: vec![], foot };
     }
     let info = catalog.get(m).cloned().unwrap_or(Value::Null);
@@ -979,6 +1010,12 @@ fn with_anchor(x: &Rec, q: usize, catalog: &Value) -> Rec {
         Some(pi) if !x.json.is_null() => {
             let mut j = x.json.clone();
             j["a"][pi] = json!(q);
+            classify(&j, catalog)
+        }
+        // 4단계 U3: 범위 표시 state 는 표시의 lo 를 고쳐 쓴다(보낸 쪽 엔진이 옮긴 자리에서 다시 만든다)
+        None if x.json.get("kind").and_then(Value::as_str) == Some("state") && x.json.get("range").is_some() => {
+            let mut j = x.json.clone();
+            j["range"]["lo"] = json!(q);
             classify(&j, catalog)
         }
         _ => Rec { foot: Some(Foot { anchor: q, ..fx.clone() }), ..x.clone() },
@@ -1357,7 +1394,7 @@ fn undo_map_json(r: &Rec) -> Option<Value> {
         return Some(if r.json.is_null() { emit_text(t, &Value::Null) } else { r.json.clone() });
     }
     if let Some(f) = &r.foot {
-        return Some(json!({ "kind": "op", "m": UNDO_FOOT, "a": [f.sec, f.anchor, f.control], "meta": { "pd": f.pd } }));
+        return Some(json!({ "kind": "op", "m": UNDO_FOOT, "a": [f.sec, f.anchor, f.control], "meta": { "pd": f.pd, "span": f.span } }));
     }
     (!r.json.is_null()).then(|| r.json.clone())
 }
@@ -1706,7 +1743,7 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
             }
             (Conc::Structural, Some(sec)) => match &r.foot {
                 Some(f) => {
-                    let hi = f.anchor + f.pd.max(0) as usize;
+                    let hi = f.post_end();
                     items.extend((f.anchor..=hi).map(|p| para_item(f.sec, p)));
                 }
                 None => items.push(section_item(sec)),
@@ -1727,3 +1764,8 @@ pub fn footprint(entries: &[Value], catalog: &Value) -> Value {
 #[cfg(test)]
 #[path = "ot_tests.rs"]
 mod ot_tests;
+
+// 4단계 U3: snapshot 경로의 문단 범위 복원 — 범위 계산·옮기기(이 모듈의 분류·발자국을 다시 쓴다), 복원·서버 확인과
+// 그 JS 표면. 자식 모듈이라 ot 의 비공개 항목과 CollabCore 의 비공개 항목을 쓸 수 있다.
+#[path = "undo_restore.rs"]
+pub mod undo_restore;

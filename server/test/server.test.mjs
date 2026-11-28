@@ -328,3 +328,17 @@ async function rawHello(room, clientId, lastSeq) {
     close: () => new Promise((r) => { ws.once('close', r); ws.close(); }),
   };
 }
+
+test('4단계 U3: 정본이 꺼진 방은 범위 표시를 확인할 수 없어 state 의 range 를 떼고 기록·방송한다(보낸 쪽 전용 필드도 뗌)', async () => {
+  const a = await client('u3-strip', 'A');
+  await a.next();
+  a.send({ type: 'base', data: 'QkFTRQ==' });
+  const b = await client('u3-strip', 'B');
+  await b.next();
+  a.send({ type: 'ops', base: 0, entries: [{ kind: 'state', data: 'U1RBVEU=', range: { section: 0, lo: 1, before: 2, after: 1 }, recipe: 7 }] });
+  const ack = await a.next();
+  assert.deepEqual(ack.entries, [{ kind: 'state', data: 'U1RBVEU=' }]);
+  assert.deepEqual((await b.next()).entries, [{ kind: 'state', data: 'U1RBVEU=' }]);
+  await a.close();
+  await b.close();
+});

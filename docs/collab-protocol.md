@@ -485,6 +485,8 @@ window.addEventListener('message', async (event) => {
 (라) 성격상 불투명한 내용 — 그대로
 
 - 참조되는 BinData 바이트(그림·OLE). 참조되지 않는 것은 버린다. 받는 쪽 프로그램이 그 내용을 다루는 방식의 문제다.
+- 한컴 조각 붙여넣기(`pasteHwpJson`)의 그림은 확장자를 클라이언트가 보낸 MIME 의 뒤쪽(`image/png` → `png`)에서 그대로 가져온다.
+  저장할 때 BinData 이름에 들어간다(내용과 같은 성격 — 받는 쪽이 이름을 다루는 방식의 문제).
 
 **op 인자로 들어오는 날 바이트**(다시 쓰기로는 막지 못한다 — op 는 모든 참여자가 그대로 적용한다): 정본 워커가 적용하기 전에
 `collabCheckOpArgs` 로 본다. 문단 나누기 다섯 함수(`splitParagraph`·`…InCell`·`…InCellByPath`·`…InFootnote`·

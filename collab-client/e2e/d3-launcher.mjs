@@ -8,6 +8,8 @@
 // 실행: node collab-client/e2e/d3-launcher.mjs
 // hs256 서버: D3_CREATE_TOKEN=<만들기(create) 토큰> D3_JOIN_TOKEN=<모든 방 edit 토큰> COLLAB_HTTP=http://127.0.0.1:<포트> 로
 //       돌린다(studio 를 #create= 로 열고, 토큰이 없는 탭은 입력 칸으로 만든다). 토큰은 저장소 밖에서 만든다(server/token.mjs).
+//       만들기 토큰에 name 이 있으면 "이 방으로 들어가기"는 이름을 묻지 않고 그 이름으로 들어간다. 초대 링크로 들어오는 탭(B)은
+//       화면 안 이름 칸으로 묻는다(브라우저 대화상자 없음).
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +30,16 @@ const JOIN_TOKEN = process.env.D3_JOIN_TOKEN ?? '';
 const HTTP = process.env.COLLAB_HTTP ?? 'http://127.0.0.1:8787';
 const WS = HTTP.replace(/^http/, 'ws') + '/';
 const MODE = CREATE_TOKEN ? 'hs256' : 'none';
+/** 만들기 토큰의 표시 이름(서명은 서버가 확인) */
+const CREATOR = (() => { try { return JSON.parse(Buffer.from(CREATE_TOKEN.split('.')[1] ?? '', 'base64url').toString()).name ?? null; } catch { return null; } })();
+/** 이름 칸이 뜨면 이름을 넣어 들어간다. 칸이 떴는지 돌려준다 */
+const answerName = async (page, name, ms = 15_000) => {
+  const input = await page.waitForSelector('[data-collab="name-input"]', { timeout: ms }).catch(() => null);
+  if (!input) return false;
+  await input.type(name);
+  await page.click('[data-collab="name-submit"]');
+  return true;
+};
 
 const results = [];
 const record = (name, ok, detail = '') => {
@@ -95,6 +107,9 @@ try {
 
   // B: 편집 링크로 들어온다 — 같은 문서
   const B = await tab(browser, 'B', edit);
+  // 초대 토큰에는 이름이 없다 — hs256 이면 화면 안 칸으로 묻는다(인증을 끈 서버의 링크에는 토큰이 없어 묻지 않는다)
+  const askedB = MODE === 'hs256' ? await answerName(B, 'B') : false;
+  if (MODE === 'hs256') record('초대 링크로 들어오는 탭은 화면 안 칸으로 이름을 물음(브라우저 대화상자 없음)', askedB && B.dialogs.length === 0, `칸 ${askedB}, 대화상자 ${JSON.stringify(B.dialogs)}`);
   await joined(B);
   const bText = await text(B);
   record('다른 탭이 편집 링크로 들어오면 같은 문서', bText === original, JSON.stringify(bText));
@@ -105,6 +120,12 @@ try {
   record('"이 방으로 들어가기" 로 편집 링크로 이동', await navigated, `${A.url().replace(/token=[^&]+/, 'token=…')} 대화상자 ${JSON.stringify(A.dialogs)}`);
   await A.waitForFunction(() => window.__inputHandler, { timeout: 90_000, polling: 250 });
   await joined(A);
+  if (MODE === 'hs256' && CREATOR) {
+    const askedA = await A.evaluate(() => Boolean(document.querySelector('[data-collab="name-input"]')));
+    const nameA = (await A.evaluate(() => window.__collab.status())).user?.name;
+    record('만든 사람은 "이 방으로 들어가기"에서 이름을 다시 묻지 않고 만들기 토큰의 이름으로 들어감', !askedA && nameA === CREATOR && !A.dialogs.some((d) => d.startsWith('prompt')),
+      `이름 칸 ${askedA}, 이름 ${nameA}(토큰 ${CREATOR}), 대화상자 ${JSON.stringify(A.dialogs)}`);
+  }
   await A.evaluate(() => {
     const ih = window.__inputHandler;
     const w = window.__wasm;
@@ -116,7 +137,7 @@ try {
   const [da, db] = await Promise.all([A, B].map((p) => p.evaluate(() => window.__collab.digest())));
   const [ta, tb] = await Promise.all([text(A), text(B)]);
   record('만든 탭도 들어가 편집 — 두 탭 수렴, 재동기화 0', da === db && ta === tb && ta.endsWith(' added') && ta.startsWith(original) && st.every((s) => s.resyncCount === 0), `A ${JSON.stringify(ta)} B ${JSON.stringify(tb)}`);
-  // 초대 토큰에는 이름이 없어 플러그인이 보일 이름을 묻는다(prompt) — 그것은 정상, 이탈 확인(beforeunload)만 실패로 본다
+  // 이탈 확인(beforeunload)이 뜨면 실패(이름은 화면 안 칸으로 묻는다 — 브라우저 대화상자가 아니다)
   const unload = A.dialogs.filter((d) => d.startsWith('beforeunload'));
   record('들어가기에서 "저장하지 않은 변경" 확인이 뜨지 않음', unload.length === 0, A.dialogs.join(' | '));
   record('평소 studio·방 만들기에서 콘솔 오류 없음', A.errors.length === 0, A.errors.join(' | '));

@@ -116,8 +116,8 @@ async function openPage(browser, url, name) {
     if (VERBOSE ? msg.type() !== 'debug' : /^\[collab/.test(t) && /인증|나감|재동기화|forbidden|HTTPS|권한/.test(t)) console.log(`    [${name}] ${t.slice(0, 200)}`);
   });
   page.on('pageerror', (e) => console.log(`    [${name} pageerror] ${e.message.slice(0, 200)}`));
-  // 새로고침의 "저장하지 않은 변경" 확인(studio 의 beforeunload)은 받아들이고, 그 밖(이름 묻기 등 — 시험은 이름을 주므로 뜨지
-  // 않아야 한다)은 닫는다.
+  // 새로고침의 "저장하지 않은 변경" 확인(studio 의 beforeunload)은 받아들이고, 그 밖은 닫는다(이름은 화면 안 칸으로 묻는다 —
+  // 브라우저 대화상자는 뜨지 않아야 한다, 7b).
   page.dialogs = [];
   page.on('dialog', (d) => { page.dialogs.push(d.type()); (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}); });
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120_000 });
@@ -289,6 +289,27 @@ try {
     sa.lastSeq === seqBefore && dv === da && vNotices.some((t) => t.includes('보기')) && (path7 === '클라이언트 문에서 막힘' || sv.resyncCount >= 1),
     `seq ${seqBefore}→${sa.lastSeq}, V resync ${sv.resyncCount}, 안내 ${JSON.stringify(vNotices.filter((t) => /보기|권한/.test(t)))}, 서버 forbidden ${forbiddenCount}`);
   await V.close();
+
+  // ── 7b. 이름 없는 초대 링크: 화면 안 이름 칸(브라우저 대화상자 없음) → 그 이름으로 들어감, 새로고침하면 다시 묻지 않음 ──
+  const N = await openPage(B0.b, link(invite.edit, room, ''), 'N');
+  const askedN = await N.waitForSelector('[data-collab="name-input"]', { timeout: 120_000 }).then(() => true, () => false);
+  const beforeN = await status(N);
+  if (askedN) {
+    await N.click('[data-collab="name-input"]');
+    await N.type('[data-collab="name-input"]', '이름칸');
+    await N.click('[data-collab="name-submit"]');
+  }
+  await waitReady(N);
+  const stN = await status(N);
+  await N.reload({ waitUntil: 'domcontentloaded' });
+  await waitReady(N);
+  const reaskedN = await N.evaluate(() => Boolean(document.querySelector('[data-collab="name-input"]')));
+  const stN2 = await status(N);
+  record('7b. 이름 없는 초대 링크: 화면 안 이름 칸으로 묻고(브라우저 대화상자 없음, 묻는 동안 연결하지 않음) 그 이름으로 들어감, 새로고침하면 기억한 이름',
+    askedN && beforeN?.connection === 'connecting' && !beforeN?.ready && stN.user?.name === '이름칸' && !reaskedN && stN2.user?.name === '이름칸'
+      && N.dialogs.filter((d) => d !== 'beforeunload').length === 0,
+    `칸 ${askedN}, 묻는 동안 ${beforeN?.connection}/${beforeN?.ready}, 이름 ${stN.user?.name} → 새로고침 ${stN2.user?.name}(다시 물음 ${reaskedN}), 대화상자 ${JSON.stringify(N.dialogs)}`);
+  await N.close();
 
   // ── 8. 다시 붙을 때 만료 → 다시 붙기를 멈추고 안내, 보내지 못한 편집 수 ──
   // 시계 오차 30초를 두므로 exp = 지금 - 5 → 약 25초 동안만 유효. 들어온 뒤 만료될 때까지 끊어 둔다.

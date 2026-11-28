@@ -867,6 +867,8 @@ export function startServer({
     }
     if (!res.ok) {
       await room.canonical.terminate();
+      // 여는 데 정본 워커 시간 제한(COLLAB_CANONICAL_TIMEOUT_MS)을 넘겼다 — 대개 문서가 커서다. 사람이 알아들을 까닭으로 따로 알린다.
+      if (res.timeout) throw new HttpError(422, 'too-slow', `문서를 여는 데 ${canonicalTimeoutMs}ms 를 넘겼다(문서가 커서 공동편집으로 쓰기 어렵다)`, { reason: 'too-slow' });
       throw new HttpError(422, 'invalid-document', `문서를 열지 못했다: ${res.reason}`);
     }
     // S2 왕복 점검: rhwp 가 모든 부분을 모델에서 다시 쓴 결과를 원본과 견준다. 손대지 않은 부분은 원본 바이트를 그대로 쓰므로

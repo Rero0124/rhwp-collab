@@ -346,6 +346,12 @@ export class CollabSession {
   /** 되돌리기 훅을 끼운다(start 전에). CollabUndo 는 engine 이 있어야 만들 수 있어 생성자 뒤에 받는다. */
   setUndo(undo: UndoHooks | null): void { this.undo = undo; }
 
+  /** 표시 이름을 정한다(호스트가 이름을 물어본 뒤, start 전에). 다음 hello 부터 쓰이고, 서버가 welcome.user.name 으로 바꿀 수 있다. */
+  setName(name: string): void {
+    this._name = name;
+    this.emit({ type: 'status' });
+  }
+
   /** 첫 연결 */
   start(): void {
     this.cursorTimer = this.clock.setInterval(() => this.cursorTick(), CURSOR_INTERVAL_MS);

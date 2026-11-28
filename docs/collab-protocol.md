@@ -49,6 +49,9 @@
 
 `name` 이 없는 토큰(예: 서버가 만든 초대 토큰)은 여러 사람이 나눠 쓴다. 그래서 표시 이름은 `hello.name`(사용자가 입력한
 값, **확인되지 않은 표시용**)을 쓰고, `sub` 에는 서버가 연결마다 다른 꼬리를 붙인다(`invite~1a2b3c4d`).
+studio 는 이름이 없는 초대 링크로 들어올 때 화면 안 입력 칸으로 이름을 한 번 묻고 그 기기에 기억한다(묻는 동안은 연결하지
+않는다, 부품 전용 서버에서는 묻지 않는다). launcher 의 "이 방으로 들어가기"는 만들기 토큰에 `name` 이 있으면 그 이름을 편집
+링크의 주소 조각(`#name=`)에 실어 다시 묻지 않는다 — 나눠 주는 링크에는 싣지 않는다.
 
 **입장 이름.** 서버는 `hello` 때 이름(토큰의 `name`, 없으면 `hello.name`)을 한 번 다듬어 그 연결의 이름으로 정한다. 규칙은
 rhwp 가 메모 작성자를 저장하는 규칙과 같다: 앞뒤 공백을 자르고, `/`·`\`·`;`·제어 문자를 빼고, 64 UTF-16 단위로 자른다
@@ -318,7 +321,7 @@ rhwp 는 메모 작성자를 부르는 쪽이 넘긴 `{author}` 그대로 저장
 - `201 {room, invite?, inviteExpiresAt?}`. 서버가 토큰을 만들 수 있으면(`hs256`) `invite` 에 그 방 전용 초대 토큰을 권한마다
   하나씩 준다: `{edit, view, form, comment}`. 초대 토큰은 `room` = 새 방, `scope` = 그 권한, `sub: "invite"`, `name` 없음,
   수명 `COLLAB_INVITE_TTL`(기본 24시간)이다. `url` 방식은 `{room}` 만 주고, 토큰은 바깥 시스템이 발급한다.
-- 실패: 415(HWP·HWPX 가 아님), 422(정본이 열지 못함), 413(메시지 상한을 넘음 — `welcome` 에 실을 수 있어야 한다), 501(정본이 꺼짐).
+- 실패: 415(HWP·HWPX 가 아님), 422(정본이 열지 못함 — `invalid-document`; 여는 데 정본 워커 시간 제한 `COLLAB_CANONICAL_TIMEOUT_MS` 를 넘기면 `{error: "too-slow", reason: "too-slow"}` — 대개 문서가 커서다, 업로드 페이지·launcher 는 "문서가 커서 여는 데 너무 오래 걸립니다"로 알린다), 413(메시지 상한을 넘음 — `welcome` 에 실을 수 있어야 한다), 501(정본이 꺼짐).
 - **암호 문서:** 기본으로 받지 않는다 — `400 {error: "encrypted", reason: "encrypted", allowed: false}`(rhwp 의 "암호 필요"
   오류를 일반 오류 422 와 구분한다). 서버가 `COLLAB_ALLOW_ENCRYPTED=1` 이면 `allowed: true` 로 답하고, 요청 머리
   `X-Collab-Document-Password` 로 문서 암호를 주면 그 암호로 열어 **암호 없는 바이트**를 방의 처음 기준점으로 쓴다(틀리면

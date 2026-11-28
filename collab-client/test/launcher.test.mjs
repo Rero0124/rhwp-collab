@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  collabLauncherPlugin, createErrorText, createRoom, ENCRYPTED_TEXT, inviteLinks, LAUNCHER_COMMAND, parseHealth, probeServer, takeCreateToken,
+  collabLauncherPlugin, createErrorText, createRoom, ENCRYPTED_TEXT, inviteLinks, LAUNCHER_COMMAND, parseHealth, probeServer, takeCreateToken, TOO_SLOW_TEXT,
 } from '../src/launcher.ts';
 
 const json = (status, body, type = 'application/json') => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers: { 'content-type': type } });
@@ -77,6 +77,8 @@ test('방 만들기: 201 이면 방, 실패는 사람이 읽는 말(권한·암�
   assert.match(await fail(413, { error: 'too-large' }), /너무 커서/);
   assert.match(await fail(415, { error: 'not-hwp' }), /열지 못해/);
   assert.match(createErrorText(500, { message: '서버 오류' }), /500: 서버 오류/);
+  assert.equal(createErrorText(422, { error: 'too-slow', reason: 'too-slow' }), TOO_SLOW_TEXT, '여는 데 너무 오래 걸림');
+  assert.equal(createErrorText(422, { error: 'invalid-document' }), '문서를 열지 못해 방을 만들 수 없습니다');
   const down = await createRoom(async () => { throw new TypeError('network'); }, 'https://h', bytes, null);
   assert.deepEqual(down, { ok: false, text: '서버에 닿지 못했습니다' });
 });
@@ -130,4 +132,19 @@ test('켜기: none·hs256 이면 파일 메뉴에 "공동편집 시작…"(대�
     assert.equal(got.surface.auth(), auth);
     assert.deepEqual(got.logs, []);
   }
+});
+
+test('만든 사람의 이름: hs256 만들기 토큰의 name 을 읽어 들어가기 링크에만 싣는다(없거나 못 읽으면 null)', async () => {
+  const { tokenName, withName } = await import('../src/launcher.ts');
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const jwt = (payload) => `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(payload)}.sig`;
+  assert.equal(tokenName(jwt({ sub: 'u', name: '김 담당', scope: 'create' })), '김 담당');
+  assert.equal(tokenName(jwt({ sub: 'u', scope: 'create' })), null, '이름 없는 토큰');
+  assert.equal(tokenName(jwt({ name: '  ' })), null);
+  assert.equal(tokenName('not-a-jwt'), null);
+  assert.equal(tokenName(null), null);
+  for (const n of ['a', 'ab', 'abc', '가나다라마']) assert.equal(tokenName(jwt({ name: n })), n, `패딩 ${n}`);
+  assert.equal(withName('https://x/?collab#token=t&room=r', '김 담당'), 'https://x/?collab#token=t&room=r&name=%EA%B9%80+%EB%8B%B4%EB%8B%B9');
+  assert.equal(withName('https://x/?collab', 'A'), 'https://x/?collab#name=A');
+  assert.equal(new URLSearchParams(withName('https://x/#room=r&name=old', 'new').split('#')[1]).get('name'), 'new');
 });

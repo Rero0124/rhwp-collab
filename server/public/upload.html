@@ -199,6 +199,11 @@
         status($('status'), why, 'err');
         return;
       }
+      // 서버가 문서를 여는 데 시간 제한을 넘겼다(launcher 의 TOO_SLOW_TEXT 와 같은 문구)
+      if (body.error === 'too-slow') {
+        status($('status'), '문서가 커서 여는 데 너무 오래 걸립니다. 공동편집으로 쓰기 어렵습니다', 'err');
+        return;
+      }
       if (body.error === 'roundtrip') {
         status($('status'), roundtripBlockedText(body.roundtrip), 'err');
         return;

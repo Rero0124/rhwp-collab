@@ -110,7 +110,8 @@ async function openParent(origin, query) {
   await page.setViewport({ width: 1280, height: 900 });
   page.consoleLines = [];
   page.on('console', (m) => page.consoleLines.push(m.text()));
-  page.on('dialog', (d) => d.dismiss().catch(() => {}));
+  page.dialogCount = 0;
+  page.on('dialog', (d) => { page.dialogCount += 1; d.dismiss().catch(() => {}); });
   await page.goto(`${origin}/parent.html?${new URLSearchParams({ room: ROOM, ...query })}`, { waitUntil: 'domcontentloaded' });
   return page;
 }
@@ -181,6 +182,14 @@ try {
   const stE = await E.evaluate(() => window.__parent.requests.map((r) => r.reason));
   record('5. 다시 붙을 때 만료 → 알림(expired) → 부모가 새 토큰 → 다시 들어옴', Boolean(back) && stE.includes('expired'),
     `알림 ${JSON.stringify(stE)}, 서버 unauthorized ${serverLog.filter((l) => l.includes('unauthorized expired')).length}`);
+
+  // 6. 부품 전용: 주소에 이름이 없고 #token 이 붙어 있어도 이름 칸을 띄우지 않는다(바깥 시스템의 토큰이 사용자를 안다)
+  const P = await openParent(PARENT, { name: '', hashToken: valid });
+  const fp = await waitFor(() => editorFrame(P), 30_000);
+  const readyP = fp && await waitFor(async () => (await collabStatus(fp))?.ready, 90_000);
+  const promptP = fp ? await fp.evaluate(() => Boolean(document.querySelector('[data-collab="name-prompt"]'))) : true;
+  record('6. 부품 전용: 이름 없는 링크여도 이름 칸·대화상자 없이 부모의 토큰으로 들어감', Boolean(readyP) && !promptP && P.dialogCount === 0,
+    `ready ${Boolean(readyP)}, 이름 칸 ${promptP}, 대화상자 ${P.dialogCount}`);
 } catch (error) {
   record('시나리오 실행', false, error.stack ?? String(error));
 } finally {

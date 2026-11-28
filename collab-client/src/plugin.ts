@@ -94,6 +94,7 @@ const safeStorage = (kind: 'sessionStorage' | 'localStorage') => {
  * 토큰은 읽은 뒤 주소에서 지운다(조각은 서버로 가지 않지만 주소창·기록·화면 공유에 남지 않게).
  */
 function readStudioEntry(): { url: string; room: string; name: string; token: string | null } {
+  // name: 주소의 이름(없으면 '' — 물을지는 activate 가 정한다)
   const query = new URLSearchParams(window.location.search);
   const frag = new URLSearchParams(window.location.hash.replace(/^#/, ''));
   const url = query.get('collab') || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/`;
@@ -108,20 +109,70 @@ function readStudioEntry(): { url: string; room: string; name: string; token: st
   } else {
     try { token = store?.getItem(TOKEN_KEY(room)) ?? null; } catch { token = null; }
   }
-  let name = frag.get('name') || query.get('name') || '';
-  if (!name && token) name = askDisplayName();
-  return { url, room, name: name || 'anon', token };
+  const name = frag.get('name') || query.get('name') || '';
+  return { url, room, name, token };
 }
 
-/** 이름이 없는 초대 링크: 다른 사람에게 보일 이름을 한 번 묻고 기억한다(확인된 값이 아닌 표시용). */
-function askDisplayName(): string {
-  const local = safeStorage('localStorage');
-  let saved = '';
-  try { saved = local?.getItem(NAME_KEY) ?? ''; } catch { /* 없음 */ }
-  if (saved) return saved;
-  const answer = (typeof window.prompt === 'function' ? window.prompt('다른 사람에게 보일 이름을 입력하세요', '') : null)?.trim() ?? '';
-  if (answer) { try { local?.setItem(NAME_KEY, answer); } catch { /* 저장 못 함 */ } }
-  return answer;
+/** 이름이 없는 초대 링크로 들어올 때 물어 기억해 둔 표시 이름(확인된 값이 아닌 표시용) */
+function savedDisplayName(): string {
+  try { return safeStorage('localStorage')?.getItem(NAME_KEY) ?? ''; } catch { return ''; }
+}
+function saveDisplayName(name: string): void {
+  try { safeStorage('localStorage')?.setItem(NAME_KEY, name); } catch { /* 저장 못 함 */ }
+}
+
+const NAME_PROMPT_TEXT = '다른 사람에게 보일 이름을 입력하세요';
+const NAME_DIALOG_STYLE = 'position:fixed;inset:0;z-index:2147483002;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.35);font:14px/1.5 system-ui,sans-serif';
+const NAME_PANEL_STYLE = 'background:#fff;color:#222;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.25);padding:18px 20px;min-width:320px;max-width:90vw';
+
+/**
+ * 화면 안 이름 입력 칸(브라우저 대화상자 window.prompt 대신 — 자동화 시험이 막히지 않고, 화면이 멈추지 않는다). 빈칸으로
+ * 들어가면 이름 없이(anon) 들어간다. 돌려주는 함수는 칸을 치운다(내릴 때).
+ */
+function showNamePrompt(onAnswer: (name: string) => void): () => void {
+  const root = document.createElement('div');
+  root.dataset.collab = 'name-prompt';
+  root.setAttribute('role', 'dialog');
+  root.setAttribute('aria-modal', 'true');
+  root.setAttribute('aria-label', NAME_PROMPT_TEXT);
+  root.style.cssText = NAME_DIALOG_STYLE;
+  const form = document.createElement('form');
+  form.style.cssText = NAME_PANEL_STYLE;
+  const label = document.createElement('label');
+  label.textContent = NAME_PROMPT_TEXT;
+  label.style.cssText = 'display:block;margin-bottom:8px;font-weight:600';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.maxLength = 64;
+  input.setAttribute('autocomplete', 'nickname');
+  input.dataset.collab = 'name-input';
+  input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px;font:inherit';
+  label.htmlFor = input.id = 'collab-name-input';
+  const actions = document.createElement('div');
+  actions.style.cssText = 'display:flex;justify-content:flex-end;margin-top:12px';
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.dataset.collab = 'name-submit';
+  button.textContent = '들어가기';
+  actions.appendChild(button);
+  form.append(label, input, actions);
+  root.appendChild(form);
+  document.body.appendChild(root);
+  // studio 의 단축키·입력 처리가 이 칸의 키를 가져가지 않게(기본 동작 — 글자 넣기·Enter 로 보내기 — 은 그대로)
+  for (const type of ['keydown', 'keypress', 'keyup', 'beforeinput', 'input', 'compositionstart', 'compositionupdate', 'compositionend']) {
+    input.addEventListener(type, (e) => e.stopPropagation());
+  }
+  let done = false;
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (done) return;
+    done = true;
+    root.remove();
+    onAnswer(input.value.trim());
+  });
+  root.addEventListener('mousedown', (e) => { if (e.target === root) { e.preventDefault(); input.focus(); } });
+  setTimeout(() => input.focus(), 0);
+  return () => { done = true; root.remove(); };
 }
 
 /** studio 의 토큰 공급자: 링크로 받은 토큰을 그대로. 링크 하나로는 새 토큰을 받을 길이 없다(만료면 다시 열어야 함). */
@@ -323,8 +374,11 @@ export const collabPlugin = {
     const resumeAutosave = host.suspendAutosave();
     // S3-1: 문서를 열기 전에 글꼴 정책을 건다 — 기기·브라우저가 달라도 같은 조판.
     const releaseFontPolicy = host.setFontPolicy(FONT_POLICY);
+    // 이름: 주소의 이름 → (토큰 링크면) 기억해 둔 이름 → 없으면 들어가기 전에 화면 안 칸으로 묻는다(아래 start). 토큰 없는 링크는 anon.
+    const knownName = entry.name || (entry.token ? savedDisplayName() : '');
+    const askName = !knownName && entry.token !== null;
     session = new CollabSession({
-      room, name: entry.name, url, transport: webSocketTransport(url), host: studioHost, getToken, fast, longDisconnectMs,
+      room, name: knownName || 'anon', url, transport: webSocketTransport(url), host: studioHost, getToken, fast, longDisconnectMs,
     });
     const engine = session.engine;
     /** 5단계 D4: form 권한이면 studio 를 양식 모드로(누름틀·양식 개체만 고치는 화면). 우리가 켰으면 나갈 때 끈다. */
@@ -462,7 +516,24 @@ export const collabPlugin = {
     host.events.on('document-mutated', () => session.edited());
     host.events.on('document-changed', () => session.changed());
     host.events.on('composition-end', () => session.compositionEnded());
-    session.start();
+    let stopped = false;
+    let closeNamePrompt: (() => void) | null = null;
+    if (!askName) {
+      session.start();
+    } else {
+      // 이름이 없는 초대 링크: 부품 전용 서버면 묻지 않는다(바깥 시스템의 토큰이 사용자를 안다). 아니면 화면 안 칸으로 묻고 기억한다.
+      void embedInfo.then((info) => {
+        if (stopped) return;
+        if (info.embedOnly) { session.start(); return; }
+        closeNamePrompt = showNamePrompt((answer) => {
+          closeNamePrompt = null;
+          if (stopped) return;
+          if (answer) saveDisplayName(answer);
+          session.setName(answer || 'anon');
+          session.start();
+        });
+      });
+    }
     render();
 
     // ── 표면: 콘솔 검증용 ──────────────────────────────────────────────
@@ -495,6 +566,8 @@ export const collabPlugin = {
       simulateDisconnect: notInEmbed(surface.simulateDisconnect),
     };
     teardown = () => {
+      stopped = true;
+      closeNamePrompt?.();
       session.dispose();
       for (const v of cursorViews.values()) v.el?.remove();
       for (const t of noticeTimers) clearTimeout(t);

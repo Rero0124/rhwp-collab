@@ -15,6 +15,7 @@
  * studio 를 import 하지 않는다 — 타입만(`plugin/types.ts`).
  */
 import type { PluginHost, PluginSurface, StudioPlugin } from '@/plugin/types';
+import { closeModal, focusInput, markModal, shieldInputs } from './overlay.ts';
 import { ROUNDTRIP_PENDING_TEXT, isRoundtripPending, roundtripBlockedText, roundtripText, type RoundtripPending, type RoundtripResult } from './session/roundtrip.ts';
 
 /** studio 개발 서버(`COLLAB_DEV_SERVER`)의 공동편집 서버 ws 주소 — 빌드·시험에서는 비거나 없다(같은 출처). */
@@ -192,14 +193,16 @@ export const collabLauncherPlugin = {
     }) };
     const health = await probeServer(fetch.bind(window), origin);
     let dialog: HTMLElement | null = null;
-    const close = () => { dialog?.remove(); dialog = null; };
+    const close = () => { closeModal(dialog); dialog = null; };
     teardown = close;
     // 서버가 없거나 바깥 시스템이 방을 만드는 방식이면 아무것도 심지 않는다
     if (!health || health.auth === 'url') return { available: () => false };
 
     const open = async () => {
       close();
-      const root = el('div', { 'data-collab': 'launcher', role: 'dialog', 'aria-label': '공동편집 시작', style: DIALOG_STYLE });
+      const root = el('div', { 'data-collab': 'launcher', role: 'dialog', 'aria-modal': 'true', 'aria-label': '공동편집 시작', style: DIALOG_STYLE });
+      // studio 가 포커스를 되가져가거나 단축키로 키를 가져가지 않게(./overlay.ts — 이름 칸과 같은 처리)
+      markModal(root);
       const panel = el('div', { style: PANEL_STYLE });
       root.append(panel);
       root.addEventListener('click', (e) => { if (e.target === root) close(); });
@@ -219,6 +222,7 @@ export const collabLauncherPlugin = {
       if (protectedDoc && !health.encryptedAllowed) {
         body.append(el('p', { 'data-collab': 'launcher-encrypted' }, ENCRYPTED_TEXT));
         actions.append(cancel);
+        focusInput(cancel);
         return;
       }
       body.append(el('p', {}, '지금 문서로 공동편집 방을 만듭니다. 링크를 받은 사람이 같은 문서를 함께 편집합니다.'));
@@ -230,6 +234,8 @@ export const collabLauncherPlugin = {
       }
       const create = el('button', { type: 'button', 'data-collab': 'launcher-create' }, '방 만들기');
       actions.append(cancel, create);
+      shieldInputs(root);
+      if (tokenInput) focusInput(tokenInput); else focusInput(create);
       create.addEventListener('click', async () => {
         status.textContent = '';
         const token = health.auth === 'hs256' ? (tokenInput?.value.trim() || createToken.value) : null;

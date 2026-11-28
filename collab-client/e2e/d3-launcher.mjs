@@ -150,6 +150,11 @@ try {
     const input = await D.waitForSelector('[data-collab="launcher-token"]', { timeout: 10_000 }).catch(() => null);
     if (input) {
       await input.type(CREATE_TOKEN);
+      // 친 값이 그대로 칸에 들어갔는지 먼저 본다(studio 가 타자 중 포커스를 가져가면 토큰이 잘린다 — 그때 원인이 바로 보이게)
+      const typed = await D.$eval('[data-collab="launcher-token"]', (e) => e.value);
+      const focusOk = await D.evaluate(() => document.activeElement?.getAttribute('data-collab') === 'launcher-token');
+      record('토큰 칸에 친 값이 그대로 들어감(포커스가 칸에 남음)', typed === CREATE_TOKEN && focusOk,
+        `칸 ${typed.length}자 / 토큰 ${CREATE_TOKEN.length}자, 포커스 ${focusOk ? '칸' : '다른 곳'}`);
       await D.click('[data-collab="launcher-create"]');
     }
     const made = await D.waitForSelector('[data-collab="launcher-link"]', { timeout: 30_000 }).then(() => true, () => false);

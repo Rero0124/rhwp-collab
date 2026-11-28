@@ -447,6 +447,25 @@ test('다른 사람 커서: 받으면 목록에, 원격 편집 지도로 옮기�
   s.dispose();
 });
 
+test('왕복 점검 알림: 방에 있는 동안 뒤에서 끝난 결과(경고·점검 못 함)를 roundtrip 메시지로 받아 한 번 알림, 통과면 무시', async () => {
+  const { s, net, h } = await joined();
+  await net.deliver({ type: 'roundtrip', roundtrip: { ok: true, lost: [], irDiff: 0 } });
+  assert.equal(h.notices().filter((c) => c === 'roundtrip').length, 0);
+  const timeout = { ok: null, reason: 'timeout', lost: [], irDiff: 0 };
+  await net.deliver({ type: 'roundtrip', roundtrip: timeout });
+  await net.deliver({ type: 'roundtrip', roundtrip: timeout });
+  const notes = h.events.filter((e) => e.type === 'notice' && e.notice.code === 'roundtrip');
+  assert.equal(notes.length, 1, '한 번만');
+  assert.match(noticeTexts(notes[0].notice)[0].text, /^왕복 점검 못 함\(시간 초과\)/);
+  s.dispose();
+  // welcome 에서 이미 받았으면 알림 메시지로 다시 알리지 않는다
+  const b = await joined({ });
+  await b.net.deliver({ type: 'welcome', seq: 0, base: stateWith(), log: [], resync: true, roundtrip: timeout });
+  await b.net.deliver({ type: 'roundtrip', roundtrip: timeout });
+  assert.equal(b.h.notices().filter((c) => c === 'roundtrip').length, 1);
+  b.s.dispose();
+});
+
 test('기본 문구: 안내 코드마다 줄이 있고(joined 는 두 줄), clientId 대체 생성기', () => {
   assert.deepEqual(noticeTexts({ code: 'joined' }).map((l) => l.kind), ['notice', 'font-policy']);
   assert.equal(noticeTexts({ code: 'forbidden', reason: '모름' })[0].text, noticeTexts({ code: 'forbidden', reason: 'scope' })[0].text);

@@ -22,6 +22,8 @@ export type ServerMessage =
   | { type: 'invalid'; what: 'ops' | 'base'; reason: string; batchId?: string }
   | { type: 'cursor'; clientId: string; name: string; seq: number; caret: TextCaret | null }
   | { type: 'cursor-leave'; clientId: string }
+  // 6단계 S2: 방을 연 뒤 뒤에서 끝난 왕복 점검이 통과가 아니다(경고 또는 점검 못 함) — 그때 방에 있던 참여자에게 한 번
+  | { type: 'roundtrip'; roundtrip: RoundtripResult }
   | UnauthorizedMessage
   | ForbiddenMessage
   | { type: 'error'; error: string };

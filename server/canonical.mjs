@@ -70,10 +70,14 @@ export class Canonical {
   }
   /** 6단계 S2: 왕복 점검(모든 부분을 모델에서 다시 쓴 결과 vs 원본) — {supported, result, ms} */
   roundtrip() { return this.call('roundtrip'); }
+  /** 7단계 B: 배치 점검(왕복 점검 다음) — {supported, entry: 통과면 null | lost 에 더할 {kind:'layout', ...}, ms} */
+  roundtripLayout() { return this.call('roundtripLayout'); }
   /** 5단계 D5: 암호 문서(원본 바이트)를 암호로 열어 결과 전송 형식(암호 없음, gzip base64)으로. 정본은 그대로. */
   decrypt(raw, password) { return this.call('decrypt', { data: Buffer.from(raw).toString('base64'), password }); }
   digest() { return this.call('digest'); }
   export() { return this.call('export'); }
+  /** 7단계 C: 원본 형식 계열로 암호를 걸어 내보낸다 — {data: 파일 바이트 base64, format} */
+  exportEncrypted(password) { return this.call('exportEncrypted', { password }); }
 
   /** 워커를 버리고 기준점 + 기록으로 새로 만든다(기록은 한 번에 — 쪽 배치는 끝에 한 번). 반환: 마지막 digest 또는 실패 사유. */
   async rebuild(base, log) {

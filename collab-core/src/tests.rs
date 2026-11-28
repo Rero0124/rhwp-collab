@@ -1745,3 +1745,76 @@ fn empty_bin_data_is_dropped_from_the_original_fingerprint_only() {
     assert_eq!(multiset_lost(&orig, &std::collections::BTreeMap::from([(image, 1)])), 1);
     assert_eq!(multiset_lost(&orig, &std::collections::BTreeMap::new()), 2);
 }
+
+// ── 7단계 B 방을 열 때 배치 점검(layout_check) ────────────────────────────────────
+
+#[test]
+fn layout_check_passes_documents_whose_model_rewrite_lays_out_the_same() {
+    let c = CollabCore::new(DocumentCore::from_bytes(&rich_doc()).unwrap());
+    assert_eq!(c.layout_check().unwrap(), None);
+    let h = CollabCore::new(DocumentCore::from_bytes(&hwpx_doc()).unwrap());
+    assert_eq!(h.layout_check().unwrap(), None, "HWPX 출처도");
+}
+
+#[test]
+fn layout_check_reuses_the_roundtrip_bytes_only_while_the_document_is_unchanged() {
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&rich_doc()).unwrap());
+    c.roundtrip_check().unwrap();
+    assert_eq!(c.layout_check().unwrap(), None, "왕복 점검이 만든 두 바이트로");
+    c.roundtrip_check().unwrap();
+    c.insert_text_native(0, 0, 0, "더 ").unwrap();
+    assert_eq!(c.layout_check().unwrap(), None, "바뀐 문서는 다시 만든다");
+}
+
+fn page_diff(page: u32, max_disp: f64, structure_mismatch: bool, textrun_pm1: bool) -> crate::diagnostics::render_geom_diff::PageGeomDiff {
+    crate::diagnostics::render_geom_diff::PageGeomDiff {
+        page,
+        node_count_a: 10,
+        node_count_b: 10,
+        structure_mismatch,
+        max_disp,
+        mean_disp: max_disp / 2.0,
+        top_deltas: vec![crate::diagnostics::render_geom_diff::NodeDelta { path: "Page/Body/Column0/TextLine2".into(), node_type: "TextLine", dx: 0.0, dy: max_disp, dw: 0.0, dh: 0.0 }],
+        type_deltas: vec![],
+        struct_textrun_pm1: textrun_pm1,
+    }
+}
+
+#[test]
+fn layout_verdict_follows_the_upstream_render_diff_gate() {
+    use crate::diagnostics::render_geom_diff::DocGeomDiff;
+    let doc = |a: u32, b: u32, pages: Vec<_>| {
+        let max_disp = pages.iter().map(|p: &crate::diagnostics::render_geom_diff::PageGeomDiff| p.max_disp).fold(0.0, f64::max);
+        DocGeomDiff { page_count_a: a, page_count_b: b, pages, max_disp }
+    };
+    // 통과: 변위 1px 이하, TextRun ±1 만의 구조 차이(경미한 조성 잡음, #1773)
+    assert_eq!(super::layout_verdict(&doc(2, 2, vec![page_diff(0, 0.4, false, false), page_diff(1, 1.0, true, true)])), None);
+    // 변위 초과: 문제 쪽 수·최대 변위·1부터 센 쪽·움직인 노드
+    let v = super::layout_verdict(&doc(3, 3, vec![page_diff(0, 0.2, false, false), page_diff(1, 3.456, false, false), page_diff(2, 1.5, false, false)])).unwrap();
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["maxDisp"], 3.46);
+    assert_eq!(v["worstPage"], 2);
+    assert_eq!(v["pages"], serde_json::json!([3, 3]));
+    assert_eq!(v["detail"], "최대 3.46px(2쪽, Page/Body/Column0/TextLine2)");
+    // 쪽 수 다름(공통 쪽은 같아도)
+    let v = super::layout_verdict(&doc(12, 13, vec![page_diff(0, 0.0, false, false)])).unwrap();
+    assert_eq!((v["count"].as_u64(), v["detail"].as_str()), (Some(1), Some("쪽 수 12 → 13")));
+    // 구조 어긋남(TextRun ±1 아님)
+    let v = super::layout_verdict(&doc(1, 1, vec![page_diff(0, 0.0, true, false)])).unwrap();
+    assert_eq!((v["count"].as_u64(), v["detail"].as_str()), (Some(1), Some("구조 다름 1쪽")));
+}
+
+#[test]
+fn layout_check_catches_char_shape_bits_the_model_rewrite_changes_and_s2_does_not_see() {
+    // multi-table-001(업스트림 샘플, 읽기만): 글자 모양 몇 개의 attr 밑줄 종류·취소선 비트(0x3C0400F8)가 모델에서 다시 쓰면
+    // 0x3C0000F0 이 된다 — 업스트림 글자 모양 저장기의 충실도 결함(2026-11-28 조사). 셀 글줄 높이가 4.41px 줄어든다.
+    // 왕복 점검(S2)의 IR 차이는 attr 비트를 보지 않아 통과다 — 배치 점검이 잡는다. 업스트림이 고치면 이 시험을 고친다.
+    let mut c = CollabCore::new(DocumentCore::from_bytes(&sample("samples/multi-table-001.hwp")).unwrap());
+    let s2 = c.roundtrip_check().unwrap();
+    assert_eq!(s2["ok"], true, "{s2}");
+    let v = c.layout_check().unwrap().expect("배치 점검 경고");
+    assert_eq!(v["pages"], serde_json::json!([2, 2]));
+    assert_eq!(v["worstPage"], 2);
+    assert!(v["maxDisp"].as_f64().unwrap() > 4.0, "{v}");
+    let _ = &mut c;
+}

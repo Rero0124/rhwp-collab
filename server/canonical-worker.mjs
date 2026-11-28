@@ -34,6 +34,8 @@ const { CATALOG } = await import(new URL('../collab-client/src/engine/catalog.ts
 
 let doc = null;
 let engine = null;
+/** 정본의 원본 형식 계열(열 때 본 바이트로) — 7단계 C 암호를 걸어 내보낼 때 같은 계열로 쓴다. HWP3 는 HWP5 로 나간다. */
+let docFormat = 'hwp';
 
 const reasonOf = (e) => (typeof e === 'string' ? e : e?.message ?? String(e));
 const TRAP = /memory access out of bounds|unreachable|recursive use of an object|null pointer passed to rust/i;
@@ -156,6 +158,7 @@ function opArgsViolation(entries) {
 function open(base) {
   const raw = gunzipSync(Buffer.from(base, 'base64'));
   const next = new wasm.HwpDocument(raw);
+  docFormat = raw[0] === 0x50 && raw[1] === 0x4b ? 'hwpx' : 'hwp';
   // 결과 다시 쓰기 강화(결정 2): 정본은 열자마자(기록 재생 전) 본 날 바이트를 모은다 — 되돌리기가 되살린 옛 바이트를 받으려고
   next.collabTrackRawSeen?.();
   engine?.detach();
@@ -279,6 +282,13 @@ parentPort.on('message', ({ id, op, ...p }) => {
       }
       case 'export':
         return reply({ ok: true, data: Buffer.from(doc.collabExportState()).toString('base64') });
+      case 'exportEncrypted': {
+        // 7단계 C: 정본을 원본 형식 계열로 암호를 걸어 내보낸다(파일 바이트 그대로, gzip 아님). 암호는 기록하지 않는다.
+        if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
+        const password = String(p.password ?? '');
+        const bytes = docFormat === 'hwpx' ? doc.exportHwpxWithPassword(password) : doc.exportHwpWithPassword(password);
+        return reply({ ok: true, data: Buffer.from(bytes).toString('base64'), format: docFormat });
+      }
       case 'digest':
         return reply({ ok: true, digest: doc.collabDigest() });
       case 'roundtrip': {
@@ -289,9 +299,18 @@ parentPort.on('message', ({ id, op, ...p }) => {
         const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
         return reply({ ok: true, supported: true, result, ms: Math.round(performance.now() - t0) });
       }
+      case 'roundtripLayout': {
+        // 7단계 B: 배치 점검(왕복 점검 다음, 같은 두 바이트) — 모델에서만 다시 쓴 결과의 조판이 같은가. 통과면 entry 는 null
+        if (!doc) return reply({ ok: false, reason: '정본 문서가 없다' });
+        if (typeof doc.collabLayoutCheck !== 'function') return reply({ ok: true, supported: false });
+        const t0 = performance.now();
+        const raw = doc.collabLayoutCheck();
+        const entry = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return reply({ ok: true, supported: true, entry, ms: Math.round(performance.now() - t0) });
+      }
       case 'capabilities':
         // 서버가 시작 로그·경고에 쓴다: 다시 쓰기 보조가 있는지(6단계 S1)
-        return reply({ ok: true, rewriteState: typeof wasm.HwpDocument.prototype[REWRITE_STATE] === 'function', roundtripCheck: typeof wasm.HwpDocument.prototype.collabRoundtripCheck === 'function' });
+        return reply({ ok: true, rewriteState: typeof wasm.HwpDocument.prototype[REWRITE_STATE] === 'function', roundtripCheck: typeof wasm.HwpDocument.prototype.collabRoundtripCheck === 'function', layoutCheck: typeof wasm.HwpDocument.prototype.collabLayoutCheck === 'function' });
       default:
         return reply({ ok: false, reason: `모르는 op: ${op}` });
     }

@@ -78,6 +78,16 @@ test('왕복 점검 문구(6단계 S2): 통과, 경고(종류 이름·개수, �
   assert.equal(roundtripText({ ok: false, lost: [{ kind: 'ole-clsid', count: 2 }, { kind: 'mystery', count: 1 }], irDiff: 0 }),
     '이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다: OLE 개체 2개, mystery 1개. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다');
   assert.match(roundtripText({ ok: false, lost: [], irDiff: 4 }), /내용 차이 4곳/);
+  // 7단계 B 배치 점검: 쪽 단위, 배치만 끝내지 못하면 덧붙임
+  // 배치만: 배치 문장 하나(쪽 수가 달라지면 그것, 아니면 가장 많이 움직인 쪽) / 내용 손실과 함께면 두 문장 / 막힌 방은 목록
+  assert.equal(roundtripText({ ok: false, lost: [{ kind: 'layout', count: 2, pages: [12, 13], maxDisp: 3.5, worstPage: 5 }], irDiff: 0 }),
+    'rhwp 가 이 문서를 다시 쓰면 일부 쪽의 배치(줄 높이·위치)가 달라질 수 있습니다(쪽 수 12 → 13)');
+  assert.equal(roundtripText({ ok: false, lost: [{ kind: 'layout', count: 2, pages: [12, 12], maxDisp: 3.5, worstPage: 5 }], irDiff: 0 }),
+    'rhwp 가 이 문서를 다시 쓰면 일부 쪽의 배치(줄 높이·위치)가 달라질 수 있습니다(5쪽 등)');
+  assert.equal(roundtripText({ ok: false, lost: [{ kind: 'record', count: 1 }, { kind: 'layout', count: 1, pages: [3, 3], maxDisp: 1.5, worstPage: 2 }], irDiff: 0 }),
+    '이 문서에는 rhwp 가 다 다루지 못하는 부분이 있습니다: rhwp 가 모르는 레코드 1개. 이 부분이 있는 쪽을 편집하면 사라질 수 있습니다. rhwp 가 이 문서를 다시 쓰면 일부 쪽의 배치(줄 높이·위치)가 달라질 수 있습니다(2쪽)');
+  assert.match(roundtripBlockedText({ ok: false, lost: [{ kind: 'layout', count: 2, pages: [3, 3] }], irDiff: 0 }), /: 조판\(쪽·위치\) 2쪽$/);
+  assert.equal(roundtripText({ ok: true, lost: [], irDiff: 0, layoutUnknown: 'timeout' }), `${ROUNDTRIP_OK_TEXT} (조판 점검 못 함: 시간 초과)`);
   // collab-core 가 내는 종류: ir(곳)·record·bindata·ole-clsid·cfb·package
   assert.match(roundtripText({ ok: false, lost: [{ kind: 'ir', count: 4 }, { kind: 'bindata', count: 1 }, { kind: 'package', count: 2 }], irDiff: 4 }), /: 내용 차이 4곳, 그림·첨부 데이터 1개, 파일 구조 2개\./);
   assert.equal(roundtripBlockedText({ ok: false, lost: [{ kind: 'record', count: 3 }], irDiff: 0 }), 'rhwp 가 이 문서의 일부를 다루지 못해 방을 만들지 않았습니다: rhwp 가 모르는 레코드 3개');

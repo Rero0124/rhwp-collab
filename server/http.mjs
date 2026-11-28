@@ -137,7 +137,7 @@ function serveFile(req, res, { file, stat }, { cache, headers: extraHeaders = {}
 /**
  * @param {{
  *   api: { createRoom(req: import('node:http').IncomingMessage, body: Buffer): Promise<object>,
- *          download(req: import('node:http').IncomingMessage, room: string): Promise<{raw: Buffer, format: string, seq: number}> },
+ *          download(req: import('node:http').IncomingMessage, room: string): Promise<{raw: Buffer, format: string, seq: number, encrypted?: boolean}> },
  *   staticDir?: string|null, maxBodyBytes: number, originAllowed(req): boolean, log(m: string): void,
  * }} opts
  */
@@ -171,8 +171,10 @@ export function createHttpHandler({ api, staticDir = null, maxBodyBytes, originA
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method' }, { allow: 'GET' });
         let room;
         try { room = decodeURIComponent(doc[1]); } catch { return sendJson(res, 400, { error: 'bad-url' }); }
-        const { raw, format, seq } = await api.download(req, room);
+        const { raw, format, seq, encrypted } = await api.download(req, room);
         res.writeHead(200, {
+          // 7단계 C: 요청 머리의 암호를 걸어 내보낸 파일
+          ...(encrypted ? { 'x-collab-encrypted': '1' } : {}),
           'content-type': 'application/octet-stream',
           'content-length': raw.length,
           'content-disposition': `attachment; filename="document.${format}"`,

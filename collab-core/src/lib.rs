@@ -283,6 +283,51 @@ fn summarize(items: impl Iterator<Item = String>, max: usize) -> String {
     s
 }
 
+/// 7단계 B: 왕복 점검이 읽은 두 문서 — [`CollabCore::layout_check`] 가 다시 읽지 않고 쓴다.
+struct RoundtripDocs {
+    /// 그때의 저장본(문서가 그 뒤 바뀌었는지 견준다)
+    orig: Vec<u8>,
+    /// 저장본을 읽어 원본 바이트 캐시를 버린 문서
+    a: DocumentCore,
+    /// `a` 를 모델에서만 써서 다시 읽은 문서
+    b: DocumentCore,
+}
+
+/// 7단계 B: 배치 점검의 판정(업스트림 render-diff 게이트와 같다 — 쪽 수 다름, TextRun ±1 이 아닌 구조 어긋남, 1px 초과 변위).
+/// 통과면 None.
+fn layout_verdict(diff: &crate::diagnostics::render_geom_diff::DocGeomDiff) -> Option<Value> {
+    const MAX_DISP_PX: f64 = 1.0;
+    let hard_struct = |p: &&crate::diagnostics::render_geom_diff::PageGeomDiff| p.structure_mismatch && !p.struct_textrun_pm1;
+    let bad: Vec<_> = diff.pages.iter().filter(|p| p.max_disp > MAX_DISP_PX || hard_struct(p)).collect();
+    let page_mismatch = diff.page_count_mismatch();
+    if !page_mismatch && bad.is_empty() {
+        return None;
+    }
+    let worst = diff.pages.iter().max_by(|x, y| x.max_disp.total_cmp(&y.max_disp));
+    let max_disp = (diff.max_disp * 100.0).round() / 100.0;
+    let mut detail = Vec::new();
+    if page_mismatch {
+        detail.push(format!("쪽 수 {} → {}", diff.page_count_a, diff.page_count_b));
+    }
+    if diff.max_disp > MAX_DISP_PX {
+        let at = worst.map(|p| p.page + 1).unwrap_or(0);
+        let node = worst.and_then(|p| p.top_deltas.first()).map(|d| format!(", {}", d.path)).unwrap_or_default();
+        detail.push(format!("최대 {max_disp}px({at}쪽{node})"));
+    }
+    let structs = diff.pages.iter().filter(hard_struct).count();
+    if structs > 0 {
+        detail.push(format!("구조 다름 {structs}쪽"));
+    }
+    Some(json!({
+        "kind": "layout",
+        "count": bad.len().max(usize::from(page_mismatch)),
+        "detail": detail.join("; "),
+        "pages": [diff.page_count_a, diff.page_count_b],
+        "maxDisp": max_disp,
+        "worstPage": worst.map(|p| p.page + 1),
+    }))
+}
+
 /// 6단계 S2: 내용(압축을 푼 뒤)이 빈 BinData 는 잃을 것이 없다 — 원본 쪽 지문에서 그 열쇠만 지운다. 열쇠는 업스트림
 /// `hwp5_roundtrip_batch::bindata_fingerprint` 와 같은 방식(`DefaultHasher` 에 내용 바이트 — `Vec<u8>` 과 `[u8]` 의 해시는
 /// 같다)으로 센다. 업스트림이 해시 방식을 바꾸면 빈 항목이 다시 경고로 드러난다(조용히 놓치는 쪽이 아니다).
@@ -342,6 +387,10 @@ pub struct CollabCore {
     /// 6단계 결과 다시 쓰기 강화(결정 2): 정본이 방이 살아 있는 동안 본 날 바이트. 정본만 켠다
     /// (`track_raw_seen` — 서버 정본 워커가 열자마자, 또는 다시 쓰기·op 인자 문이 처음 부를 때). 클라이언트는 None.
     raw_seen: Option<rewrite_raw::Seen>,
+    /// 7단계 B: 왕복 점검(S2)이 읽은 두 문서(저장본을 읽은 것, 모델에서만 쓴 것을 읽은 것)와 그 저장본 — 이어 부르는 배치
+    /// 점검이 다시 읽지 않게(큰 문서는 읽기만 몇 초). 배치 점검이 가져가거나 다음 왕복 점검이 바꿀 때까지 문서 두 벌을 든다.
+    /// 그 사이 문서가 바뀌었으면(저장본이 다르면) 쓰지 않는다.
+    roundtrip_docs: std::sync::Mutex<Option<RoundtripDocs>>,
 }
 
 /// S3-0 BinData 내용 해시 캐시 (docs/collab-stage3.md S3-0).
@@ -458,7 +507,7 @@ fn bad_args(method: &str, detail: impl std::fmt::Display) -> HwpError {
 
 impl CollabCore {
     pub fn new(inner: DocumentCore) -> Self {
-        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default(), state_loads: 0, raw_seen: None }
+        Self { inner, snapshots: Vec::new(), next_snapshot_id: 1, clipboard_stash: Vec::new(), bin_digest: Default::default(), state_loads: 0, raw_seen: None, roundtrip_docs: Default::default() }
     }
 
     // ── 자체 스냅샷 (§5) ────────────────────────────────────────────────
@@ -1078,6 +1127,49 @@ impl CollabCore {
         Ok((pack_state(&out)?, changes))
     }
 
+    fn roundtrip_hwpx(&self) -> bool {
+        matches!(self.inner.source_format, crate::parser::FileFormat::Hwpx)
+    }
+
+    /// 왕복 점검의 저장 — 이 문서의 형식 계열로.
+    fn roundtrip_export(&self, core: &DocumentCore) -> Result<Vec<u8>, HwpError> {
+        if self.roundtrip_hwpx() {
+            core.export_hwpx_native()
+        } else {
+            core.export_hwp_native()
+        }
+    }
+
+    /// 7단계 B(docs/collab-stage7.md): 방을 열 때 배치 점검. 왕복 점검(S2)과 같은 두 바이트 — 지금 문서의 저장본(원본)과 원본
+    /// 바이트 캐시를 모두 버리고 모델에서만 쓴 것 — 를 다시 읽어 **조판 결과**를 견준다: 업스트림 render-diff 의 핵심
+    /// (`diagnostics::render_geom_diff::diff_render_geometry` — 쪽마다 렌더 트리 노드를 타입 LCS 로 맞춰 bbox 변위를 잰다,
+    /// 파일 시스템을 쓰지 않는다). 판정은 업스트림 게이트와 같다: 쪽 수가 다르거나, 구조가 어긋난 쪽이 있거나(TextRun ±1 뿐인
+    /// 경미한 것은 뺀다, #1773), 최대 변위가 1px 을 넘으면 경고. 이 문서는 바꾸지 않는다. 조판 환경은 부른 쪽의 것(정본 워커 =
+    /// 엔진 기본 = bundled-only)이다.
+    ///
+    /// 통과면 None, 경고면 왕복 점검 `lost` 에 더할 항목 `{kind:"layout", count, detail, pages:[원본, 다시 쓴 것], maxDisp,
+    /// worstPage}` — `count` 는 문제 쪽 수(쪽 수만 다르면 1), `maxDisp` 는 px(소수 둘째 자리), `worstPage` 는 1부터 센 쪽.
+    /// 바로 앞에 왕복 점검을 불렀고 그 뒤 문서가 그대로면 그때 만든 두 바이트를 쓴다.
+    pub fn layout_check(&self) -> Result<Option<Value>, HwpError> {
+        use crate::diagnostics::render_geom_diff::diff_render_geometry;
+        let orig = self.roundtrip_export(&self.inner)?;
+        let cached = self.roundtrip_docs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let (a, b) = match cached {
+            Some(docs) if docs.orig == orig => (docs.a, docs.b),
+            _ => {
+                // 왕복 점검과 같은 두 문서: 저장본을 읽어 원본 바이트 캐시를 버린 것(조판은 같다)과, 그것을 모델에서만 쓴 것을 읽은 것
+                let mut a = DocumentCore::from_bytes(&orig)?;
+                if !self.roundtrip_hwpx() {
+                    strip_raw_caches(&mut a.document);
+                }
+                let out = self.roundtrip_export(&a)?;
+                let b = DocumentCore::from_bytes(&out)?;
+                (a, b)
+            }
+        };
+        Ok(layout_verdict(&diff_render_geometry(&a, &b)?))
+    }
+
     /// 6단계 S2(docs/collab-stage6.md): 방을 열 때 왕복 점검. rhwp 는 저장할 때 손대지 않은 부분의 원본 바이트를 그대로
     /// 써서 "저장 후 비교"는 rhwp 가 모르는 기능이 있어도 통과한다. 그 부분을 편집하면 모델에서 다시 쓰므로, **원본 바이트
     /// 캐시를 모두 버리고 모델에서만 쓴 결과**를 지금 문서의 저장본(원본)과 견준다. 이 문서는 바꾸지 않는다.
@@ -1097,16 +1189,16 @@ impl CollabCore {
     /// 캐시 없이 늘 모델(과 원문 조각)에서 쓰므로 그대로 저장한다.
     pub fn roundtrip_check(&self) -> Result<Value, HwpError> {
         use crate::diagnostics::hwp5_roundtrip_batch::{bindata_fingerprint, cfb_structure_ok, multiset_lost, nested_ole_clsid_fingerprint};
-        let hwpx = matches!(self.inner.source_format, crate::parser::FileFormat::Hwpx);
-        let export = |core: &DocumentCore| if hwpx { core.export_hwpx_native() } else { core.export_hwp_native() };
-        let orig = export(&self.inner)?;
+        let hwpx = self.roundtrip_hwpx();
+        let orig = self.roundtrip_export(&self.inner)?;
         let mut tmp = DocumentCore::from_bytes(&orig)?;
         let before = tmp.document.clone();
         if !hwpx {
             strip_raw_caches(&mut tmp.document);
         }
-        let out = export(&tmp)?;
-        let after = DocumentCore::from_bytes(&out)?.document;
+        let out = self.roundtrip_export(&tmp)?;
+        let after_core = DocumentCore::from_bytes(&out)?;
+        let after = &after_core.document;
         let mut lost: Vec<Value> = Vec::new();
         let mut push = |kind: &str, count: usize, detail: String| {
             if count > 0 {
@@ -1150,7 +1242,11 @@ impl CollabCore {
                 push("cfb", 1, problems);
             }
         }
-        Ok(json!({ "ok": lost.is_empty(), "lost": lost, "irDiff": ir_diff }))
+        let result = json!({ "ok": lost.is_empty(), "lost": lost, "irDiff": ir_diff });
+        // 7단계 B: 이어 부르는 배치 점검이 쓴다 — 원본 쪽은 캐시를 버린 문서지만 조판은 모델만 본다(렌더러는 원본 바이트
+        // 캐시를 읽지 않는다)
+        *self.roundtrip_docs.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RoundtripDocs { orig, a: tmp, b: after_core });
+        Ok(result)
     }
 
     /// 5단계 D4 클라이언트 문: 글자 연산 호출(`method`·`args`, 호출 전)이 활성 누름틀(`active_field`) 안에 완전히 드는가.
